@@ -209,6 +209,66 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# -----------------------------------------------------------------------------
+# SRE Agent monorepo local/runtime files
+# -----------------------------------------------------------------------------
+
+# Local secrets and environment overrides. Keep example templates tracked.
+.env.*
+!.env.example
+!.env.*.example
+
+# SQLite runtime databases and their journal/WAL sidecar files.
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+
+# Common operating-system and editor files.
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# -----------------------------------------------------------------------------
+# SRE Agent monorepo local/runtime files
+# -----------------------------------------------------------------------------
+
+# Local secrets and environment overrides. Keep example templates tracked.
+.env.*
+!.env.example
+!.env.*.example
+
+# SQLite runtime databases and their journal/WAL sidecar files.
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+
+# Common operating-system and editor files.
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

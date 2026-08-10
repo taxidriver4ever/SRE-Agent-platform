@@ -1,0 +1,4 @@
+interface:
+  display_name: "Node.js Service Debugging"
+  short_description: "Diagnose event-loop, heap, Promise, and OOM failures"
+  default_prompt: "Use $nodejs-service-debugging to diagnose this Node.js service incident with read-only evidence."

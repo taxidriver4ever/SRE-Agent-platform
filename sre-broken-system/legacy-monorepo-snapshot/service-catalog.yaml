@@ -1,0 +1,26 @@
+# Service Catalog 由 Agent 读取，用于把自然语言中的业务别名映射到真实 K8s 服务。
+services:
+  order-service:
+    aliases: [order, orders, 订单, 订单模块, 下单]
+    language: java
+    repository: sre-broken-system
+    source_path: order-service/src/main/java/local/srelab/order/OrderRepository.java
+    health_path: /actuator/health
+  inventory-service:
+    aliases: [inventory, stock, 库存, 库存模块]
+    language: go
+    repository: sre-broken-system
+    source_path: inventory-service/main.go
+    health_path: /health
+  user-service:
+    aliases: [user, users, 用户, 用户模块]
+    language: python
+    repository: sre-broken-system
+    source_path: user-service/app.py
+    health_path: /health
+  payment-service:
+    aliases: [payment, payments, 支付, 支付模块]
+    language: nodejs
+    repository: sre-broken-system
+    source_path: payment-service/server.js
+    health_path: /health

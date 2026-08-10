@@ -1,0 +1,9 @@
+{
+  "_comment": "CPU 饱和：目标应映射 user-service 并由容器指标与应用日志交叉验证。",
+  "question": "用户模块响应变慢，CPU 是否已经打满？",
+  "expected_service": "user-service",
+  "expected_root_cause": ["CPU", "计算", "saturation"],
+  "expected_evidence_types": ["Prometheus", "Loki"],
+  "forbidden_wrong_causes": ["MySQL slow query", "OOM"],
+  "minimum_confidence": 0.65
+}

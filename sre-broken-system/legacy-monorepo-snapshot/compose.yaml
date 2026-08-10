@@ -1,0 +1,67 @@
+# Phase 1 本地构建/健康验证使用 Compose；正式 Demo 使用 infra/k8s 下的资源。
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: sre-lab-mysql-local
+    environment:
+      MYSQL_ROOT_PASSWORD: root_dev_only
+    command:
+      - --slow-query-log=ON
+      - --long-query-time=0.5
+      - --performance-schema=ON
+    ports: ["13307:3306"]
+    volumes:
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+      - mysql-local-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-proot_dev_only"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  inventory-service:
+    build: ./inventory-service
+    container_name: sre-lab-inventory-local
+    ports: ["18081:8081"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 12
+
+  user-service:
+    build: ./user-service
+    container_name: sre-lab-user-local
+    ports: ["18082:8082"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8082/health')"]
+      interval: 5s
+      timeout: 2s
+      retries: 12
+
+  payment-service:
+    build: ./payment-service
+    container_name: sre-lab-payment-local
+    ports: ["18083:8083"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8083/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 12
+
+  order-service:
+    build: ./order-service
+    container_name: sre-lab-order-local
+    depends_on:
+      mysql: {condition: service_healthy}
+      inventory-service: {condition: service_healthy}
+    environment:
+      DB_URL: jdbc:mysql://mysql:3306/sre_lab?useSSL=false&allowPublicKeyRetrieval=true
+      DB_USERNAME: sre_reader
+      DB_PASSWORD: sre_reader_dev_only
+      INVENTORY_BASE_URL: http://inventory-service:8081
+      OTEL_JAVAAGENT_ENABLED: "false"
+    ports: ["18080:8080"]
+
+volumes:
+  mysql-local-data:

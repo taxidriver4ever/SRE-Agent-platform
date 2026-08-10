@@ -1,0 +1,4 @@
+interface:
+  display_name: "Resource Exhaustion"
+  short_description: "Diagnose CPU, memory, OOM, and pool saturation"
+  default_prompt: "Use $resource-exhaustion to verify which resource is exhausted and why."

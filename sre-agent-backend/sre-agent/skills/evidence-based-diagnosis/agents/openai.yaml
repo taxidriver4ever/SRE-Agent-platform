@@ -1,0 +1,4 @@
+interface:
+  display_name: "Evidence Based Diagnosis"
+  short_description: "Require independent evidence before declaring root cause"
+  default_prompt: "Use $evidence-based-diagnosis to build a verified causal chain and final report."

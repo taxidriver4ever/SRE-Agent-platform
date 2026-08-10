@@ -1,0 +1,159 @@
+"""FastAPI 应用组装入口。
+
+该模块只负责读取配置、组装依赖、管理资源生命周期和注册路由。Agent 推理、
+网关协议和工具逻辑分别保留在各自模块中，避免入口文件演变成业务逻辑集合。
+"""
+
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastmcp.utilities.lifespan import combine_lifespans
+
+from app.agent import ToolAgent
+from app.api.router import chat_router, router as agent_router
+from app.auth import AuthService, auth_router
+from app.conversation import ConversationService, conversation_router
+from app.context import ActiveContextCompactor, EvidenceStore
+from app.core.config import get_settings
+from app.core.database import ApplicationDatabase
+from app.llm import GatewayLLM
+from app.mcp_clients import FastMCPToolClient, KubernetesMCPAdapter
+from app.mcp_servers import build_fastmcp_server
+from app.repositories import RepositoryRegistry
+from app.storage import MinioObjectStore
+from app.uploads import UploadService, upload_router
+from app.workflow import DiagnosisWorkflow
+
+
+def create_app() -> FastAPI:
+    """创建一个依赖完整且可独立启动的 FastAPI 应用。
+
+    Returns:
+        注册了健康检查和 Agent v1 路由的应用实例。
+
+    工厂函数让测试可以为每个用例创建隔离应用，也为未来按环境注入不同工具集
+    留出扩展点。
+    """
+    # 配置在应用创建时形成快照，同一进程内的一次应用生命周期保持一致。
+    settings = get_settings()
+
+    # Auth 与 Conversation 共享一份 SQLite 业务库；密码哈希和 Token 逻辑留在
+    # AuthService，ConversationService 只接收已经验证过的 user_id。
+    application_database = ApplicationDatabase(settings.application_database_path)
+    auth_service = AuthService(application_database, settings.auth_token_ttl_hours)
+    auth_service.ensure_user(settings.initial_username, settings.initial_password)
+    conversation_service = ConversationService(application_database)
+
+    # 原始 Evidence、用户附件和超长粘贴日志统一保存到 Docker MinIO。public endpoint
+    # 专门用于浏览器签名，未来容器化 Agent 时不必把内部服务名泄漏给浏览器。
+    object_store = MinioObjectStore(
+        endpoint=settings.minio_endpoint,
+        public_endpoint=settings.minio_public_endpoint,
+        access_key=settings.minio_access_key,
+        secret_key=settings.minio_secret_key,
+        bucket=settings.minio_bucket,
+        secure=settings.minio_secure,
+    )
+    upload_service = UploadService(
+        application_database,
+        conversation_service,
+        object_store,
+        max_bytes=settings.upload_max_bytes,
+        presign_expire_minutes=settings.minio_presign_expire_minutes,
+    )
+
+    # GatewayLLM 是唯一连接外部模型能力的组件。Agent 不直接访问厂商 API。
+    llm = GatewayLLM(
+        base_url=settings.gateway_base_url,
+        api_key=settings.gateway_api_key,
+        model=settings.gateway_model,
+        timeout=settings.gateway_timeout_seconds,
+    )
+    # FastMCP 负责工具注册、Schema、参数校验和标准 MCP 调用；Agent 只持有官方
+    # in-memory Client 的薄适配器，没有自研 MCP 注册中心或协议实现。
+    repository_registry = RepositoryRegistry(
+        repository_root=settings.repository_path,
+        catalog_path=settings.service_catalog_path,
+        cache_path=settings.repository_cache_path,
+        allowed_hosts=settings.repository_allowed_hosts,
+        timeout=settings.tool_timeout_seconds,
+    )
+    mcp_server = build_fastmcp_server(settings, repository_registry)
+    # 生成标准 Streamable HTTP ASGI 应用；path="/" 是因为下方会挂载到 /mcp。
+    mcp_app = mcp_server.http_app(path="/")
+    # Kubernetes 不再注册到项目自有 Server，而是由维护活跃的第三方 MCP
+    # 以 read-only/core/single-context 模式直接访问 Kubernetes API。
+    kubernetes_mcp = KubernetesMCPAdapter(settings.kubernetes_namespace)
+    tools = FastMCPToolClient(mcp_server, kubernetes_mcp)
+    evidence_store = EvidenceStore(application_database, object_store)
+    compactor = ActiveContextCompactor(settings.active_context_character_budget)
+    diagnosis_workflow = DiagnosisWorkflow(
+        tools=tools,
+        catalog_path=settings.service_catalog_path,
+        max_steps=max(8, min(settings.agent_max_iterations + 4, 12)),
+        llm=llm,
+        repository_registry=repository_registry,
+        evidence_store=evidence_store,
+        compactor=compactor,
+        kubernetes_namespace=settings.kubernetes_namespace,
+    )
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        """在服务启动时发布共享依赖，在关闭时释放 HTTP 连接池。"""
+        # state 保存进程内共享对象，避免每个请求重复建立 httpx 连接池。
+        application.state.llm = llm
+        application.state.mcp_server = mcp_server
+        application.state.tools = tools
+        application.state.agent = ToolAgent(llm, tools, settings.agent_max_iterations)
+        application.state.diagnosis_workflow = diagnosis_workflow
+        application.state.evidence_store = evidence_store
+        application.state.object_store = object_store
+        application.state.upload_service = upload_service
+        application.state.auth_service = auth_service
+        application.state.conversation_service = conversation_service
+        yield
+        # 只有 GatewayLLM 自己创建的客户端会被关闭，注入客户端的所有权规则
+        # 由 GatewayLLM.close() 内部负责判断。
+        await tools.close()
+        await llm.close()
+
+    # FastMCP 的 session manager 必须进入自己的 lifespan。官方 combine_lifespans
+    # 同时管理 Agent HTTP 资源与 MCP transport，避免嵌套 ASGI lifespan 被忽略。
+    application = FastAPI(
+        title="SRE Tool Agent",
+        version="0.2.0",
+        lifespan=combine_lifespans(lifespan, mcp_app.lifespan),
+    )
+    # Vite 默认运行在 5173；同时保留 3000 供自定义前端启动参数使用。
+    # 当前 API 不使用 Cookie，因此 allow_credentials 保持关闭。
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "http://127.0.0.1:5173", "http://localhost:5173",
+            "http://127.0.0.1:3000", "http://localhost:3000",
+        ],
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Content-Type", "Authorization"],
+    )
+    application.include_router(auth_router)
+    application.include_router(conversation_router)
+    application.include_router(upload_router)
+    application.include_router(agent_router)
+    application.include_router(chat_router)
+    # 对外端点只暴露项目的 Git/可观测性只读工具。Kubernetes Server 保持独立，
+    # 这样第三方版本、RBAC 和进程生命周期不会被伪装成项目自研工具。
+    application.mount("/mcp", mcp_app)
+
+    @application.get("/health", tags=["health"])
+    async def health() -> dict[str, str]:
+        """无需调用 LLM 的轻量存活检查。"""
+        return {"status": "ok"}
+
+    return application
+
+
+# Uvicorn 使用 ``app.main:app`` 导入此模块级对象。
+app = create_app()

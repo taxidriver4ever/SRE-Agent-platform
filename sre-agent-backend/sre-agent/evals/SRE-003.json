@@ -1,0 +1,9 @@
+{
+  "_comment": "下游超时：Trace 必须把 order 延迟归属到 inventory-service。",
+  "question": "为什么 order 很慢，但是 CPU 又不高？库存依赖是否超时？",
+  "expected_service": "order-service",
+  "expected_root_cause": ["inventory-service", "下游", "超时", "timeout"],
+  "expected_evidence_types": ["Tempo", "Loki"],
+  "forbidden_wrong_causes": ["MySQL missing index", "OOM"],
+  "minimum_confidence": 0.65
+}

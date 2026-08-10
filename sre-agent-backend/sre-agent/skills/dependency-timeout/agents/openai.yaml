@@ -1,0 +1,4 @@
+interface:
+  display_name: "Dependency Timeout"
+  short_description: "Trace downstream latency, retries, and timeouts"
+  default_prompt: "Use $dependency-timeout to locate the slow downstream hop and validate it."

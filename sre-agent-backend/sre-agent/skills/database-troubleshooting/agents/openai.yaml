@@ -1,0 +1,4 @@
+interface:
+  display_name: "Database Troubleshooting"
+  short_description: "Diagnose slow SQL, pools, locks, and indexes"
+  default_prompt: "Use $database-troubleshooting to trace this database symptom to verified SQL evidence."

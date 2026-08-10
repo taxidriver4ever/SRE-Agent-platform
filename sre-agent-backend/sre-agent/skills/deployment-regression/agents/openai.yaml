@@ -1,0 +1,4 @@
+interface:
+  display_name: "Deployment Regression"
+  short_description: "Map runtime images to Git changes and regressions"
+  default_prompt: "Use $deployment-regression to compare the running commit with the previous good version."

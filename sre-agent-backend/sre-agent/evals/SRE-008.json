@@ -1,0 +1,9 @@
+{
+  "_comment": "单 Pod 退化：Agent 必须比较同一 Service 下的 Pod 指标和身份。",
+  "question": "为什么订单接口有时候很快，有时候特别慢？是不是某个实例有问题？",
+  "expected_service": "order-service",
+  "expected_root_cause": ["Pod", "实例", "CPU", "间歇"],
+  "expected_evidence_types": ["Kubernetes", "Prometheus"],
+  "forbidden_wrong_causes": ["所有 Pod 都异常", "payment OOM"],
+  "minimum_confidence": 0.7
+}

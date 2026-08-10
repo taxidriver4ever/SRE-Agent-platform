@@ -1,0 +1,4 @@
+# NVIDIA GPU 可选覆盖文件。Docker Desktop + WSL2 需要支持 GPU 容器。
+services:
+  ollama:
+    gpus: all

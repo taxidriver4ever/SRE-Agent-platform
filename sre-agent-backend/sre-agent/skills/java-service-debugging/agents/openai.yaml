@@ -1,0 +1,4 @@
+interface:
+  display_name: "Java Service Debugging"
+  short_description: "Diagnose JVM, HikariCP, GC, and thread failures"
+  default_prompt: "Use $java-service-debugging to investigate this Java service incident with evidence."

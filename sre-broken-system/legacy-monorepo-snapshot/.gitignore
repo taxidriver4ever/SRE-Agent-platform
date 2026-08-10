@@ -1,0 +1,11 @@
+.idea/
+.vscode/
+target/
+node_modules/
+__pycache__/
+.pytest_cache/
+*.log
+.env
+dist/
+# Kind 二进制由 deploy-lab.ps1 按需下载，不进入 Git 历史，避免仓库携带平台相关大文件。
+tools/*.exe

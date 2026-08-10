@@ -1,0 +1,9 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+# Evidence Store 是本地运行数据，不能提交到源码仓库。
+.data/
+# 本地联调进程日志不属于源码交付物。
+.agent-*.log

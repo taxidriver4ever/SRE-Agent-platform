@@ -1,0 +1,4 @@
+interface:
+  display_name: "Distributed Tracing"
+  short_description: "Follow cross-language traces to the exact causal span"
+  default_prompt: "Use $distributed-tracing to follow this request across services and identify the causal span."

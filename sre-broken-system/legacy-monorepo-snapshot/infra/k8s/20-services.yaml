@@ -1,0 +1,159 @@
+# 所有业务 Deployment 使用相同的 runtime→source 注解约定；deploy-lab.ps1 会把
+# local-dev 占位值替换成真实 Git SHA，并加载对应 SHA 标签镜像到 kind。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: sre-lab
+  labels: {app: order-service, service: order-service}
+  annotations: &orderAnnotations
+    sre.agent/repository: sre-broken-system
+    sre.agent/git-sha: local-dev
+    sre.agent/previous-git-sha: local-good
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: order-service}}
+  template:
+    metadata:
+      labels: {app: order-service, service: order-service, version: local-dev}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /actuator/prometheus
+        prometheus.io/port: "8080"
+        sre.agent/repository: sre-broken-system
+        sre.agent/git-sha: local-dev
+    spec:
+      containers:
+        - name: order-service
+          image: sre-lab/order-service:local-dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: DB_URL, value: "jdbc:mysql://mysql:3306/sre_lab?useSSL=false&allowPublicKeyRetrieval=true"}
+            - {name: DB_USERNAME, value: sre_reader}
+            - name: DB_PASSWORD
+              valueFrom: {secretKeyRef: {name: mysql-credentials, key: reader-password}}
+            - {name: INVENTORY_BASE_URL, value: "http://inventory-service:8081"}
+            - {name: OTEL_SERVICE_NAME, value: order-service}
+            - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector:4318"}
+            - {name: OTEL_EXPORTER_OTLP_PROTOCOL, value: http/protobuf}
+            - {name: OTEL_METRICS_EXPORTER, value: none}
+            - {name: OTEL_LOGS_EXPORTER, value: none}
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /actuator/health/readiness, port: http}, initialDelaySeconds: 15, periodSeconds: 5}
+          livenessProbe: {httpGet: {path: /actuator/health/liveness, port: http}, initialDelaySeconds: 30, periodSeconds: 10}
+          resources:
+            requests: {cpu: 100m, memory: 192Mi}
+            limits: {cpu: "1", memory: 512Mi}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: order-service, namespace: sre-lab, labels: {app: order-service}}
+spec:
+  selector: {app: order-service}
+  ports: [{name: http, port: 8080, targetPort: http, nodePort: 30080}]
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inventory-service
+  namespace: sre-lab
+  labels: {app: inventory-service, service: inventory-service}
+  annotations: {sre.agent/repository: sre-broken-system, sre.agent/git-sha: local-dev}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: inventory-service}}
+  template:
+    metadata:
+      labels: {app: inventory-service, service: inventory-service, version: local-dev}
+      annotations: {prometheus.io/scrape: "true", prometheus.io/path: /metrics, prometheus.io/port: "8081", sre.agent/git-sha: local-dev}
+    spec:
+      containers:
+        - name: inventory-service
+          image: sre-lab/inventory-service:local-dev
+          imagePullPolicy: IfNotPresent
+          env: [{name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector:4318"}]
+          ports: [{name: http, containerPort: 8081}]
+          readinessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 2, periodSeconds: 5}
+          livenessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 10, periodSeconds: 10}
+          resources:
+            requests: {cpu: 25m, memory: 32Mi}
+            limits: {cpu: 500m, memory: 128Mi}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: inventory-service, namespace: sre-lab, labels: {app: inventory-service}}
+spec:
+  selector: {app: inventory-service}
+  ports: [{name: http, port: 8081, targetPort: http, nodePort: 30081}]
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+  namespace: sre-lab
+  labels: {app: user-service, service: user-service}
+  annotations: {sre.agent/repository: sre-broken-system, sre.agent/git-sha: local-dev}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: user-service}}
+  template:
+    metadata:
+      labels: {app: user-service, service: user-service, version: local-dev}
+      annotations: {prometheus.io/scrape: "true", prometheus.io/path: /metrics, prometheus.io/port: "8082", sre.agent/git-sha: local-dev}
+    spec:
+      containers:
+        - name: user-service
+          image: sre-lab/user-service:local-dev
+          imagePullPolicy: IfNotPresent
+          ports: [{name: http, containerPort: 8082}]
+          readinessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 2, periodSeconds: 5}
+          livenessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 10, periodSeconds: 10}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 192Mi}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: user-service, namespace: sre-lab, labels: {app: user-service}}
+spec:
+  selector: {app: user-service}
+  ports: [{name: http, port: 8082, targetPort: http, nodePort: 30082}]
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  namespace: sre-lab
+  labels: {app: payment-service, service: payment-service}
+  annotations: {sre.agent/repository: sre-broken-system, sre.agent/git-sha: local-dev}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: payment-service}}
+  template:
+    metadata:
+      labels: {app: payment-service, service: payment-service, version: local-dev}
+      annotations: {prometheus.io/scrape: "true", prometheus.io/path: /metrics, prometheus.io/port: "8083", sre.agent/git-sha: local-dev}
+    spec:
+      containers:
+        - name: payment-service
+          image: sre-lab/payment-service:local-dev
+          imagePullPolicy: IfNotPresent
+          # 较小 old-space 与 K8s memory limit 共同保证 SRE-005 最终产生真实 OOMKilled。
+          env: [{name: NODE_OPTIONS, value: "--max-old-space-size=96"}]
+          ports: [{name: http, containerPort: 8083}]
+          readinessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 2, periodSeconds: 5}
+          livenessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 10, periodSeconds: 10}
+          resources:
+            requests: {cpu: 25m, memory: 48Mi}
+            limits: {cpu: 500m, memory: 128Mi}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: payment-service, namespace: sre-lab, labels: {app: payment-service}}
+spec:
+  selector: {app: payment-service}
+  ports: [{name: http, port: 8083, targetPort: http, nodePort: 30083}]
+  type: NodePort

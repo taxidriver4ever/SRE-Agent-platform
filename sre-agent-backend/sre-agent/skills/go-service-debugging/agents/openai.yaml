@@ -1,0 +1,4 @@
+interface:
+  display_name: "Go Service Debugging"
+  short_description: "Diagnose Go runtime, timeout, GC, CPU, and retry failures"
+  default_prompt: "Use $go-service-debugging to diagnose this Go microservice incident with read-only evidence."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Python Service Debugging"
+  short_description: "Diagnose asyncio, SQLAlchemy, blocking, and CPU failures"
+  default_prompt: "Use $python-service-debugging to diagnose this Python service incident with read-only evidence."

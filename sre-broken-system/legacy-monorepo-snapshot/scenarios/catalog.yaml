@@ -1,0 +1,57 @@
+scenarios:
+  SRE-001:
+    name: Slow SQL / Missing Index
+    service: order-service
+    trigger: POST /debug/fault/slow_sql, then GET /orders/search
+    expected_metrics: [http_server_requests_seconds p95 rises, hikaricp_connections_active rises]
+    expected_logs: [searching orders by email pattern mode=slow_sql]
+    expected_trace: [HTTP GET /orders/search, JDBC SELECT span around 2 seconds]
+    expected_root_cause: leading-wildcard LIKE plus missing customer_email index causes full scan
+  SRE-002:
+    name: Hikari Connection Pool Exhaustion
+    service: order-service
+    trigger: pool_exhaustion mode plus 20 concurrent search requests
+    expected_metrics: [hikaricp active equals max, pending rises, HTTP 500 rises]
+    expected_logs: [connection is not available, request timed out]
+    expected_trace: [slow JDBC spans hold all three connections]
+    expected_root_cause: slow SQL retains a three-connection pool until acquisition timeout
+  SRE-003:
+    name: Dependency Timeout
+    service: inventory-service
+    trigger: inventory dependency_timeout plus order dependency_timeout
+    expected_metrics: [inventory latency rises, order 5xx rises]
+    expected_logs: [inventory request failed]
+    expected_trace: [order client span ends at timeout, inventory server span lasts four seconds]
+    expected_root_cause: inventory-service artificial delay exceeds order-service one-second timeout
+  SRE-004:
+    name: CPU Saturation
+    service: user-service
+    trigger: cpu_saturation mode plus concurrent /users requests
+    expected_metrics: [container CPU rises, user request p95 rises, DB metrics remain normal]
+    expected_logs: [user lookup mode=cpu_saturation]
+    expected_trace: [user HTTP span slow without JDBC/downstream child span]
+    expected_root_cause: synchronous inefficient prime calculation saturates the single worker CPU
+  SRE-005:
+    name: Memory Leak / OOMKilled
+    service: payment-service
+    trigger: memory_leak mode retains six MiB per second
+    expected_metrics: [container memory approaches 128Mi, restart count rises]
+    expected_logs: [retaining buffer for SRE-005]
+    expected_trace: []
+    expected_root_cause: unbounded retained Buffer array exceeds the Kubernetes memory limit
+  SRE-006:
+    name: Retry Storm
+    service: order-service
+    trigger: inventory timeout plus five immediate order retries
+    expected_metrics: [sre_dependency_retries_total jumps, downstream QPS amplified]
+    expected_logs: [five inventory request failed entries for one upstream request]
+    expected_trace: [multiple downstream client spans under one request]
+    expected_root_cause: no-backoff retries amplify a slow dependency failure
+  SRE-007:
+    name: Deployment Regression
+    service: order-service
+    trigger: deploy BAD revision and enable regression mode
+    expected_metrics: [latency after deployment exceeds before deployment]
+    expected_logs: [search mode=regression]
+    expected_trace: [JDBC span dominates request]
+    expected_root_cause: BAD commit changed indexed exact lookup to leading-wildcard scan and delay

@@ -1,0 +1,9 @@
+{
+  "_comment": "内存泄漏：需看到 payment-service 内存增长、OOMKilled 或重启状态。",
+  "question": "payment-service 为什么一直重启，是不是内存泄漏？",
+  "expected_service": "payment-service",
+  "expected_root_cause": ["内存", "Buffer", "OOM", "memory leak"],
+  "expected_evidence_types": ["Kubernetes", "Prometheus"],
+  "forbidden_wrong_causes": ["MySQL slow query", "CPU saturation"],
+  "minimum_confidence": 0.65
+}

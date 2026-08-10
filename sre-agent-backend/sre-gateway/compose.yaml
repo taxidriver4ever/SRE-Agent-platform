@@ -1,0 +1,81 @@
+# 基础编排默认兼容 CPU 环境；有 NVIDIA GPU 时叠加 compose.gpu.yaml。
+services:
+  # Evidence、用户附件和超长粘贴日志统一保存到独立 Docker MinIO。
+  # 19100/19101 避开本机其他实验项目已经占用的 19000/19001。
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    container_name: sre-agent-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    ports:
+      - "19100:9000"
+      - "19101:9001"
+    environment:
+      # 本地默认值只用于实验。共享部署必须在网关 .env 中覆盖这两个变量。
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-sreagent}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-sreagent-dev-secret}
+      # 浏览器直接 PUT 预签名 URL，需要明确允许本地 Vite 两种常用 Origin。
+      MINIO_API_CORS_ALLOW_ORIGIN: ${MINIO_API_CORS_ALLOW_ORIGIN:-http://127.0.0.1:3000,http://localhost:3000}
+    volumes:
+      # named volume 保证重建容器后 Evidence 与用户附件仍然存在。
+      - minio-data:/data
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: sre-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      # 模型文件持久化，重建容器无需重新下载。
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # 一次性初始化容器：等待 Ollama 健康后拉取 Agent 默认模型。
+  ollama-model-init:
+    image: ollama/ollama:latest
+    container_name: sre-ollama-model-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:4b}
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["ollama pull \"$$OLLAMA_MODEL\""]
+    restart: "no"
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sre-gateway
+    restart: unless-stopped
+    depends_on:
+      ollama-model-init:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+    env_file:
+      # 继续复用现有厂商密钥配置，但不把 .env 打进镜像。
+      - .env
+    environment:
+      # 容器间必须使用 Compose 服务名，不能使用 Gateway 容器自己的 localhost。
+      OLLAMA_BASE_URL: http://ollama:11434
+      GATEWAY_AUTH_DB: /app/data/auth.db
+      PROVIDER_TIMEOUT_SECONDS: ${PROVIDER_TIMEOUT_SECONDS:-180}
+    volumes:
+      - gateway-data:/app/data
+
+volumes:
+  minio-data:
+    name: sre-agent-minio-data
+  ollama-data:
+    name: sre-ollama-data
+  gateway-data:
+    name: sre-gateway-data

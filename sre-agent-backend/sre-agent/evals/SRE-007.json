@@ -1,0 +1,9 @@
+{
+  "_comment": "部署回归：必须从运行镜像 SHA 比较 GOOD..BAD，并以运行证据验证代码变更。",
+  "question": "order-service 发布后变慢了，帮我确认是否是代码回归。",
+  "expected_service": "order-service",
+  "expected_root_cause": ["回归", "LIKE", "索引", "Git"],
+  "expected_evidence_types": ["Kubernetes", "Git", "MySQL"],
+  "forbidden_wrong_causes": ["CPU saturation", "payment OOM"],
+  "minimum_confidence": 0.75
+}

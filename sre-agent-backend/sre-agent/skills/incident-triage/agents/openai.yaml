@@ -1,0 +1,4 @@
+interface:
+  display_name: "Incident Triage"
+  short_description: "Turn vague incidents into a scoped triage plan"
+  default_prompt: "Use $incident-triage to identify the service, symptom, environment, and time range."

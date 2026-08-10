@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kubernetes Debugging"
+  short_description: "Inspect pods, events, resources, and images safely"
+  default_prompt: "Use $kubernetes-debugging to inspect this Kubernetes incident using read-only tools."

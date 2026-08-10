@@ -1,0 +1,9 @@
+# 复制为 repository-bindings.yaml，并把占位域名改成真实 HTTPS Git 地址。
+# 不要把 Personal Access Token 写进 URL；私有仓库凭据应交给系统 Git Credential Manager。
+repositories:
+  order-service: https://github.com/your-org/order-service.git
+  inventory-service: https://github.com/your-org/inventory-service.git
+  user-service: https://github.com/your-org/user-service.git
+  payment-service: https://github.com/your-org/payment-service.git
+  notification-service: https://github.com/your-org/notification-service.git
+  recommendation-service: https://github.com/your-org/recommendation-service.git
