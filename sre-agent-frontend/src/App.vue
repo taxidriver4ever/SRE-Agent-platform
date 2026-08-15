@@ -24,7 +24,7 @@ const suggestions = [
   "为什么 order 很慢，但是 CPU 又不高？",
 ];
 const phaseLabels = {
-  START: "启动诊断", TRIAGE: "定位服务与症状", BASELINE_OBSERVATION: "采集健康、指标和日志基线",
+  START: "启动诊断", SYSTEM_SCAN: "系统整体扫描", TRIAGE: "定位服务与症状", BASELINE_OBSERVATION: "采集健康、指标和日志基线",
   ANALYZE: "生成候选根因", INVESTIGATE: "专项调查与交叉验证", VERIFY: "检查独立证据数量",
   REPORT: "生成结构化报告", END: "诊断完成",
 };
@@ -39,9 +39,11 @@ async function scrollToBottom() {
 /** 把公开阶段、Tool 摘要和最终报告合并到消息；不显示隐藏思维链。 */
 function applyEvent(message, event) {
   if (event.type === "conversation") currentConversationId.value = event.conversation_id;
+  else if (event.type === "intent") message.intent = event.intent;
   else if (event.type === "phase") message.phases.push(event.phase);
   else if (event.type === "tool") message.tools.push(event.record);
   else if (event.type === "final") { message.report = event.report; message.content = ""; }
+  else if (event.type === "message") { message.content = event.message || ""; message.intent = event.intent; }
   else if (event.type === "error") message.error = event.message || "诊断流发生未知错误";
 }
 
@@ -201,6 +203,9 @@ async function openConversation(conversationId) {
     }
     if (item.content.report) {
       return [{ id: item.id, role: "assistant", content: "", phases: [], tools: [], report: item.content.report, error: "" }];
+    }
+    if (item.message_type === "assistant" && item.content.message) {
+      return [{ id: item.id, role: "assistant", content: item.content.message, intent: item.content.intent || "", phases: [], tools: [], report: null, error: "" }];
     }
     // Tool Call/Tool Result 是 Conversation Store 中供上下文恢复和 Evidence
     // 回查使用的内部记录，不应该各自渲染成一个没有正文的 AI 消息。

@@ -5,7 +5,7 @@
 ## 功能
 
 - 使用 Agent Bearer Token 登录并恢复会话。
-- 调用 `POST /api/agent/chat/stream`，消费 `conversation`、`phase`、`tool`、`final` 和错误事件。
+- 调用 `POST /api/agent/chat/stream`，消费 `conversation`、`intent`、`phase`、`tool`、`message`、`final` 和错误事件。
 - 展示八阶段调查进度、根因、置信度、证据、影响范围与建议动作。
 - 历史记录只渲染用户和助手的可见消息，不为内部 Tool Call / Tool Result 创建空 AI 气泡。
 - 后端在 MySQL 中持久化会话、Evidence 和压缩状态，刷新页面不依赖浏览器内存恢复历史。

@@ -5,6 +5,7 @@
 ## 模块
 
 - `app/llm/`：Provider 无关协议与 Gateway Client，Agent 不使用厂商 SDK。
+- `app/intent/`：LLM Structured Output 意图分类与工作流闸门；合法意图确认前禁止进入工具 Runtime。
 - `app/agent/`：通用 JSON-ReAct Runtime，不再保留 calculator/current_time 等凑框架工具。
 - `app/mcp_servers/`：项目自有 FastMCP Server，只注册 Prometheus/Loki/Tempo/MySQL 与 Git 只读工具。
 - `app/mcp_clients/`：FastMCP 官方 Client 聚合层，以及第三方 Kubernetes MCP 的只读语义适配；Client 不放在 tools 中。
@@ -94,7 +95,9 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8001/api/agent/chat `
   -Headers $headers -ContentType application/json -Body $body
 ```
 
-`/api/agent/chat/stream` 返回 SSE `phase`、`tool`、`final` 事件。前端可展示公开调查步骤、工具参数与摘要，但不展示隐藏 Chain-of-Thought。
+`/api/agent/chat/stream` 返回 SSE `intent`、`phase`、`tool`、`message`、`final` 事件。前端可展示公开调查步骤、工具参数与摘要，但不展示隐藏 Chain-of-Thought。
+
+每条请求先被分类为 `SPECIFIC_INCIDENT`、`GENERAL_DIAGNOSIS`、`NEED_CLARIFICATION` 或 `OUT_OF_SCOPE`。具体故障进入 Investigation Workflow；整体巡检先执行全局 System Scan；信息不足或非运维问题只返回普通消息，不允许调用 Kubernetes、Prometheus、Loki、Tempo、MySQL 或 Git 工具。
 
 ## Structured Output 容错
 

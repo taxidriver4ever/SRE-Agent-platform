@@ -22,6 +22,7 @@ from app.code_state import CodeStateRepository, CodeStateService, initialize_cod
 from app.core.config import get_settings
 from app.core.database import ApplicationDatabase
 from app.llm import GatewayLLM
+from app.intent import IntentRouter, IntentWorkflowRouter
 from app.mcp_clients import FastMCPToolClient, KubernetesMCPAdapter
 from app.mcp_servers import build_fastmcp_server
 from app.repositories import RepositoryRegistry
@@ -111,6 +112,12 @@ def create_app() -> FastAPI:
         code_state_service=code_state_service,
         kubernetes_namespace=settings.kubernetes_namespace,
     )
+    intent_router = IntentRouter(llm)
+    intent_workflow_router = IntentWorkflowRouter(
+        intent_router,
+        diagnosis_workflow,
+        conversation_service,
+    )
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -121,6 +128,8 @@ def create_app() -> FastAPI:
         application.state.tools = tools
         application.state.agent = ToolAgent(llm, tools, settings.agent_max_iterations)
         application.state.diagnosis_workflow = diagnosis_workflow
+        application.state.intent_router = intent_router
+        application.state.intent_workflow_router = intent_workflow_router
         application.state.memory_repository = memory_repository
         application.state.code_state_repository = code_state_repository
         application.state.code_state_service = code_state_service

@@ -16,6 +16,7 @@ from app.conversation.router import get_conversation_service
 from app.conversation.service import ConversationService
 from app.conversation_memory import conversation_memory_scope
 from app.llm import GatewayConfigurationError, GatewayRequestError
+from app.intent import IntentReply, IntentWorkflowRouter, SREIntent
 from app.workflow import DiagnosisReport, DiagnosisWorkflow
 
 # 所有 Agent 能力统一挂在版本化前缀下，后续协议演进可保留 v1 兼容性。
@@ -38,10 +39,16 @@ def get_workflow(request: Request) -> DiagnosisWorkflow:
     return request.app.state.diagnosis_workflow
 
 
+def get_workflow_router(request: Request) -> IntentWorkflowRouter:
+    """取得位于任何诊断工具之前的 Intent/Workflow Router。"""
+    return request.app.state.intent_workflow_router
+
+
 @router.post("/run", response_model=AgentResult)
 async def run_agent(
     body: AgentRunRequest,
     agent: Annotated[ToolAgent, Depends(get_agent)],
+    workflow_router: Annotated[IntentWorkflowRouter, Depends(get_workflow_router)],
     _user: Annotated[CurrentUser, Depends(require_user)],
 ) -> AgentResult:
     """执行一个用户问题并返回答案、工具轨迹及 Token 统计。
@@ -49,6 +56,11 @@ async def run_agent(
     HTTP 层不参与推理，只负责输入验证、调用 ToolAgent 和异常语义转换。
     """
     try:
+        decision = await workflow_router.intent_router.classify(body.query)
+        if decision.intent is SREIntent.NEED_CLARIFICATION:
+            return AgentResult(answer="请补充具体服务、故障现象和发生时间。", steps=[])
+        if decision.intent is SREIntent.OUT_OF_SCOPE:
+            return AgentResult(answer="当前仅支持运维、系统巡检和故障排查问题。", steps=[])
         return await agent.run(body.query)
     except GatewayConfigurationError as exc:
         # 缺少 Gateway Token 属于服务端未配置，而非用户请求格式错误。
@@ -61,10 +73,10 @@ async def run_agent(
         raise HTTPException(status.HTTP_504_GATEWAY_TIMEOUT, detail=str(exc)) from exc
 
 
-@chat_router.post("/chat", response_model=DiagnosisReport)
+@chat_router.post("/chat", response_model=DiagnosisReport | IntentReply)
 async def diagnose(
     body: DiagnosisChatRequest,
-    workflow: Annotated[DiagnosisWorkflow, Depends(get_workflow)],
+    workflow_router: Annotated[IntentWorkflowRouter, Depends(get_workflow_router)],
     user: Annotated[CurrentUser, Depends(require_user)],
     conversations: Annotated[ConversationService, Depends(get_conversation_service)],
 ) -> DiagnosisReport:
@@ -74,19 +86,19 @@ async def diagnose(
     except KeyError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="conversation not found") from exc
     with conversation_memory_scope(user["id"], conversation_id):
-        report = await workflow.run(
+        result = await workflow_router.dispatch(
             body.message,
             conversation_id=conversation_id,
             user_id=user["id"],
         )
-    report.conversation_id = conversation_id
-    return report
+    result.conversation_id = conversation_id
+    return result
 
 
 @chat_router.post("/chat/stream")
 async def diagnose_stream(
     body: DiagnosisChatRequest,
-    workflow: Annotated[DiagnosisWorkflow, Depends(get_workflow)],
+    workflow_router: Annotated[IntentWorkflowRouter, Depends(get_workflow_router)],
     user: Annotated[CurrentUser, Depends(require_user)],
     conversations: Annotated[ConversationService, Depends(get_conversation_service)],
 ) -> StreamingResponse:
@@ -108,7 +120,7 @@ async def diagnose_stream(
         """后台执行工作流，并把未预期错误转换为可读 SSE 事件。"""
         try:
             with conversation_memory_scope(user["id"], conversation_id):
-                await workflow.run(
+                await workflow_router.dispatch(
                     body.message,
                     publish,
                     conversation_id=conversation_id,

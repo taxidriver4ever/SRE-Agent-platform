@@ -13,6 +13,7 @@ class WorkflowPhase(StrEnum):
     """硬性工作流阶段；顺序与任务要求完全一致。"""
 
     START = "START"
+    SYSTEM_SCAN = "SYSTEM_SCAN"
     TRIAGE = "TRIAGE"
     BASELINE_OBSERVATION = "BASELINE_OBSERVATION"
     ANALYZE = "ANALYZE"

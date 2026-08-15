@@ -7,6 +7,7 @@
 ## 核心能力
 
 - 八阶段诊断工作流，通过 SSE 实时展示调查进度、工具调用摘要和最终报告。
+- 前置 Intent Router 使用 Structured Output 将请求限定为具体故障、整体巡检、需要澄清或非运维问题；合法意图确认前不调用任何诊断工具。
 - 统一 LLM Gateway，支持 Ollama、OpenAI、Claude 和 DeepSeek，业务 Agent 不依赖厂商 SDK。
 - Prometheus、Loki、Tempo、MySQL、Kubernetes 和 Git 多源证据交叉验证。
 - MySQL 持久化会话；上下文达到约 80% 预算后生成短 Summary、State、Evidence Reference，再让旧消息退出 Active Context，原始消息永久保留。

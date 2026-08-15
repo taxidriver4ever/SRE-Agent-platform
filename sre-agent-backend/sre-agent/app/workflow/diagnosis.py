@@ -64,6 +64,9 @@ class DiagnosisWorkflow:
         *,
         conversation_id: str | None = None,
         user_id: str | None = None,
+        target: str | None = None,
+        symptom: str | None = None,
+        system_scan: bool = False,
     ) -> DiagnosisReport:
         """从 TRIAGE 走到 REPORT；模型不能跳过基线观测或证据验证。"""
         run_id = uuid4().hex
@@ -73,6 +76,8 @@ class DiagnosisWorkflow:
             run_id=run_id,
             conversation_id=conversation_id or run_id,
             user_id=user_id,
+            service=target or "unknown",
+            symptom=symptom or "待确定",
         )
         if self.conversation_service and state.user_id:
             self.conversation_service.append(
@@ -84,10 +89,12 @@ class DiagnosisWorkflow:
                 run_id=state.run_id,
             )
         await self._phase(state, WorkflowPhase.START, on_event)
-        await self._triage(state, on_event)
-        await self._baseline(state, on_event)
+        if system_scan:
+            await self._system_scan(state, on_event)
+        await self._triage(state, on_event, system_scan=system_scan)
+        await self._baseline(state, on_event, system_scan=system_scan)
         await self._analyze(state, on_event)
-        await self._investigate(state, on_event)
+        await self._investigate(state, on_event, system_scan=system_scan)
         await self._phase(state, WorkflowPhase.VERIFY, on_event)
         # 在生成模型摘要之前先检查阈值，避免把已经足够大的跨轮增量继续原样传递。
         await self._compact_context_before_summary(state)
@@ -107,18 +114,33 @@ class DiagnosisWorkflow:
         if callback:
             await callback({"type": "phase", "phase": phase.value})
 
-    async def _triage(self, state: DiagnosisState, callback: EventCallback | None) -> None:
+    async def _system_scan(self, state: DiagnosisState, callback: EventCallback | None) -> None:
+        """整体巡检先建立全局服务、Pod 和错误率视图，不预设故障服务。"""
+        await self._phase(state, WorkflowPhase.SYSTEM_SCAN, callback)
+        await self._call(state, "list_deployments", {}, "系统 Deployment 清单", callback)
+        await self._call(state, "list_pods", {}, "系统 Pod、版本与运行状态", callback)
+
+    async def _triage(
+        self,
+        state: DiagnosisState,
+        callback: EventCallback | None,
+        *,
+        system_scan: bool = False,
+    ) -> None:
         """确定 service、symptom、environment 与默认最近 30 分钟窗口。"""
         await self._phase(state, WorkflowPhase.TRIAGE, callback)
         analysis_input = state.query
-        state.service = self.catalog.resolve(analysis_input)
+        if state.service not in self.catalog.services:
+            state.service = self.catalog.resolve(f"{state.service} {analysis_input}")
         metadata = self.catalog.services.get(state.service, {})
         state.language = str(metadata.get("language", "unknown"))
         state.repository = state.service if state.service in self.catalog.services else None
         state.source_code_location = metadata.get("source_path")
         state.repository_url = metadata.get("repository_url")
         text = analysis_input.lower()
-        if any(word in text for word in ("重试", "retry", "依赖", "dependency", "timeout", "超时")):
+        if state.symptom != "待确定":
+            pass
+        elif any(word in text for word in ("重试", "retry", "依赖", "dependency", "timeout", "超时")):
             state.symptom = "dependency_timeout"
         elif any(word in text for word in ("慢", "延迟", "latency")):
             state.symptom = "latency"
@@ -129,12 +151,54 @@ class DiagnosisWorkflow:
         else:
             state.symptom = "general_incident"
         # 即使用户没有明确服务，也先列出只读 Service/Deployment，避免凭空选定根因。
-        if state.service == "unknown":
+        if state.service == "unknown" and not system_scan:
             await self._call(state, "list_deployments", {}, "K8s 服务发现", callback)
 
-    async def _baseline(self, state: DiagnosisState, callback: EventCallback | None) -> None:
+    async def _baseline(
+        self,
+        state: DiagnosisState,
+        callback: EventCallback | None,
+        *,
+        system_scan: bool = False,
+    ) -> None:
         """硬性采集健康、延迟、错误率、CPU/内存与异常日志。"""
         await self._phase(state, WorkflowPhase.BASELINE_OBSERVATION, callback)
+        if system_scan and state.service == "unknown":
+            await self._call(
+                state,
+                "query_metrics",
+                {"query": "sum by (service) (up)", "time_range_minutes": state.time_range_minutes},
+                "全服务健康基线",
+                callback,
+            )
+            await self._call(
+                state,
+                "query_metrics",
+                {
+                    "query": 'sum by (service) (rate(http_server_requests_seconds_count{status=~"5.."}[5m]))',
+                    "time_range_minutes": state.time_range_minutes,
+                },
+                "全服务 HTTP 5xx 速率",
+                callback,
+            )
+            await self._call(
+                state,
+                "query_metrics",
+                {
+                    "query": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"sre-lab\"}[5m])) or sum by (pod) (container_memory_working_set_bytes{namespace=\"sre-lab\"})",
+                    "time_range_minutes": state.time_range_minutes,
+                },
+                "全局 Pod CPU/内存",
+                callback,
+            )
+            await self._call(
+                state,
+                "query_logs",
+                {"time_range_minutes": state.time_range_minutes, "level": "error", "limit": 50},
+                "全局异常日志",
+                callback,
+            )
+            return
         service = state.service if state.service != "unknown" else "order-service"
         common = {"service": service, "time_range_minutes": state.time_range_minutes}
         # Pod 清单必须先于聚合指标采集，以便识别单实例异常与混合镜像版本。
@@ -174,9 +238,25 @@ class DiagnosisWorkflow:
             causes = [("connection pool exhaustion", "错误高峰可能由池等待超时产生", 5), ("deployment regression", "近期发布可能改变失败率", 4)]
         state.candidates = [CandidateCause(cause=c, reason=r, priority=p) for c, r, p in causes]
 
-    async def _investigate(self, state: DiagnosisState, callback: EventCallback | None) -> None:
+    async def _investigate(
+        self,
+        state: DiagnosisState,
+        callback: EventCallback | None,
+        *,
+        system_scan: bool = False,
+    ) -> None:
         """按症状选择专项策略，共享同一 State/Tool/Evidence/Report 模型。"""
         await self._phase(state, WorkflowPhase.INVESTIGATE, callback)
+        if system_scan and state.service == "unknown":
+            await self._call(
+                state,
+                "query_logs",
+                {"time_range_minutes": state.time_range_minutes, "limit": 50},
+                "跨服务近期日志",
+                callback,
+            )
+            await self._call(state, "query_slow_queries", {"time_range_minutes": 30, "limit": 10}, "系统慢查询", callback)
+            return
         service = state.service if state.service != "unknown" else "order-service"
         text = state.query.lower()
         is_regression = any(word in text for word in ("发布", "回归", "deploy", "regression"))
