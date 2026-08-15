@@ -1,4 +1,12 @@
-# Local SRE Agent Lab
+# Legacy Monorepo Snapshot（只读归档）
+
+> 此目录保存项目早期单仓库版本，仅用于历史追溯。它不参与当前构建、部署、测试或 Agent 诊断；下方旧文档中的端口、脚本和场景数量可能已经失效。
+
+当前入口：[实验工作区](../README.md) · [Infra README](../sre-lab-infra/README.md) · [平台总览](../../README.md)。
+
+---
+
+## 历史文档（不再维护）
 
 ## 1. 项目目标
 

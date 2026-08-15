@@ -52,7 +52,8 @@ class FastMCPToolClient:
                 return result.data
             return {"content": [block.model_dump(mode="json") for block in result.content]}
         except Exception as exc:
-            raise ToolExecutionError(f"MCP tool '{name}' failed: {exc}") from exc
+            detail = str(exc).strip() or exc.__class__.__name__
+            raise ToolExecutionError(f"MCP tool '{name}' failed ({exc.__class__.__name__}): {detail}") from exc
 
     async def close(self) -> None:
         """释放第三方 stdio MCP 进程；本地 in-memory 会话按调用自动关闭。"""

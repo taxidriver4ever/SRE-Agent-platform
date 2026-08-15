@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from contextlib import closing
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -12,6 +15,7 @@ from app.conversation import ConversationService
 from app.conversation_memory import ConversationCompactionService, ConversationMemoryRepository
 from app.conversation_memory.models import CompactionOutput, ShortContextState
 from app.llm.base import LLMMessage, LLMResponse
+from app.workflow.diagnosis import DiagnosisWorkflow
 from tests.mysql_support import mysql_test_database
 
 
@@ -66,6 +70,53 @@ def valid_compaction(source_message_id: str) -> dict[str, object]:
             "source_tool_name": "explain_sql",
         }],
     }
+
+
+def test_report_persistence_does_not_wait_for_slow_background_compaction():
+    class SlowContextService:
+        compaction_ratio = 0.8
+        repository = SimpleNamespace(compaction_count=lambda *_: 0)
+
+        @staticmethod
+        def active_token_count(*_):
+            return 123
+
+        @staticmethod
+        async def maybe_compact(*_):
+            await asyncio.sleep(60)
+
+    class ConversationRecorder:
+        calls: list[tuple] = []
+
+        def append(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    class FakeReport:
+        context_compaction: dict[str, object] = {}
+
+        def model_dump(self, **_):
+            return {"context_compaction": dict(self.context_compaction)}
+
+    async def scenario():
+        workflow = object.__new__(DiagnosisWorkflow)
+        workflow.context_service = SlowContextService()
+        workflow.conversation_service = ConversationRecorder()
+        workflow._background_tasks = set()
+        state = SimpleNamespace(user_id="user-a", conversation_id="conversation-a", run_id="run-a")
+        report = FakeReport()
+
+        started = time.perf_counter()
+        await workflow._update_conversation_context(state, report)
+        elapsed = time.perf_counter() - started
+
+        assert elapsed < 0.5
+        assert workflow.conversation_service.calls
+        assert len(workflow._background_tasks) == 1
+        for task in workflow._background_tasks:
+            task.cancel()
+        await asyncio.gather(*workflow._background_tasks, return_exceptions=True)
+
+    asyncio.run(scenario())
 
 
 def test_normal_phase_keeps_messages_tool_calls_and_results_in_active_context(memory_stack):

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -21,6 +22,7 @@ from app.workflow import DiagnosisReport, DiagnosisWorkflow
 router = APIRouter(prefix="/v1/agent", tags=["agent"])
 # 新的诊断聊天接口保持任务指定的 /api/agent/chat 路径，旧 v1 ReAct API 继续兼容。
 chat_router = APIRouter(prefix="/api/agent", tags=["sre-diagnosis"])
+logger = logging.getLogger(__name__)
 
 
 def get_agent(request: Request) -> ToolAgent:
@@ -113,10 +115,13 @@ async def diagnose_stream(
                     user_id=user["id"],
                 )
         except Exception as exc:  # HTTP 流已开始，只能通过事件报告错误。
+            detail = str(exc).strip()
+            error_message = f"{exc.__class__.__name__}: {detail}" if detail else exc.__class__.__name__
+            logger.exception("diagnosis stream failed: conversation_id=%s", conversation_id)
             conversations.append(
-                user["id"], conversation_id, "assistant", {"error": str(exc)[:1000]}
+                user["id"], conversation_id, "assistant", {"error": error_message[:1000]}
             )
-            await queue.put({"type": "error", "message": str(exc)})
+            await queue.put({"type": "error", "message": error_message})
         finally:
             await queue.put({"type": "done"})
 

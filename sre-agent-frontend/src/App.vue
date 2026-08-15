@@ -194,14 +194,20 @@ async function openConversation(conversationId) {
   if (!response.ok) return;
   const detail = await response.json();
   currentConversationId.value = detail.id;
-  messages.value = detail.messages.map((item) => {
+  messages.value = detail.messages.flatMap((item) => {
     if (item.role === "user") {
-      return { id: item.id, role: "user", content: item.content.message || "" };
+      const content = item.content.message || "";
+      return content ? [{ id: item.id, role: "user", content }] : [];
     }
     if (item.content.report) {
-      return { id: item.id, role: "assistant", content: "", phases: [], tools: [], report: item.content.report, error: "" };
+      return [{ id: item.id, role: "assistant", content: "", phases: [], tools: [], report: item.content.report, error: "" }];
     }
-    return { id: item.id, role: "assistant", content: "", phases: [], tools: [], report: null, error: item.content.error || "" };
+    // Tool Call/Tool Result 是 Conversation Store 中供上下文恢复和 Evidence
+    // 回查使用的内部记录，不应该各自渲染成一个没有正文的 AI 消息。
+    const error = item.message_type === "assistant" ? (item.content.error || "") : "";
+    return error
+      ? [{ id: item.id, role: "assistant", content: "", phases: [], tools: [], report: null, error }]
+      : [];
   });
   await scrollToBottom();
 }

@@ -19,11 +19,16 @@ from fastmcp.exceptions import ToolError
 
 _COMMIT = re.compile(r"^[0-9a-fA-F]{40}$")
 _ENTRY_NAME = re.compile(
-    r"(Controller|Service|ServiceImpl|Repository|Mapper|Client|Handler|Router|Routes|UseCase)\.(java|kt|py|js|ts|tsx)$",
+    r"(Controller|Service|ServiceImpl|Repository|Mapper|Client|Handler|Router|Routes|UseCase)\.(java|kt|py|js|ts|tsx|go)$",
     re.IGNORECASE,
 )
-_MANIFESTS = {"pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "package.json"}
+_MANIFESTS = {
+    "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
+    "package.json", "go.mod", "go.sum", "requirements.txt", "pyproject.toml",
+}
 _CONFIG_SUFFIXES = (".yml", ".yaml", ".properties", ".toml")
+_SOURCE_SUFFIXES = (".java", ".kt", ".py", ".js", ".ts", ".tsx", ".go")
+_ENTRY_DIRECTORIES = {"controller", "service", "repository", "client", "handler", "routes", "api"}
 
 
 class CodeStateService:
@@ -136,7 +141,7 @@ class CodeStateService:
     def _select_initial_paths(self, paths: list[str]) -> list[str]:
         manifests = [path for path in paths if Path(path).name in _MANIFESTS]
         configs = [path for path in paths if self._is_config(path)][:40]
-        entries = [path for path in paths if _ENTRY_NAME.search(Path(path).name)][:100]
+        entries = [path for path in paths if self._is_entry(path)][:100]
         return list(dict.fromkeys([*manifests, *configs, *entries]))[:self.max_files]
 
     async def _read_selected(
@@ -257,6 +262,8 @@ class CodeStateService:
             patterns = [re.compile(r"^\s*(?:async\s+)?def\s+(\w+)\s*\(")]
         elif path.endswith((".js", ".ts", ".tsx")):
             patterns = [re.compile(r"\b(?:async\s+)?(?:function\s+)?(\w+)\s*\([^)]*\)\s*(?:\{|=>)")]
+        elif path.endswith(".go"):
+            patterns = [re.compile(r"^\s*func\s+(?:\([^)]*\)\s*)?(\w+)\s*\(")]
         for index, line in enumerate(lines, start=1):
             for pattern in patterns:
                 match = pattern.search(line)
@@ -283,7 +290,15 @@ class CodeStateService:
 
     @classmethod
     def _is_navigation_file(cls, path: str) -> bool:
-        return Path(path).name in _MANIFESTS or cls._is_config(path) or bool(_ENTRY_NAME.search(Path(path).name))
+        return Path(path).name in _MANIFESTS or cls._is_config(path) or cls._is_entry(path)
+
+    @staticmethod
+    def _is_entry(path: str) -> bool:
+        normalized = path.replace("\\", "/").lower()
+        parts = set(normalized.split("/")[:-1])
+        return normalized.endswith(_SOURCE_SUFFIXES) and (
+            bool(_ENTRY_NAME.search(Path(path).name)) or bool(parts & _ENTRY_DIRECTORIES)
+        )
 
     @classmethod
     def _kind(cls, path: str) -> str:
@@ -292,8 +307,9 @@ class CodeStateService:
             return "manifest"
         if cls._is_config(path):
             return "config"
-        for token, kind in (("controller", "controller"), ("service", "service"), ("repository", "repository"), ("mapper", "repository")):
-            if token in name:
+        normalized = path.replace("\\", "/").lower()
+        for token, kind in (("controller", "controller"), ("handler", "controller"), ("routes", "controller"), ("/api/", "controller"), ("service", "service"), ("repository", "repository"), ("mapper", "repository")):
+            if token in name or token in normalized:
                 return kind
         return "component"
 

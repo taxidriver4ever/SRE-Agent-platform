@@ -74,7 +74,7 @@ docker-compose -f compose.yml up -d ollama ollama-model-init
 
 Set-Location D:\SRE-Agent-platform\sre-agent-backend\sre-agent
 $env:GATEWAY_API_KEY = "从 POST /v1/auth/tokens 获得的 Token"
-python -m pip install -r requirements-dev.txt
+python -m pip install -r requirements.txt
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8001
 ```
 
@@ -95,6 +95,12 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8001/api/agent/chat `
 ```
 
 `/api/agent/chat/stream` 返回 SSE `phase`、`tool`、`final` 事件。前端可展示公开调查步骤、工具参数与摘要，但不展示隐藏 Chain-of-Thought。
+
+## Structured Output 容错
+
+模型决策和上下文压缩结果都必须通过 Pydantic Schema 校验。JSON 格式错误会先执行受限 JSON Repair 并重新校验；字段缺失或类型错误会把安全的校验信息反馈给模型。常规重试仍失败后，系统提供预设 JSON 模板，让模型基于原始输出重新填充。模板结果仍无效时，本轮决策返回结构化失败；压缩任务则放弃本次 State 更新并保留 Conversation Store 中的原始消息，不用错误 State 覆盖已有记忆。
+
+该流程只修复结构，不改变工具权限，也不会执行模型输出中的任意代码或 SQL。
 
 最终报告中的每条证据包含 `evidence_id` 和 `source_references`。User/Assistant Message、Tool Call 和完整 Tool Result 全部永久写入 MySQL Conversation Store；正常阶段全部保留在 Active Context。活动上下文加预留输出达到模型窗口约 80% 后，模型生成短 Conversation Summary、短 Context State 和可检索 Memory Item，成功提交后旧消息退出 Active Context，但原始记录不删除。`evidence_id` 就是原始 Tool Result Message ID，可通过 `GET /api/agent/evidence/{run_id}/{evidence_id}` 在当前用户权限内回查。
 
@@ -139,3 +145,5 @@ python evals/run_evals.py --case SRE-001
 ```
 
 当前代码包含 MCP 安全、Agent、API、MySQL Conversation Compaction、Memory 权限隔离、Code State 增量更新与 Source Reference 回归测试；最终通过数以本机 `pytest` 输出为准。
+
+返回 [平台总览](../../README.md)。

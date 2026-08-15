@@ -1,4 +1,4 @@
-# SRE Agent Backend - LLM Gateway Auth
+# SRE LLM Gateway
 
 当前实现 API Token 鉴权和非流式 LLM Gateway 调用链，使用 SQLAlchemy ORM + SQLite，不包含账号密码或 JWT。
 
@@ -92,6 +92,16 @@ Authorization: Bearer gw_sk_xxx
 
 当前版本只支持非流式请求，`stream: true` 会返回参数校验错误。
 
+## API 一览
+
+| 方法 | 路径 | 鉴权 | 作用 |
+| --- | --- | --- | --- |
+| POST | `/v1/auth/tokens` | 无 | 创建 Gateway Token，明文仅返回一次 |
+| GET | `/v1/auth/check` | Bearer | 校验 Token 状态 |
+| POST | `/v1/gateway/chat/completions` | Bearer | 执行一次非流式模型调用 |
+
+Gateway 不保存提示词和模型回复，只记录 Provider、模型、Token 用量、耗时、成功状态和必要的操作审计。SQLite 仅属于 Gateway 自身，不保存 Agent 会话；Agent 会话与 State 使用独立 MySQL。
+
 Ollama 模型不是在网关代码中写死的。每次请求都从 JSON 的 `model` 字段选择，
 `ollama/` 是路由前缀，传给 Ollama 的实际名称是斜杠后的部分。例如同一个网关
 进程可先后接收 `ollama/llama3.2:3b` 和 `ollama/deepseek-r1:7b`。目标模型需先
@@ -137,3 +147,5 @@ Invoke-RestMethod http://127.0.0.1:11434/api/tags
 ```bash
 pytest
 ```
+
+返回 [平台总览](../../README.md)。

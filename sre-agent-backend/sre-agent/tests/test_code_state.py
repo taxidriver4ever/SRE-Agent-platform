@@ -162,3 +162,16 @@ def test_code_state_tool_exposes_navigation_parameters_only(tmp_path: Path):
     properties = set(asyncio.run(schema())["properties"])
     assert properties == {"repository_name", "query", "kinds", "limit"}
     assert properties.isdisjoint({"sql", "table", "path", "commit_sha"})
+
+
+def test_go_key_directories_and_symbols_are_navigation_entries():
+    assert CodeStateService._is_entry("internal/handler/http.go")
+    assert CodeStateService._is_entry("internal/service/notification.go")
+    assert CodeStateService._is_entry("internal/repository/memory.go")
+    assert not CodeStateService._is_entry("internal/domain/order.go")
+
+    symbols = CodeStateService._symbols(
+        "internal/handler/http.go",
+        "package handler\nfunc (h *Handler) ServeHTTP(w Writer, r Request) {}\nfunc Health() {}\n",
+    )
+    assert [item[0] for item in symbols] == ["http#ServeHTTP", "http#Health"]

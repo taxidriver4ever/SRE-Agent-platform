@@ -1,6 +1,8 @@
 """证据驱动的通用与专项 SRE 工作流实现。"""
 
+import asyncio
 import json
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -25,6 +27,7 @@ from app.workflow.models import (
 )
 
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
+logger = logging.getLogger(__name__)
 
 
 class DiagnosisWorkflow:
@@ -52,6 +55,7 @@ class DiagnosisWorkflow:
         self.conversation_service = conversation_service
         self.code_state_service = code_state_service
         self.kubernetes_namespace = kubernetes_namespace
+        self._background_tasks: set[asyncio.Task[None]] = set()
 
     async def run(
         self,
@@ -224,6 +228,7 @@ class DiagnosisWorkflow:
         source_path = self.catalog.services.get(service, {}).get("source_path")
         navigation_references: list[dict[str, Any]] = []
         if self.code_state_service and state.repository and state.runtime_commit:
+            navigation_started = time.perf_counter()
             try:
                 await self.code_state_service.ensure(state.repository, state.runtime_commit)
                 navigation = await self._call(
@@ -250,8 +255,23 @@ class DiagnosisWorkflow:
                         navigation_references.append(item)
                         if len(navigation_references) == 2:
                             break
-            except (ValueError, ToolExecutionError):
+            except Exception as exc:
+                # Code State 是源码导航增强，不得因为首次扫描、Git 历史缺失或
+                # 可选模型增强失败而中断主诊断。记录可见错误后回退 Catalog 路径。
                 navigation_references = []
+                error = self._exception_text(exc)
+                record = ToolCallRecord(
+                    tool_name="refresh_code_state",
+                    arguments={"repository": state.repository, "commit": state.runtime_commit},
+                    result_summary="",
+                    timestamp=datetime.now(timezone.utc),
+                    duration_ms=int((time.perf_counter() - navigation_started) * 1000),
+                    error=error,
+                    evidence_id=None,
+                )
+                state.timeline.append(record)
+                if callback:
+                    await callback({"type": "tool", "record": record.model_dump(mode="json")})
         if not navigation_references and source_path:
             navigation_references = [{"path": str(source_path)}]
         for reference in navigation_references:
@@ -334,8 +354,8 @@ class DiagnosisWorkflow:
                 source_references=references,
                 supports_conclusion=self._supports_conclusion(tool_name, summary),
             ))
-        except ToolExecutionError as exc:
-            error = str(exc)
+        except Exception as exc:
+            error = self._exception_text(exc)
             summary = ""
             if self.conversation_service and state.user_id:
                 self.conversation_service.append(
@@ -356,6 +376,11 @@ class DiagnosisWorkflow:
         if callback:
             await callback({"type": "tool", "record": record.model_dump(mode="json")})
         return result
+
+    @staticmethod
+    def _exception_text(exc: BaseException) -> str:
+        detail = str(exc).strip()
+        return f"{exc.__class__.__name__}: {detail}" if detail else exc.__class__.__name__
 
     @staticmethod
     def _compact_result(value: Any, limit: int = 900) -> str:
@@ -481,19 +506,6 @@ class DiagnosisWorkflow:
         """
         if self.context_service is None or self.conversation_service is None or not state.user_id:
             return
-        self.conversation_service.append(
-            state.user_id,
-            state.conversation_id,
-            "assistant",
-            {"report": report.model_dump(mode="json")},
-            message_type="assistant",
-            run_id=state.run_id,
-        )
-        compression_error = ""
-        try:
-            await self.context_service.maybe_compact(state.user_id, state.conversation_id)
-        except (GatewayError, ValueError) as exc:
-            compression_error = str(exc)[:300]
         report.context_compaction.update({
             "storage": "mysql",
             "compaction_ratio": str(self.context_service.compaction_ratio),
@@ -504,8 +516,37 @@ class DiagnosisWorkflow:
                 state.user_id, state.conversation_id
             ),
         })
-        if compression_error:
-            report.context_compaction["last_error"] = compression_error
+        self.conversation_service.append(
+            state.user_id,
+            state.conversation_id,
+            "assistant",
+            {"report": report.model_dump(mode="json")},
+            message_type="assistant",
+            run_id=state.run_id,
+        )
+        # 报告持久化后立即允许 SSE 返回 final。压缩是增强任务，即使本地模型
+        # 冷启动或生成缓慢，也不能让已经完成的诊断在页面上继续卡数分钟。
+        task = asyncio.create_task(
+            self._compact_after_report(state.user_id, state.conversation_id),
+            name=f"compact-{state.conversation_id}",
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _compact_after_report(self, user_id: str, conversation_id: str) -> None:
+        try:
+            await self.context_service.maybe_compact(user_id, conversation_id)
+        except (GatewayError, ValueError, TimeoutError) as exc:
+            logger.warning(
+                "background conversation compaction failed: conversation_id=%s error=%s",
+                conversation_id,
+                self._exception_text(exc),
+            )
+        except Exception:
+            logger.exception(
+                "unexpected background compaction failure: conversation_id=%s",
+                conversation_id,
+            )
 
     async def _compact_context_before_summary(self, state: DiagnosisState) -> None:
         """在本轮 LLM 摘要前压缩达到预算阈值的持久化 Conversation Message。
@@ -516,8 +557,11 @@ class DiagnosisWorkflow:
         if self.context_service is None or not state.user_id:
             return
         try:
-            await self.context_service.maybe_compact(state.user_id, state.conversation_id)
-        except (GatewayError, ValueError):
+            await asyncio.wait_for(
+                self.context_service.maybe_compact(state.user_id, state.conversation_id),
+                timeout=30,
+            )
+        except (GatewayError, ValueError, TimeoutError):
             return
 
     def _report(self, state: DiagnosisState) -> DiagnosisReport:
