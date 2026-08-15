@@ -99,11 +99,51 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8001/api/agent/chat `
 
 每条请求先被分类为 `SPECIFIC_INCIDENT`、`GENERAL_DIAGNOSIS`、`NEED_CLARIFICATION` 或 `OUT_OF_SCOPE`。具体故障进入 Investigation Workflow；整体巡检先执行全局 System Scan；信息不足或非运维问题只返回普通消息，不允许调用 Kubernetes、Prometheus、Loki、Tempo、MySQL 或 Git 工具。
 
+### Intent Schema
+
+```json
+{
+  "intent": "SPECIFIC_INCIDENT",
+  "target": "order-service",
+  "symptom": "high_latency"
+}
+```
+
+- `intent` 是严格枚举，禁止模型生成其他分类。
+- `SPECIFIC_INCIDENT` 必须同时提供非空 `target` 和 `symptom`，否则 Schema 校验失败并要求模型改判或补齐。
+- `NEED_CLARIFICATION`、`OUT_OF_SCOPE` 的 `target` 和 `symptom` 必须为 `null`。
+- `target` 最终还会经过 Service Catalog 归一化；模型生成的任意服务名不会直接成为工具参数。
+
+### Workflow Router
+
+| Intent | 路径 | Tool 权限 |
+| --- | --- | --- |
+| `SPECIFIC_INCIDENT` | Intent → TRIAGE → Baseline → Investigation → Verify → Report | 允许只读工具 |
+| `GENERAL_DIAGNOSIS` | Intent → `SYSTEM_SCAN` → TRIAGE → 全局 Baseline → Investigation → Report | 允许只读工具 |
+| `NEED_CLARIFICATION` | Intent → 普通回复 | 禁止工具调用 |
+| `OUT_OF_SCOPE` | Intent → 能力边界提示 | 禁止工具调用 |
+
+`SYSTEM_SCAN` 会读取全局 Deployment、Pod、服务健康、按服务聚合的 5xx、Pod CPU/内存和全局错误日志。服务仍未知时保持 `unknown`，不会退回假定 `order-service`。
+
+### SSE 事件
+
+| 事件 | 内容 |
+| --- | --- |
+| `conversation` | 服务端确认的持久会话 ID |
+| `intent` | 分类后的 `intent`、`target`、`symptom` |
+| `phase` | `SYSTEM_SCAN`、`TRIAGE` 等公开工作流阶段 |
+| `tool` | 只读工具名称、参数、耗时和结果摘要 |
+| `message` | 澄清问题或能力边界普通回复 |
+| `final` | 完整结构化诊断报告 |
+| `error` | SSE 建立后的可读错误 |
+
 ## Structured Output 容错
 
 模型决策和上下文压缩结果都必须通过 Pydantic Schema 校验。JSON 格式错误会先执行受限 JSON Repair 并重新校验；字段缺失或类型错误会把安全的校验信息反馈给模型。常规重试仍失败后，系统提供预设 JSON 模板，让模型基于原始输出重新填充。模板结果仍无效时，本轮决策返回结构化失败；压缩任务则放弃本次 State 更新并保留 Conversation Store 中的原始消息，不用错误 State 覆盖已有记忆。
 
 该流程只修复结构，不改变工具权限，也不会执行模型输出中的任意代码或 SQL。
+
+Intent Router 在模板回填仍失败时采用更严格的失败策略：保存首次原始模型输出用于排查，并返回 `NEED_CLARIFICATION`。因此结构错误不能绕过 Intent 闸门触发诊断工具。
 
 最终报告中的每条证据包含 `evidence_id` 和 `source_references`。User/Assistant Message、Tool Call 和完整 Tool Result 全部永久写入 MySQL Conversation Store；正常阶段全部保留在 Active Context。活动上下文加预留输出达到模型窗口约 80% 后，模型生成短 Conversation Summary、短 Context State 和可检索 Memory Item，成功提交后旧消息退出 Active Context，但原始记录不删除。`evidence_id` 就是原始 Tool Result Message ID，可通过 `GET /api/agent/evidence/{run_id}/{evidence_id}` 在当前用户权限内回查。
 
@@ -137,6 +177,7 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8001/api/agent/chat `
 - Git 仅 read/search/diff；`repository` 必须来自 Service Catalog 白名单，路径不能逃逸对应独立仓库，并优先读取 Pod 正在运行的 SHA。
 - `search_code_state` 的 SQL 与表名固定，模型只能提交仓库名、关键词、组件类型和条数；查询结果不含源码，Reference 始终绑定完整 commit SHA。
 - Tool Call 与 Tool Result 原文永久进入 MySQL Conversation Store；压缩成功后旧原文退出 Active Context，短 State/Evidence 进入专用 Memory 表。
+- Intent 判断仅调用 LLM Gateway；分类成功前不会读取工具清单或执行任何 MCP/Kubernetes 调用。
 - Tool 有参数校验、15 秒超时、结构化错误；工作流最多 12 步。
 - VERIFY 过滤空查询；少于两个独立证据源只能报告“高可能性候选根因”。
 

@@ -10,6 +10,21 @@
 - 历史记录只渲染用户和助手的可见消息，不为内部 Tool Call / Tool Result 创建空 AI 气泡。
 - 后端在 MySQL 中持久化会话、Evidence 和压缩状态，刷新页面不依赖浏览器内存恢复历史。
 
+## 意图与 SSE 展示
+
+前端不自行猜测意图，只消费后端已校验的 SSE 事件：
+
+| 事件 | 页面行为 |
+| --- | --- |
+| `intent` | 保存本轮分类结果，不触发任何浏览器侧工具逻辑 |
+| `phase: SYSTEM_SCAN` | 显示“系统整体扫描”进度 |
+| `phase` / `tool` | 更新诊断阶段和只读工具摘要 |
+| `message` | 直接展示澄清问题或非运维提示，不创建空报告卡片 |
+| `final` | 渲染证据、根因链、置信度和修复建议 |
+| `error` | 显示诊断失败原因 |
+
+`NEED_CLARIFICATION` 和 `OUT_OF_SCOPE` 回复会作为普通 assistant 消息写入 Conversation Store。重新打开历史会话时，页面会恢复其正文，同时继续过滤内部 Tool Call / Tool Result，避免出现没有消息的 AI 头像。
+
 ## 本地开发
 
 要求 Node.js 22+。

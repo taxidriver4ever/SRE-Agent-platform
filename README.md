@@ -20,8 +20,13 @@
 ```mermaid
 flowchart LR
     U["浏览器 / SRE"] --> F["Vue 诊断台 :3000"]
-    F -->|"登录、历史、SSE"| A["SRE Agent :8001"]
-    A --> G["LLM Gateway :8000"]
+    F -->|"登录、历史、SSE"| I["Intent Router"]
+    I -->|"具体故障"| A["Investigation Workflow :8001"]
+    I -->|"整体巡检"| SS["System Scan"]
+    SS --> A
+    I -->|"需澄清 / 非运维"| F
+    I --> G["LLM Gateway :8000"]
+    A --> G
     G --> O["Ollama :11434"]
     G -.-> P["云端模型 Provider"]
     A --> M[("Agent MySQL :13308")]
@@ -34,6 +39,27 @@ flowchart LR
 ```
 
 一次诊断遵循：确定范围 → 建立健康、指标和日志基线 → 生成候选根因 → 专项调查 → 跨源验证 → 输出带 Evidence Reference 的报告。证据不足时只报告候选根因，不把推测包装成事实。
+
+## 意图识别与工作流分流
+
+所有聊天请求先经过只使用 LLM 的 Intent Router。分类结果必须通过 Structured Output 和 Pydantic Schema 校验；在分类成功以前，系统不会调用 Kubernetes、Prometheus、Loki、Tempo、MySQL 或 Git 工具。
+
+```json
+{
+  "intent": "SPECIFIC_INCIDENT",
+  "target": "order-service",
+  "symptom": "high_latency"
+}
+```
+
+| Intent | 条件 | 后端行为 |
+| --- | --- | --- |
+| `SPECIFIC_INCIDENT` | 已提供具体服务和故障现象 | 进入 Investigation Workflow |
+| `GENERAL_DIAGNOSIS` | 请求系统整体巡检 | 先执行全局 System Scan，再进入分析与调查 |
+| `NEED_CLARIFICATION` | 服务、现象或范围不足 | 要求用户补充信息，不调用工具 |
+| `OUT_OF_SCOPE` | 非运维或非故障排查问题 | 返回能力边界提示，不调用工具 |
+
+JSON 格式错误先进行有限 Repair；字段或类型错误会携带安全的 Schema 错误让模型重试 2～3 次；仍失败则使用预设模板回填。模板依然无效时安全降级为 `NEED_CLARIFICATION`，不会让不可信分类进入工具 Runtime。
 
 ## 仓库结构
 
