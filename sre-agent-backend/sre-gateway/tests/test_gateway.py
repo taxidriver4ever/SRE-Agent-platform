@@ -38,6 +38,19 @@ class FailingProviderAdapter(BaseProviderAdapter):
         raise ProviderRequestError("provider unavailable", 500)
 
 
+class RecordingOllamaAdapter(FakeProviderAdapter):
+    """记录网关按请求数据传入的 Ollama 模型名。"""
+
+    provider_name = "ollama"
+
+    def __init__(self) -> None:
+        self.models: list[str] = []
+
+    async def complete(self, request, model):
+        self.models.append(model)
+        return await super().complete(request, model)
+
+
 def test_model_router_supports_four_providers():
     """显式前缀和模型名称可以路由到四个目标厂商。"""
     router = ModelRouter()
@@ -76,6 +89,7 @@ def test_gateway_endpoint_calls_provider_and_records_usage(tmp_path):
             ModelRouter(),
             {"openai": FakeProviderAdapter()},
             real_service.usage_repository,
+            real_service.operation_repository,
         )
         token = client.post("/v1/auth/tokens").json()["token"]
         response = client.post(
@@ -105,7 +119,45 @@ def test_gateway_endpoint_calls_provider_and_records_usage(tmp_path):
             FROM gateway_usage_logs
             """
         ).fetchone()
+        operation = connection.execute(
+            """
+            SELECT operation, token_id, success, status_code
+            FROM gateway_operation_logs
+            WHERE operation = 'gateway.chat.completion'
+            """
+        ).fetchone()
     assert log == ("openai", "gpt-4o-mini", 17, 1, 200)
+    assert operation == ("gateway.chat.completion", 1, 1, 200)
+
+
+def test_gateway_selects_ollama_model_from_each_request(tmp_path):
+    """Ollama 模型由每次请求的 model 数据决定，不绑定为 qwen3。"""
+    app = create_app(tmp_path / "ollama-model-selection.db")
+    adapter = RecordingOllamaAdapter()
+    with TestClient(app) as client:
+        real_service = app.state.gateway_service
+        app.state.gateway_service = GatewayService(
+            ProtocolParser(),
+            ModelRouter(),
+            {"ollama": adapter},
+            real_service.usage_repository,
+            real_service.operation_repository,
+        )
+        token = client.post("/v1/auth/tokens").json()["token"]
+        headers = {"Authorization": f"Bearer {token}"}
+        for model in ("llama3.2:3b", "deepseek-r1:7b"):
+            response = client.post(
+                "/v1/gateway/chat/completions",
+                headers=headers,
+                json={
+                    "model": f"ollama/{model}",
+                    "messages": [{"role": "user", "content": "你好"}],
+                },
+            )
+            assert response.status_code == 200
+            assert response.json()["model"] == model
+
+    assert adapter.models == ["llama3.2:3b", "deepseek-r1:7b"]
 
 
 def test_gateway_failure_returns_502_and_records_failure(tmp_path):
@@ -119,6 +171,7 @@ def test_gateway_failure_returns_502_and_records_failure(tmp_path):
             ModelRouter(),
             {"openai": FailingProviderAdapter()},
             real_service.usage_repository,
+            real_service.operation_repository,
         )
         token = client.post("/v1/auth/tokens").json()["token"]
         response = client.post(

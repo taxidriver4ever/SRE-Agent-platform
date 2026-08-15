@@ -1,6 +1,6 @@
 # SRE Agent Backend
 
-单 Agent 后端通过统一 `GatewayLLM` 连接 `sre-gateway → Docker Ollama/qwen3:4b`。项目自有工具使用 FastMCP 3.4.5；Kubernetes 改为维护活跃的 `containers/kubernetes-mcp-server`，以只读、单集群、core 工具集模式直接调用 Kubernetes API。
+单 Agent 后端通过统一 `GatewayLLM` 连接 `sre-gateway → Docker Ollama`，实际模型由请求数据指定。项目自有工具使用 FastMCP 3.4.5；Kubernetes 改为维护活跃的 `containers/kubernetes-mcp-server`，以只读、单集群、core 工具集模式直接调用 Kubernetes API。
 
 ## 模块
 
@@ -9,11 +9,11 @@
 - `app/mcp_servers/`：项目自有 FastMCP Server，只注册 Prometheus/Loki/Tempo/MySQL 与 Git 只读工具。
 - `app/mcp_clients/`：FastMCP 官方 Client 聚合层，以及第三方 Kubernetes MCP 的只读语义适配；Client 不放在 tools 中。
 - `app/repositories/`：从 K8s `repository-url` 注解建立模块→远程仓库绑定，并按运行 SHA 创建浅克隆缓存。
-- `app/context/`：Active Context Compaction、Evidence Store 与 Source Reference。
-- `app/storage/`：Docker MinIO 客户端、完整 Evidence 对象读写和短时效签名。
-- `app/uploads/`：用户附件预签名直传、完成校验、会话绑定和下载签名。
 - `app/auth/`：PBKDF2 密码登录、随机 Bearer Token、数据库验证与注销撤销。
-- `app/conversation/`：按用户隔离的 Conversation/Message SQLite 持久化与历史缓存 API。
+- `app/conversation/`：按用户隔离的 Conversation/Message MySQL 持久化与历史缓存 API。
+- `app/conversation_memory/`：80% 预算压缩、短 State、MySQL Repository、请求 Scope 与固定表只读检索工具。
+- `app/evidence/`：Tool Result 的外部来源引用模型；完整原文仍属于 Conversation Message。
+- `app/code_state/`：Git 仓库导航 State、首次有限扫描、按 commit diff 增量更新与固定表只读检索。
 - `app/workflow/`：八阶段硬性工作流、专项策略、证据门槛与统一报告模型。
 - `app/api/`：旧 `/v1/agent/run`、结构化 `/api/agent/chat` 和 SSE `/api/agent/chat/stream`。
 - `skills/`：12 个独立 SRE Skill，覆盖语言运行时、Kubernetes、数据库、依赖、发布、Tracing 与证据综合。
@@ -39,27 +39,38 @@ TOOL_OUTPUT_LIMIT=12000
 KUBERNETES_MCP_VERSION=0.0.65
 SRE_REPOSITORY_CACHE_PATH=D:\SRE-Agent-platform\.cache\sre-agent-repositories
 SRE_REPOSITORY_ALLOWED_HOSTS=github.com,gitlab.com,bitbucket.org
-MINIO_ENDPOINT=127.0.0.1:19100
-MINIO_PUBLIC_ENDPOINT=127.0.0.1:19100
-MINIO_ACCESS_KEY=sreagent
-MINIO_SECRET_KEY=sreagent-dev-secret
-MINIO_BUCKET=sre-agent-evidence
-MINIO_PRESIGN_EXPIRE_MINUTES=15
-UPLOAD_MAX_BYTES=52428800
-LARGE_TEXT_THRESHOLD_BYTES=12288
-ACTIVE_CONTEXT_CHARACTER_BUDGET=8000
-APPLICATION_DATABASE_PATH=.data/sre-agent.sqlite3
+MODEL_CONTEXT_WINDOW=32768
+CONTEXT_COMPACTION_RATIO=0.80
+CONTEXT_RESERVED_OUTPUT_TOKENS=4096
+APPLICATION_MYSQL_HOST=127.0.0.1
+APPLICATION_MYSQL_PORT=13308
+APPLICATION_MYSQL_USER=sre_agent
+APPLICATION_MYSQL_DATABASE=sre_agent
 AUTH_TOKEN_TTL_HOURS=24
-SRE_INITIAL_USERNAME=admin
-SRE_INITIAL_PASSWORD=admin123
 ```
+
+本地登录用户名和密码只保存在未提交的 `.env` 中，不写入本配置示例或文档。
+
+业务表不集中在 Core 层，各模块分别拥有自己的 MySQL 建表语句：
+
+- `app/auth/sql/schema.sql`：`users`、`auth_tokens`
+- `app/conversation/sql/schema.sql`：`conversations`、`conversation_messages`
+- `app/conversation_memory/sql/schema.sql`：`conversation_compactions`、`conversation_memory_items`
+- `app/code_state/sql/schema.sql`：`code_state_repositories`、`code_state_components`
+
+每份 SQL 都包含字段级 `COMMENT` 和表级 `COMMENT`。各模块的 `schema.py` 只负责定位并执行本模块 SQL；`app/core/database.py` 只负责通用 MySQL 连接、事务和 SQL 文件执行，不依赖任何业务表。
 
 ## 启动
 
+MySQL 数据统一持久化到后端根目录的 `data/mysql`，不在 Agent 或 Gateway 模块内生成数据库目录。
+
 ```powershell
-# MinIO 与 Ollama 都由网关 Compose 编排；19101 是 MinIO 管理控制台。
-Set-Location D:\SRE-Agent-platform\sre-agent-backend\sre-gateway
-docker-compose up -d minio ollama ollama-model-init gateway
+# 后端统一使用根目录 compose.yml；表由各业务模块启动时初始化。
+Set-Location D:\SRE-Agent-platform\sre-agent-backend
+docker-compose -f compose.yml up -d mysql
+
+# Compose 只启动基础设施；Gateway 保持本地 Python 进程运行。
+docker-compose -f compose.yml up -d ollama ollama-model-init
 
 Set-Location D:\SRE-Agent-platform\sre-agent-backend\sre-agent
 $env:GATEWAY_API_KEY = "从 POST /v1/auth/tokens 获得的 Token"
@@ -70,9 +81,13 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8001
 ## API
 
 ```powershell
+$credentials = Get-Content .env -Raw | ConvertFrom-StringData
 $login = Invoke-RestMethod -Method Post http://127.0.0.1:8001/api/auth/login `
   -ContentType application/json `
-  -Body (@{ username="admin"; password="admin123" } | ConvertTo-Json)
+  -Body (@{
+    username=$credentials.SRE_INITIAL_USERNAME
+    password=$credentials.SRE_INITIAL_PASSWORD
+  } | ConvertTo-Json)
 $headers = @{ Authorization = "Bearer $($login.access_token)" }
 $body = @{ message = "为什么订单模块最近这么慢？"; conversation_id = $null } | ConvertTo-Json
 Invoke-RestMethod -Method Post http://127.0.0.1:8001/api/agent/chat `
@@ -81,15 +96,15 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8001/api/agent/chat `
 
 `/api/agent/chat/stream` 返回 SSE `phase`、`tool`、`final` 事件。前端可展示公开调查步骤、工具参数与摘要，但不展示隐藏 Chain-of-Thought。
 
-最终报告中的每条证据包含 `evidence_id` 和 `source_references`。压缩摘要用于 LLM 上下文；完整原文持久化到私有 MinIO bucket，并可通过 `GET /api/agent/evidence/{run_id}/{evidence_id}` 回查。SQLite 的 `evidence_objects` 只保存 `run_id/evidence_id/oss_key/created_at`，没有 Evidence 正文列。
+最终报告中的每条证据包含 `evidence_id` 和 `source_references`。User/Assistant Message、Tool Call 和完整 Tool Result 全部永久写入 MySQL Conversation Store；正常阶段全部保留在 Active Context。活动上下文加预留输出达到模型窗口约 80% 后，模型生成短 Conversation Summary、短 Context State 和可检索 Memory Item，成功提交后旧消息退出 Active Context，但原始记录不删除。`evidence_id` 就是原始 Tool Result Message ID，可通过 `GET /api/agent/evidence/{run_id}/{evidence_id}` 在当前用户权限内回查。
 
-附件上传顺序为：前端创建或复用 Conversation → `POST /api/uploads/presign` → 浏览器直接 `PUT` MinIO → `POST /api/uploads/complete` 校验大小并保存 `oss_key` → 调用诊断 SSE。粘贴文本超过 12 KiB 时，前端会在普通附件之后把原文转换为 `.log` 并执行同一流程；预签名 URL 只短暂存在浏览器函数内存。
+历史 State/Evidence 只允许通过 `search_conversation_memory` MCP 工具读取。该工具的 SQL 和表名固定为 `conversation_memory_items`，用户与 Conversation 从服务端请求 Scope 注入；模型不能传入身份、会话、表名或原始 SQL，最多读取当前会话 20 条有效记忆。
 
-旧版 Evidence SQLite 可用以下命令一次性迁移。只有每一条 MinIO 对象回读验证成功后，`--purge-legacy` 才会删除旧 `payload_json` 表并压缩数据库文件：
+## Code State 与精确源码读取
 
-```powershell
-python scripts/migrate_legacy_evidence_to_minio.py --purge-legacy
-```
+首次发现仓库时，系统只枚举目录、构建清单、配置文件和 Controller/Service/Repository 等关键入口，生成包含模块、职责、symbol、路径、行号和 commit SHA 的短导航 State；数据库不保存源码正文。排查时先用 `search_code_state` 在固定的 `code_state_components` 表中筛选组件，再通过 Git 工具按对应 commit、路径和 symbol 精确读取少量源码。代码原文由 Git 保存，不进入 Evidence Store。
+
+仓库出现新 commit 后，系统执行 `git diff --name-status -M old..new`，仅重新处理新增或修改文件；删除文件会移除对应 State，重命名会迁移路径和 Reference，调用关系只在受影响组件内更新。若本地浅克隆已无法取得旧 commit，才对新 commit 执行一次有限的导航扫描。
 
 前端启动顺序为：读取本地 Token → `GET /api/auth/me` 服务端校验 → `GET /api/conversations` 加载会话摘要缓存。诊断 SSE 的第一条 `conversation` 事件返回持久会话 ID，用户消息和最终结构化报告都会落入 `conversation_messages` 表。
 
@@ -110,9 +125,9 @@ python scripts/migrate_legacy_evidence_to_minio.py --purge-legacy
 - MySQL 账号只读，代码仅放行单条 SELECT/EXPLAIN SELECT。
 - 用户密码使用独立随机盐和 60 万轮 PBKDF2-HMAC-SHA256；数据库不保存明文密码或明文 Token。
 - 诊断、会话与 Evidence API 强制 Bearer Token，Conversation 查询始终同时校验 user_id。
-- MinIO bucket 保持私有；上传/下载 URL 默认 15 分钟失效，Key 绑定 user_id 与 conversation_id，完成接口还会校验对象真实大小。
 - Git 仅 read/search/diff；`repository` 必须来自 Service Catalog 白名单，路径不能逃逸对应独立仓库，并优先读取 Pod 正在运行的 SHA。
-- Tool 原文进入 Evidence Store；Active Context Compaction 按来源多样性、结论支持度和源码引用选择摘要，避免日志淹没 Trace/SQL/源码。
+- `search_code_state` 的 SQL 与表名固定，模型只能提交仓库名、关键词、组件类型和条数；查询结果不含源码，Reference 始终绑定完整 commit SHA。
+- Tool Call 与 Tool Result 原文永久进入 MySQL Conversation Store；压缩成功后旧原文退出 Active Context，短 State/Evidence 进入专用 Memory 表。
 - Tool 有参数校验、15 秒超时、结构化错误；工作流最多 12 步。
 - VERIFY 过滤空查询；少于两个独立证据源只能报告“高可能性候选根因”。
 
@@ -123,4 +138,4 @@ python -m pytest -q
 python evals/run_evals.py --case SRE-001
 ```
 
-当前代码包含 MCP 安全、Agent、API、Evidence Store、上下文压缩与 Source Reference 回归测试；最终通过数以本机 `pytest` 输出为准。
+当前代码包含 MCP 安全、Agent、API、MySQL Conversation Compaction、Memory 权限隔离、Code State 增量更新与 Source Reference 回归测试；最终通过数以本机 `pytest` 输出为准。

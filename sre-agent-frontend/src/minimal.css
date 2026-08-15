@@ -45,8 +45,6 @@ code, pre, dt, dd { font-family: "Cascadia Code", Consolas, monospace; }
 .user .message-content { display: flex; align-items: flex-end; flex-direction: column; }
 .bubble { padding: 13px 15px; border: 1px solid var(--line); border-radius: 12px; background: #fff; font-size: 14px; line-height: 1.7; white-space: pre-wrap; }
 .user .bubble { color: #fff; border-color: var(--ink); background: var(--ink); }
-.message-attachments { display: grid; max-width: 100%; gap: 4px; margin-top: 7px; }
-.message-attachments code { max-width: 100%; padding: 5px 7px; border: 1px solid var(--line); border-radius: 5px; color: #555; background: var(--soft); font-size: 8px; overflow-wrap: anywhere; }
 
 /* 调查进度只呈现阶段名，不制造仪表盘式视觉噪音。 */
 .progress-card { padding: 15px 16px; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
@@ -103,19 +101,6 @@ code, pre, dt, dd { font-family: "Cascadia Code", Consolas, monospace; }
 .suggestions button { flex: 0 0 auto; padding: 7px 10px; border: 1px solid var(--line); border-radius: 999px; background: #fff; cursor: pointer; color: #444; font-size: 10px; }
 .suggestions button:hover:not(:disabled) { border-color: var(--ink); color: var(--ink); }
 .suggestions button:disabled { opacity: .4; }
-.attachment-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 8px; color: var(--muted); font-size: 9px; }
-.file-picker { flex: 0 0 auto; padding: 6px 9px; border: 1px solid var(--ink); border-radius: 6px; color: var(--ink); background: #fff; cursor: pointer; font-size: 10px; font-weight: 700; }
-.file-picker:hover:not(.disabled) { color: #fff; background: var(--ink); }
-.file-picker.disabled { cursor: not-allowed; opacity: .35; }
-.file-picker input { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; pointer-events: none; }
-.selected-files { display: flex; gap: 6px; margin-bottom: 8px; overflow-x: auto; }
-.selected-files > span { display: flex; flex: 0 0 auto; align-items: center; gap: 6px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--soft); }
-.selected-files code { max-width: 180px; overflow: hidden; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
-.selected-files small { color: var(--muted); font-size: 8px; }
-.selected-files button { padding: 0; border: 0; color: var(--ink); background: transparent; cursor: pointer; font-size: 14px; line-height: 1; }
-.upload-status, .upload-error { margin: 0 0 8px; font-size: 9px; }
-.upload-status { color: var(--muted); }
-.upload-error { color: var(--ink); font-weight: 700; }
 .composer { display: flex; align-items: flex-end; gap: 10px; padding: 8px 8px 8px 14px; border: 1px solid #999; border-radius: 12px; background: #fff; }
 .composer:focus-within { border-color: var(--ink); }
 textarea { width: 100%; max-height: 140px; padding: 8px 0; resize: vertical; border: 0; outline: 0; color: var(--ink); background: transparent; font-size: 13px; line-height: 1.5; }
@@ -132,7 +117,6 @@ textarea::placeholder { color: #999; }
   .header-actions button:last-child { max-width: 72px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .conversation { padding: 24px 14px; }
   .composer-area { padding: 10px 12px 14px; }
-  .attachment-toolbar { align-items: flex-start; flex-direction: column; gap: 6px; }
   .runtime-identity, .evidence-grid { grid-template-columns: 1fr; }
   .message-content { max-width: calc(100% - 42px); }
   .diagnosis-content { width: calc(100% - 42px); }

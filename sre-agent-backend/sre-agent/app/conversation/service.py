@@ -73,65 +73,45 @@ class ConversationService:
         with closing(self.database.connect()) as connection:
             rows = connection.execute(
                 """
-                SELECT id, role, content_json, created_at
+                SELECT id, role, message_type, content_json, run_id, tool_name, created_at
                 FROM conversation_messages
                 WHERE conversation_id = ?
                 ORDER BY created_at, id
                 """,
                 (conversation_id,),
             ).fetchall()
-            attachment_rows = connection.execute(
-                """
-                SELECT oss_key, created_at
-                FROM conversation_attachments
-                WHERE conversation_id = ? AND user_id = ?
-                ORDER BY created_at, id
-                """,
-                (conversation_id, user_id),
-            ).fetchall()
         messages = [{
             "id": str(row["id"]),
             "role": str(row["role"]),
+            "message_type": str(row["message_type"]),
             "content": json.loads(str(row["content_json"])),
+            "run_id": str(row["run_id"]) if row["run_id"] else None,
+            "tool_name": str(row["tool_name"]) if row["tool_name"] else None,
             "created_at": str(row["created_at"]),
         } for row in rows]
-        attachments = [dict(row) for row in attachment_rows]
         return {
             **conversation,
             "message_count": len(messages),
             "messages": messages,
-            "attachments": attachments,
         }
 
-    def owns(self, user_id: str, conversation_id: str) -> bool:
-        """供 UploadService 复用同一用户隔离规则，不暴露会话内容。"""
-        return self._owned_conversation(user_id, conversation_id) is not None
-
-    def validate_attachment_keys(
-        self, user_id: str, conversation_id: str, oss_keys: list[str]
-    ) -> list[str]:
-        """确认请求中的每个 Key 都已上传完成且属于当前会话。"""
-        unique_keys = list(dict.fromkeys(oss_keys))
-        if not unique_keys:
-            return []
-        placeholders = ",".join("?" for _ in unique_keys)
-        with closing(self.database.connect()) as connection:
-            rows = connection.execute(
-                f"""
-                SELECT oss_key FROM conversation_attachments
-                WHERE user_id = ? AND conversation_id = ? AND oss_key IN ({placeholders})
-                """,
-                (user_id, conversation_id, *unique_keys),
-            ).fetchall()
-        found = {str(row["oss_key"]) for row in rows}
-        if found != set(unique_keys):
-            raise KeyError("attachment not found in current conversation")
-        return unique_keys
-
-    def append(self, user_id: str, conversation_id: str, role: str, content: Any) -> str:
+    def append(
+        self,
+        user_id: str,
+        conversation_id: str,
+        role: str,
+        content: Any,
+        *,
+        message_type: str | None = None,
+        run_id: str | None = None,
+        tool_name: str | None = None,
+    ) -> str:
         """在同一事务中验证所有权、写入消息并推进会话更新时间。"""
         if role not in {"user", "assistant"}:
             raise ValueError("role must be user or assistant")
+        normalized_type = message_type or role
+        if normalized_type not in {"user", "assistant", "tool_call", "tool_result"}:
+            raise ValueError("unsupported conversation message type")
         message_id = uuid4().hex
         now = self._now()
         serialized = json.dumps(content, ensure_ascii=False, default=str)
@@ -144,16 +124,57 @@ class ConversationService:
                 raise KeyError("conversation not found")
             connection.execute(
                 """
-                INSERT INTO conversation_messages(id, conversation_id, role, content_json, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO conversation_messages(
+                    id, conversation_id, role, message_type, content_json,
+                    estimated_tokens, run_id, tool_name, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (message_id, conversation_id, role, serialized, now),
+                (
+                    message_id, conversation_id, role, normalized_type, serialized,
+                    self.estimate_tokens(serialized), run_id, tool_name, now,
+                ),
             )
             connection.execute(
                 "UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id)
             )
             connection.commit()
         return message_id
+
+    def get_tool_result(
+        self,
+        user_id: str,
+        run_id: str,
+        message_id: str,
+    ) -> dict[str, Any] | None:
+        """只返回当前用户会话中的指定 Tool Result，禁止跨会话按 ID 回读。"""
+        with closing(self.database.connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT m.id, m.content_json, m.created_at, m.tool_name
+                FROM conversation_messages m
+                JOIN conversations c ON c.id = m.conversation_id
+                WHERE m.id = ? AND c.user_id = ?
+                  AND m.run_id = ? AND m.message_type = 'tool_result'
+                """,
+                (message_id, user_id, run_id),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(str(row["content_json"]))
+        return {
+            "evidence_id": str(row["id"]),
+            "tool_name": str(row["tool_name"] or payload.get("tool_name") or ""),
+            "arguments": payload.get("arguments", {}),
+            "result": payload.get("result"),
+            "source_references": payload.get("source_references", []),
+            "stored_at": str(row["created_at"]),
+        }
+
+    @staticmethod
+    def estimate_tokens(value: str) -> int:
+        """V1 使用稳定保守近似：约每三个字符一个 Token。"""
+        return max(1, (len(value) + 2) // 3)
 
     def _owned_conversation(self, user_id: str, conversation_id: str) -> dict[str, Any] | None:
         """只按 user_id + id 查询，不提供跨用户的管理员旁路。"""

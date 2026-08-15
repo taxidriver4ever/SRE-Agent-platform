@@ -26,14 +26,10 @@ class ConversationMessage(BaseModel):
 
     id: str
     role: Literal["user", "assistant"]
+    message_type: Literal["user", "assistant", "tool_call", "tool_result"]
     content: Any
-    created_at: str
-
-
-class ConversationAttachment(BaseModel):
-    """持久化附件只暴露 MinIO Key；下载时再申请短时效签名。"""
-
-    oss_key: str
+    run_id: str | None = None
+    tool_name: str | None = None
     created_at: str
 
 
@@ -41,4 +37,3 @@ class ConversationDetail(ConversationSummary):
     """选择历史会话时返回按时间排序的全部消息。"""
 
     messages: list[ConversationMessage]
-    attachments: list[ConversationAttachment] = Field(default_factory=list)

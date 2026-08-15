@@ -13,8 +13,8 @@ from app.api.schemas import AgentRunRequest, DiagnosisChatRequest
 from app.auth import CurrentUser, require_user
 from app.conversation.router import get_conversation_service
 from app.conversation.service import ConversationService
+from app.conversation_memory import conversation_memory_scope
 from app.llm import GatewayConfigurationError, GatewayRequestError
-from app.context import EvidenceStore
 from app.workflow import DiagnosisReport, DiagnosisWorkflow
 
 # 所有 Agent 能力统一挂在版本化前缀下，后续协议演进可保留 v1 兼容性。
@@ -34,11 +34,6 @@ def get_agent(request: Request) -> ToolAgent:
 def get_workflow(request: Request) -> DiagnosisWorkflow:
     """取得应用生命周期内共享的硬性 SRE 工作流。"""
     return request.app.state.diagnosis_workflow
-
-
-def get_evidence_store(request: Request) -> EvidenceStore:
-    """取得保存完整工具原文的 Evidence Store。"""
-    return request.app.state.evidence_store
 
 
 @router.post("/run", response_model=AgentResult)
@@ -76,22 +71,13 @@ async def diagnose(
         conversation_id = conversations.ensure(user["id"], body.conversation_id, body.message)
     except KeyError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="conversation not found") from exc
-    try:
-        attachment_keys = conversations.validate_attachment_keys(
-            user["id"], conversation_id, body.attachment_keys
+    with conversation_memory_scope(user["id"], conversation_id):
+        report = await workflow.run(
+            body.message,
+            conversation_id=conversation_id,
+            user_id=user["id"],
         )
-    except KeyError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    # 超长原文不进入 content_json；这里只保存用于回放的短消息与 MinIO Key。
-    conversations.append(
-        user["id"], conversation_id, "user",
-        {"message": body.message, "attachment_keys": attachment_keys},
-    )
-    report = await workflow.run(body.message, attachment_keys=attachment_keys)
     report.conversation_id = conversation_id
-    conversations.append(
-        user["id"], conversation_id, "assistant", {"report": report.model_dump(mode="json")}
-    )
     return report
 
 
@@ -107,30 +93,25 @@ async def diagnose_stream(
         conversation_id = conversations.ensure(user["id"], body.conversation_id, body.message)
     except KeyError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="conversation not found") from exc
-    try:
-        attachment_keys = conversations.validate_attachment_keys(
-            user["id"], conversation_id, body.attachment_keys
-        )
-    except KeyError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    conversations.append(
-        user["id"], conversation_id, "user",
-        {"message": body.message, "attachment_keys": attachment_keys},
-    )
     queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
 
     async def publish(event: dict[str, object]) -> None:
-        """最终报告先持久化，再入队发送，避免浏览器收到但数据库尚未落盘。"""
+        """工作流先完成持久化，再把事件入队发送。"""
         if event.get("type") == "final" and isinstance(event.get("report"), dict):
             report = event["report"]
             report["conversation_id"] = conversation_id
-            conversations.append(user["id"], conversation_id, "assistant", {"report": report})
         await queue.put(event)
 
     async def execute() -> None:
         """后台执行工作流，并把未预期错误转换为可读 SSE 事件。"""
         try:
-            await workflow.run(body.message, publish, attachment_keys=attachment_keys)
+            with conversation_memory_scope(user["id"], conversation_id):
+                await workflow.run(
+                    body.message,
+                    publish,
+                    conversation_id=conversation_id,
+                    user_id=user["id"],
+                )
         except Exception as exc:  # HTTP 流已开始，只能通过事件报告错误。
             conversations.append(
                 user["id"], conversation_id, "assistant", {"error": str(exc)[:1000]}
@@ -162,11 +143,11 @@ async def diagnose_stream(
 async def get_evidence(
     run_id: str,
     evidence_id: str,
-    store: Annotated[EvidenceStore, Depends(get_evidence_store)],
-    _user: Annotated[CurrentUser, Depends(require_user)],
+    conversations: Annotated[ConversationService, Depends(get_conversation_service)],
+    user: Annotated[CurrentUser, Depends(require_user)],
 ) -> dict[str, object]:
-    """按 Source Reference 旁的 ID 读取完整原始证据，摘要不会替代审计原文。"""
-    item = store.get(run_id, evidence_id)
+    """只回读当前用户会话中的原始 Tool Result。"""
+    item = conversations.get_tool_result(user["id"], run_id, evidence_id)
     if item is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="evidence not found or expired")
     return item

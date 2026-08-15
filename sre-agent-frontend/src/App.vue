@@ -16,11 +16,6 @@ const conversations = ref([]);
 const currentConversationId = ref("");
 const question = ref("");
 const sending = ref(false);
-const selectedFiles = ref([]);
-const fileInputRef = ref(null);
-// 与后端默认值保持一致；部署时可通过 VITE_LARGE_TEXT_THRESHOLD_BYTES 覆盖。
-const largeTextThresholdBytes = Number(import.meta.env.VITE_LARGE_TEXT_THRESHOLD_BYTES || 12 * 1024);
-const uploadState = reactive({ message: "", error: "" });
 const conversationRef = ref(null);
 const messages = ref([{ id: 1, role: "assistant", content: "请描述故障现象。我会定位服务，并通过指标、日志、Trace、数据库和运行源码建立证据链。" }]);
 const suggestions = [
@@ -72,127 +67,14 @@ async function consumeEventStream(response, message) {
   }
 }
 
-/**
- * 附件必须先绑定一个真实会话，因此首次发送时先创建空会话。
- * 创建动作只写标题，不会把待上传文件或超长粘贴正文写进数据库。
- */
-async function ensureConversation(query) {
-  if (currentConversationId.value) return currentConversationId.value;
-  const response = await fetch(apiBaseUrl + "/api/conversations", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token.value },
-    body: JSON.stringify({ title: query.trim().slice(0, 60) || "附件诊断" }),
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.detail || "创建会话失败");
-  currentConversationId.value = payload.id;
-  await loadConversations();
-  return payload.id;
-}
-
-/**
- * 申请 PUT 签名、浏览器直传 MinIO、再通知后端完成校验。
- * upload_url 只存在于该函数局部变量中，不写入 Vue 持久状态或 localStorage。
- */
-async function uploadEvidenceObject(file, conversationId, kind) {
-  const presignResponse = await fetch(apiBaseUrl + "/api/uploads/presign", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token.value },
-    body: JSON.stringify({
-      conversation_id: conversationId,
-      filename: file.name,
-      content_type: file.type || "application/octet-stream",
-      size: file.size,
-      kind,
-    }),
-  });
-  const signature = await presignResponse.json().catch(() => ({}));
-  if (!presignResponse.ok) throw new Error(signature.detail || `申请 ${file.name} 上传签名失败`);
-
-  const putResponse = await fetch(signature.upload_url, {
-    method: "PUT",
-    headers: { "Content-Type": file.type || "application/octet-stream" },
-    body: file,
-  });
-  if (!putResponse.ok) throw new Error(`${file.name} 直传 MinIO 失败（HTTP ${putResponse.status}）`);
-
-  const completeResponse = await fetch(apiBaseUrl + "/api/uploads/complete", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token.value },
-    body: JSON.stringify({
-      conversation_id: conversationId,
-      oss_key: signature.oss_key,
-      expected_size: file.size,
-    }),
-  });
-  const completed = await completeResponse.json().catch(() => ({}));
-  if (!completeResponse.ok) throw new Error(completed.detail || `${file.name} 上传完成校验失败`);
-  return completed.oss_key;
-}
-
-/**
- * 严格按“普通文件在前、超长粘贴日志在后”的顺序串行上传。
- * 返回给聊天接口的只有短消息和 oss_key 数组，原始长文本不会进入消息表。
- */
-async function prepareEvidenceUploads(rawQuery, conversationId) {
-  const utf8Size = new TextEncoder().encode(rawQuery).byteLength;
-  const shouldStorePastedLog = utf8Size > largeTextThresholdBytes;
-  if (selectedFiles.value.length + (shouldStorePastedLog ? 1 : 0) > 10) {
-    throw new Error("一次诊断最多关联 10 个 Evidence 对象，请减少附件数量");
-  }
-
-  const attachmentKeys = [];
-  for (const file of selectedFiles.value) {
-    uploadState.message = `正在上传文件：${file.name}`;
-    attachmentKeys.push(await uploadEvidenceObject(file, conversationId, "file"));
-  }
-  if (shouldStorePastedLog) {
-    uploadState.message = "正在把超长粘贴内容转换为 .log 并上传…";
-    const logFile = new File(
-      [new Blob([rawQuery], { type: "text/plain;charset=utf-8" })],
-      `pasted-${new Date().toISOString().replace(/[:.]/g, "-")}.log`,
-      { type: "text/plain;charset=utf-8" },
-    );
-    attachmentKeys.push(await uploadEvidenceObject(logFile, conversationId, "pasted_log"));
-  }
-
-  const fileSummary = selectedFiles.value.length
-    ? `\n已上传文件：${selectedFiles.value.map((file) => file.name).join("、")}`
-    : "";
-  const message = shouldStorePastedLog
-    ? `用户粘贴了 ${utf8Size} bytes 的诊断文本，原文已保存为 MinIO Evidence。${fileSummary}`
-    : (rawQuery || "请分析已上传的 Evidence 文件。") + fileSummary;
-  return { attachmentKeys, message };
-}
-
-/** 选择文件只保存在当前页面内存；刷新页面后由会话中的 oss_key 恢复附件关联。 */
-function selectFiles(event) {
-  uploadState.error = "";
-  const files = Array.from(event.target.files || []);
-  if (files.length > 10) uploadState.error = "一次最多选择 10 个文件";
-  selectedFiles.value = files.slice(0, 10);
-}
-
-/** 从待上传列表移除文件，不会删除已经完成上传的持久对象。 */
-function removeSelectedFile(index) {
-  selectedFiles.value.splice(index, 1);
-  if (!selectedFiles.value.length && fileInputRef.value) fileInputRef.value.value = "";
-}
-
 /** 提交问题并创建一个由 SSE 持续更新的 assistant 消息。 */
 async function sendQuestion() {
   const query = question.value.trim();
-  if ((!query && !selectedFiles.value.length) || sending.value) return;
+  if (!query || sending.value) return;
   sending.value = true;
-  uploadState.error = "";
-  uploadState.message = "正在准备 Evidence…";
   let diagnosis = null;
   try {
-    const conversationId = await ensureConversation(query);
-    const prepared = await prepareEvidenceUploads(query, conversationId);
-    messages.value.push({
-      id: Date.now(), role: "user", content: prepared.message, attachments: prepared.attachmentKeys,
-    });
+    messages.value.push({ id: Date.now(), role: "user", content: query });
     // 必须使用 reactive：若把普通对象 push 进 reactive 数组后仍修改原始引用，
     // Vue 不会逐帧触发渲染，只会在请求结束的其他状态更新时一次性显示结果。
     diagnosis = reactive({
@@ -201,17 +83,13 @@ async function sendQuestion() {
     });
     messages.value.push(diagnosis);
     question.value = "";
-    selectedFiles.value = [];
-    if (fileInputRef.value) fileInputRef.value.value = "";
-    uploadState.message = "Evidence 上传完成，正在启动诊断…";
     await scrollToBottom();
     const response = await fetch(`${apiBaseUrl}/api/agent/chat/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token.value },
       body: JSON.stringify({
-        message: prepared.message,
-        conversation_id: conversationId,
-        attachment_keys: prepared.attachmentKeys,
+        message: query,
+        conversation_id: currentConversationId.value || null,
       }),
     });
     if (!response.ok) {
@@ -221,11 +99,9 @@ async function sendQuestion() {
     await consumeEventStream(response, diagnosis);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "未知请求错误";
-    uploadState.error = errorMessage;
     if (diagnosis) diagnosis.error = errorMessage;
   } finally {
     sending.value = false;
-    uploadState.message = "";
     await loadConversations();
     await scrollToBottom();
   }
@@ -320,12 +196,7 @@ async function openConversation(conversationId) {
   currentConversationId.value = detail.id;
   messages.value = detail.messages.map((item) => {
     if (item.role === "user") {
-      return {
-        id: item.id,
-        role: "user",
-        content: item.content.message || "",
-        attachments: item.content.attachment_keys || [],
-      };
+      return { id: item.id, role: "user", content: item.content.message || "" };
     }
     if (item.content.report) {
       return { id: item.id, role: "assistant", content: "", phases: [], tools: [], report: item.content.report, error: "" };
@@ -339,9 +210,6 @@ async function openConversation(conversationId) {
 function newConversation() {
   if (sending.value) return;
   currentConversationId.value = "";
-  selectedFiles.value = [];
-  uploadState.error = "";
-  if (fileInputRef.value) fileInputRef.value.value = "";
   messages.value = [{ id: Date.now(), role: "assistant", content: "请描述新的故障现象。" }];
 }
 
@@ -357,9 +225,6 @@ async function logout(callServer = true) {
   currentUser.value = null;
   conversations.value = [];
   currentConversationId.value = "";
-  selectedFiles.value = [];
-  uploadState.message = "";
-  uploadState.error = "";
 }
 
 onMounted(restoreSession);
@@ -443,10 +308,6 @@ onMounted(restoreSession);
           <div class="avatar">{{ message.role === "user" ? "你" : message.role === "error" ? "!" : "AI" }}</div>
           <div class="message-content diagnosis-content">
             <div v-if="message.content" class="bubble">{{ message.content }}</div>
-            <div v-if="message.attachments?.length" class="message-attachments">
-              <code v-for="ossKey in message.attachments" :key="ossKey">{{ ossKey }}</code>
-            </div>
-
             <section v-if="message.phases?.length && !message.report" class="progress-card">
               <p class="eyebrow">INVESTIGATION PROGRESS</p>
               <div v-for="phase in message.phases" :key="phase" class="progress-row"><span>✓</span><b>{{ phaseLabels[phase] || phase }}</b></div>
@@ -520,27 +381,11 @@ onMounted(restoreSession);
         <div class="suggestions">
           <button v-for="item in suggestions" :key="item" :disabled="sending" @click="useSuggestion(item)">{{ item }}</button>
         </div>
-        <div class="attachment-toolbar">
-          <label class="file-picker" :class="{ disabled: sending }">
-            <input ref="fileInputRef" type="file" multiple :disabled="sending" @change="selectFiles" />
-            添加文件
-          </label>
-          <span>大于 {{ Math.round(largeTextThresholdBytes / 1024) }} KiB 的粘贴文本会转为 .log 保存到 MinIO</span>
-        </div>
-        <div v-if="selectedFiles.length" class="selected-files">
-          <span v-for="(file, index) in selectedFiles" :key="file.name + file.size + index">
-            <code>{{ file.name }}</code>
-            <small>{{ Math.ceil(file.size / 1024) }} KiB</small>
-            <button type="button" :disabled="sending" aria-label="移除文件" @click="removeSelectedFile(index)">×</button>
-          </span>
-        </div>
-        <p v-if="uploadState.message" class="upload-status">{{ uploadState.message }}</p>
-        <p v-if="uploadState.error" class="upload-error">{{ uploadState.error }}</p>
         <form class="composer" @submit.prevent="sendQuestion">
-          <textarea v-model="question" rows="1" maxlength="2000000" placeholder="描述故障现象，或粘贴日志后直接发送" aria-label="问题" :disabled="sending" @keydown="handleKeydown"></textarea>
-          <button type="submit" :disabled="sending || (!question.trim() && !selectedFiles.length)" aria-label="发送问题"><span>{{ sending ? "处理中" : "发送" }}</span><b>↗</b></button>
+          <textarea v-model="question" rows="1" maxlength="20000" placeholder="描述故障现象" aria-label="问题" :disabled="sending" @keydown="handleKeydown"></textarea>
+          <button type="submit" :disabled="sending || !question.trim()" aria-label="发送问题"><span>{{ sending ? "处理中" : "发送" }}</span><b>↗</b></button>
         </form>
-        <p class="composer-hint">文件直传 MinIO · 数据库只保存 oss_key · Enter 发送</p>
+        <p class="composer-hint">Enter 发送 · Shift + Enter 换行</p>
       </footer>
     </main>
   </div>

@@ -25,5 +25,3 @@ class DiagnosisChatRequest(BaseModel):
     )
     # 首次提问可省略，由服务器创建会话；后续提问必须回传 SSE conversation 事件中的 ID。
     conversation_id: str | None = Field(default=None, min_length=32, max_length=64)
-    # Key 必须先通过 /api/uploads/complete 绑定当前会话；工作流不会接受任意 MinIO Key。
-    attachment_keys: list[str] = Field(default_factory=list, max_length=10)

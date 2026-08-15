@@ -6,6 +6,8 @@ httpx>=0.27,<1.0
 pydantic>=2.10,<3.0
 # standard extra 包含本地运行常用的事件循环和热重载依赖。
 uvicorn[standard]>=0.30,<1.0
+# 从未提交到 Git 的 .env 加载本地登录凭据与运行配置。
+python-dotenv>=1.0,<2.0
 # 读取 service-catalog.yaml 与 Scenario/Skill 元数据，避免把服务映射硬编码在工作流中。
 PyYAML>=6.0,<7.0
 # MySQL MCP 只用只读账号执行 SELECT/EXPLAIN；PyMySQL 无需本机安装原生驱动。
@@ -13,7 +15,3 @@ PyMySQL>=1.1,<2.0
 # 使用 FastMCP 提供标准 MCP Server、工具 Schema、参数验证、发现和调用能力。
 # 精确锁定稳定版，避免 MCP 生态快速演进时次版本破坏现有 Agent 行为。
 fastmcp==3.4.5
-
-# 官方 MinIO Python SDK：后端保存 Tool 原文、校验用户直传对象并生成短时效签名。
-# 锁定主版本，避免 S3 客户端接口在无人值守升级时发生破坏性变化。
-minio>=7.2.0,<8.0.0

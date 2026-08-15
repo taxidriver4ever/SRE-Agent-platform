@@ -19,6 +19,7 @@ from app.gateway.schema import (
     ChatCompletionResponse,
     ChatUsage,
 )
+from app.operation_log import OperationLogEntry, OperationLogRepository
 
 
 class GatewayService:
@@ -30,11 +31,13 @@ class GatewayService:
         model_router: ModelRouter,
         providers: dict[str, BaseProviderAdapter],
         usage_repository: UsageLogRepository,
+        operation_repository: OperationLogRepository | None = None,
     ) -> None:
         self.parser = parser
         self.model_router = model_router
         self.providers = providers
         self.usage_repository = usage_repository
+        self.operation_repository = operation_repository
 
     async def complete(
         self, request: ChatCompletionRequest, client_api_key_id: int
@@ -55,10 +58,12 @@ class GatewayService:
         except ProviderConfigurationError as exc:
             latency_ms = _elapsed_ms(started)
             self._log(request_id, client_api_key_id, route.provider, route.model, latency_ms, False, 503, str(exc))
+            self._record_operation(request_id, client_api_key_id, False, 503, "Provider 未配置")
             raise
         except ProviderRequestError as exc:
             latency_ms = _elapsed_ms(started)
             self._log(request_id, client_api_key_id, route.provider, route.model, latency_ms, False, exc.status_code, str(exc))
+            self._record_operation(request_id, client_api_key_id, False, exc.status_code, "Provider 调用失败")
             raise
 
         latency_ms = _elapsed_ms(started)
@@ -74,6 +79,7 @@ class GatewayService:
             result.prompt_tokens,
             result.completion_tokens,
         )
+        self._record_operation(request_id, client_api_key_id, True, 200, "模型调用成功")
         return ChatCompletionResponse(
             id=result.response_id,
             created=int(time.time()),
@@ -119,6 +125,29 @@ class GatewayService:
                 success=success,
                 status_code=status_code,
                 error_message=error_message,
+                created_at=datetime.now(UTC).isoformat(),
+            )
+        )
+
+    def _record_operation(
+        self,
+        request_id: str,
+        token_id: int,
+        success: bool,
+        status_code: int,
+        detail: str,
+    ) -> None:
+        """记录不包含 Prompt、回复或 API Key 明文的 Gateway 操作事件。"""
+        if self.operation_repository is None:
+            return
+        self.operation_repository.create(
+            OperationLogEntry(
+                operation="gateway.chat.completion",
+                token_id=token_id,
+                request_id=request_id,
+                success=success,
+                status_code=status_code,
+                detail=detail,
                 created_at=datetime.now(UTC).isoformat(),
             )
         )

@@ -8,6 +8,8 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 from app.core.config import get_settings
+from app.conversation import ConversationService
+from app.conversation_memory import ConversationMemoryRepository, conversation_memory_scope
 from app.mcp_clients import FastMCPToolClient, KubernetesMCPAdapter
 from app.mcp_servers import build_fastmcp_server
 from app.mcp_servers.common import bounded
@@ -15,6 +17,7 @@ from app.mcp_servers.git.tools import GitReadBackend
 from app.mcp_servers.observability.tools import MySQLReadBackend
 from app.workflow.diagnosis import DiagnosisWorkflow
 from app.workflow.models import DiagnosisState
+from tests.mysql_support import mysql_test_database
 
 
 def test_mcp_factory_exposes_required_read_tools_only():
@@ -35,6 +38,44 @@ def test_mcp_factory_exposes_required_read_tools_only():
     }
     assert required.issubset(names)
     assert names.isdisjoint({"delete_pod", "restart", "scale", "apply", "patch"})
+
+
+def test_memory_tool_schema_exposes_no_identity_table_or_sql_parameters(tmp_path):
+    """模型只能提交检索条件，用户/会话由服务端注入，表名和 SQL 完全不可控。"""
+    async def memory_tool_schema() -> dict:
+        database = mysql_test_database()
+        server = build_fastmcp_server(get_settings(), memory_repository=ConversationMemoryRepository(database))
+        async with Client(server) as client:
+            tools = await client.list_tools()
+        return next(tool.inputSchema for tool in tools if tool.name == "search_conversation_memory")
+
+    schema = asyncio.run(memory_tool_schema())
+    properties = set(schema["properties"])
+    assert properties == {"query", "item_types", "limit"}
+    assert properties.isdisjoint({"user_id", "conversation_id", "table", "sql"})
+
+
+def test_memory_tool_reads_only_server_scoped_conversation(tmp_path):
+    """即使同库存在其他会话，工具也只能使用 ContextVar 绑定的当前会话。"""
+    async def call_memory_tool() -> dict:
+        database = mysql_test_database()
+        with database.connect() as connection:
+            connection.execute(
+                "INSERT INTO users(id, username, password_hash, created_at) VALUES ('u1','u1','x','now')"
+            )
+            connection.commit()
+        conversations = ConversationService(database)
+        conversation_id = conversations.create("u1", "memory")["id"]
+        repository = ConversationMemoryRepository(database)
+        server = build_fastmcp_server(get_settings(), memory_repository=repository)
+        with conversation_memory_scope("u1", conversation_id):
+            async with Client(server) as client:
+                result = await client.call_tool(
+                    "search_conversation_memory", {"query": "anything", "limit": 10}
+                )
+        return result.data
+
+    assert asyncio.run(call_memory_tool()) == {"items": []}
 
 
 def test_kubernetes_adapter_exposes_no_write_semantics():

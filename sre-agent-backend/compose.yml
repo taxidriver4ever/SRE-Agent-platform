@@ -1,0 +1,67 @@
+# 后端基础设施统一编排：Ollama 与 Agent 使用的 MySQL。
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: sre-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  ollama-model-init:
+    image: ollama/ollama:latest
+    container_name: sre-ollama-model-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        if [ -n "$$OLLAMA_MODEL" ]; then
+          ollama pull "$$OLLAMA_MODEL";
+        else
+          echo "OLLAMA_MODEL is empty; skipping optional model preload";
+        fi
+    restart: "no"
+
+  mysql:
+    image: mysql:8.4
+    container_name: sre-agent-mysql
+    restart: unless-stopped
+    ports:
+      - "13308:3306"
+    env_file:
+      - ./sre-agent/.env
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >-
+        export MYSQL_ROOT_PASSWORD="$$APPLICATION_MYSQL_ROOT_PASSWORD";
+        export MYSQL_DATABASE="$$APPLICATION_MYSQL_DATABASE";
+        export MYSQL_USER="$$APPLICATION_MYSQL_USER";
+        export MYSQL_PASSWORD="$$APPLICATION_MYSQL_PASSWORD";
+        exec /usr/local/bin/docker-entrypoint.sh mysqld
+        --character-set-server=utf8mb4
+        --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$APPLICATION_MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+      - ./sre-agent/docker/mysql/init:/docker-entrypoint-initdb.d:ro
+
+volumes:
+  ollama-data:
+    name: sre-ollama-data

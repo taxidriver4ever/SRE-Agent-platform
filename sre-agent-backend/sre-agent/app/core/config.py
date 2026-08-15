@@ -6,6 +6,21 @@
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+# 只加载 Agent 项目根目录中的本地 .env；操作系统环境变量优先，不会被覆盖。
+load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
+
+
+def _required_env(name: str) -> str:
+    """读取必填环境变量，拒绝缺失或纯空白配置。"""
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"{name} must be configured in sre-agent/.env or the environment")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,18 +56,14 @@ class Settings:
     repository_allowed_hosts: tuple[str, ...]
     tool_timeout_seconds: float
     tool_output_limit: int
-    # Evidence 原文统一进入 MinIO；SQLite 只保存 evidence_id 到 oss_key 的映射。
-    minio_endpoint: str
-    minio_public_endpoint: str
-    minio_access_key: str
-    minio_secret_key: str
-    minio_bucket: str
-    minio_secure: bool
-    minio_presign_expire_minutes: int
-    upload_max_bytes: int
-    large_text_threshold_bytes: int
-    active_context_character_budget: int
-    application_database_path: str
+    model_context_window: int
+    context_compaction_ratio: float
+    context_reserved_output_tokens: int
+    application_mysql_host: str
+    application_mysql_port: int
+    application_mysql_user: str
+    application_mysql_password: str
+    application_mysql_database: str
     auth_token_ttl_hours: int
     initial_username: str
     initial_password: str
@@ -100,24 +111,20 @@ def get_settings() -> Settings:
         # 所有外部诊断操作都有统一超时和输出上限，避免卡死或把海量日志灌入模型。
         tool_timeout_seconds=float(os.getenv("TOOL_TIMEOUT_SECONDS", "15")),
         tool_output_limit=int(os.getenv("TOOL_OUTPUT_LIMIT", "12000")),
-        # SDK 内部访问地址与返回浏览器的签名地址分开配置。Agent 在宿主机运行时
-        # 两者通常相同；未来 Agent 进入 Docker 后可分别使用 minio:9000 与公网域名。
-        minio_endpoint=os.getenv("MINIO_ENDPOINT", "127.0.0.1:19100"),
-        minio_public_endpoint=os.getenv("MINIO_PUBLIC_ENDPOINT", "127.0.0.1:19100"),
-        minio_access_key=os.getenv("MINIO_ACCESS_KEY", "sreagent"),
-        minio_secret_key=os.getenv("MINIO_SECRET_KEY", "sreagent-dev-secret"),
-        minio_bucket=os.getenv("MINIO_BUCKET", "sre-agent-evidence"),
-        minio_secure=os.getenv("MINIO_SECURE", "false").strip().lower() in {"1", "true", "yes", "on"},
-        minio_presign_expire_minutes=int(os.getenv("MINIO_PRESIGN_EXPIRE_MINUTES", "15")),
-        # 默认单对象 50 MiB；浏览器直传避免大文件经过 FastAPI 内存和带宽。
-        upload_max_bytes=int(os.getenv("UPLOAD_MAX_BYTES", str(50 * 1024 * 1024))),
-        # 粘贴文本超过 12 KiB 时，前端将其转换成 .log 并按附件流程直传 MinIO。
-        large_text_threshold_bytes=int(os.getenv("LARGE_TEXT_THRESHOLD_BYTES", str(12 * 1024))),
-        active_context_character_budget=int(os.getenv("ACTIVE_CONTEXT_CHARACTER_BUDGET", "8000")),
-        # Auth 与 Conversation 使用独立业务数据库，不与 Evidence Store 原文混表。
-        application_database_path=os.getenv("APPLICATION_DATABASE_PATH", ".data/sre-agent.sqlite3"),
+        model_context_window=max(4096, int(os.getenv("MODEL_CONTEXT_WINDOW", "32768"))),
+        context_compaction_ratio=min(
+            0.95, max(0.50, float(os.getenv("CONTEXT_COMPACTION_RATIO", "0.80")))
+        ),
+        context_reserved_output_tokens=max(
+            512, int(os.getenv("CONTEXT_RESERVED_OUTPUT_TOKENS", "4096"))
+        ),
+        application_mysql_host=os.getenv("APPLICATION_MYSQL_HOST", "127.0.0.1"),
+        application_mysql_port=int(os.getenv("APPLICATION_MYSQL_PORT", "13308")),
+        application_mysql_user=os.getenv("APPLICATION_MYSQL_USER", "sre_agent"),
+        application_mysql_password=_required_env("APPLICATION_MYSQL_PASSWORD"),
+        application_mysql_database=os.getenv("APPLICATION_MYSQL_DATABASE", "sre_agent"),
         auth_token_ttl_hours=int(os.getenv("AUTH_TOKEN_TTL_HOURS", "24")),
-        # 本地实验环境提供开箱即用账号；部署到共享环境前必须通过环境变量修改。
-        initial_username=os.getenv("SRE_INITIAL_USERNAME", "admin"),
-        initial_password=os.getenv("SRE_INITIAL_PASSWORD", "admin123"),
+        # 登录凭据必须来自未提交的 .env 或进程环境，源码不再提供默认密码。
+        initial_username=_required_env("SRE_INITIAL_USERNAME"),
+        initial_password=_required_env("SRE_INITIAL_PASSWORD"),
     )

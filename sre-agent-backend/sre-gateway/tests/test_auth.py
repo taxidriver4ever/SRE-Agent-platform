@@ -71,7 +71,16 @@ def test_generate_token_endpoint_returns_plaintext_once_and_stores_hash(client):
         row = connection.execute(
             "SELECT token_hash FROM gateway_tokens"
         ).fetchone()
+        operation = connection.execute(
+            """
+            SELECT operation, success, status_code, token_id
+            FROM gateway_operation_logs
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
     assert row == (hash_token(token),)
+    assert operation == ("api_key.create", 1, 201, 1)
     assert token not in database_path.read_bytes().decode("latin1")
 
 

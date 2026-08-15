@@ -6,11 +6,15 @@
 
 import json
 
-from pydantic import ValidationError
-
 from app.agent.prompt import build_system_prompt
 from app.agent.schemas import AgentDecision, AgentResult, AgentStep
 from app.llm import LLM, LLMMessage
+from app.llm.structured_output import (
+    StructuredOutputError,
+    schema_retry_message,
+    template_refill_message,
+    validate_structured_output,
+)
 from app.mcp_clients import FastMCPToolClient, ToolExecutionError
 
 
@@ -70,6 +74,9 @@ class ToolAgent:
         total_completion_tokens = 0
         last_model: str | None = None
         last_provider: str | None = None
+        protocol_failures = 0
+        first_invalid_output = ""
+        awaiting_template_refill = False
 
         for iteration in range(1, self.max_iterations + 1):
             # 每一轮都发送完整上下文，因为当前网关提供的是无状态 Chat API。
@@ -86,11 +93,33 @@ class ToolAgent:
                 # 模型输出属于不可信输入，必须先经过 JSON 解析和 Pydantic
                 # 跨字段校验，校验通过后才允许进入工具执行路径。
                 decision = _parse_decision(response.content)
-            except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+            except StructuredOutputError as exc:
                 # 协议错误不立刻终止任务，而是把结构化错误反馈给模型，允许它
                 # 在下一轮自我修复。该修复同样受最大轮数限制。
-                messages.append(LLMMessage("user", _protocol_error(str(exc))))
+                if awaiting_template_refill:
+                    # 模板回填仍不合法时绝不执行工具，也不写入 AgentStep State。
+                    raise AgentMaxIterationsError(
+                        "structured output remained invalid after template refill"
+                    ) from exc
+                protocol_failures += 1
+                if not first_invalid_output:
+                    first_invalid_output = response.content
+                if protocol_failures <= 3:
+                    messages.append(LLMMessage("user", schema_retry_message(exc)))
+                else:
+                    awaiting_template_refill = True
+                    messages.append(LLMMessage(
+                        "user",
+                        template_refill_message(
+                            {"type": "final", "tool": None, "tool_input": {}, "answer": ""},
+                            first_invalid_output,
+                        ),
+                    ))
                 continue
+
+            protocol_failures = 0
+            first_invalid_output = ""
+            awaiting_template_refill = False
 
             if decision.type == "final":
                 # final 决策意味着任务完成；返回前同时带回完整可观测轨迹与
@@ -152,33 +181,7 @@ class ToolAgent:
 def _parse_decision(content: str) -> AgentDecision:
     """把模型文本解析并验证为 ``AgentDecision``。
 
-    协议要求裸 JSON，但部分模型仍会习惯性添加 Markdown 代码围栏。这里对完整
-    围栏做有限兼容，不尝试从任意自然语言中“猜取”JSON，以免错误执行工具。
+    协议要求裸 JSON；公共结构化输出层会有限兼容代码围栏、前缀文字、尾随逗号
+    和单引号，再以严格 Schema 作为是否允许执行工具的最终边界。
     """
-    text = content.strip()
-    if text.startswith("```"):
-        # 只移除首尾配对的完整代码围栏；残缺围栏仍交给 JSON 解析器拒绝。
-        lines = text.splitlines()
-        if len(lines) >= 3 and lines[-1].strip() == "```":
-            text = "\n".join(lines[1:-1])
-            if text.lstrip().startswith("json"):
-                text = text.lstrip()[4:].lstrip()
-    # ``json.loads`` 会拒绝尾随说明文字，确保一次响应只有一个决策对象。
-    data = json.loads(text)
-    if not isinstance(data, dict):
-        raise ValueError("decision must be a JSON object")
-    return AgentDecision.model_validate(data)
-
-
-def _protocol_error(detail: str) -> str:
-    """生成可安全回传给模型的协议修复消息。
-
-    错误详情截断为 300 字符，避免底层解析错误无限放大下一轮提示词。
-    """
-    return json.dumps(
-        {
-            "type": "protocol_error",
-            "message": f"输出不符合协议：{detail[:300]}。请只返回一个合法 JSON 对象。",
-        },
-        ensure_ascii=False,
-    )
+    return validate_structured_output(content, AgentDecision)

@@ -6,6 +6,13 @@
 
 from contextlib import asynccontextmanager
 from pathlib import Path
+import sys
+
+# PyCharm 直接执行本文件时，sys.path 默认只有 app 目录，无法解析 ``app.*``。
+# 把网关项目根目录加入模块搜索路径，使“点击运行”和 ``python app/main.py``
+# 都与 ``uvicorn app.main:app`` 使用相同的包结构。
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +36,7 @@ from app.gateway.provider import (
 from app.gateway.repository import UsageLogRepository, initialize_gateway_tables
 from app.gateway.router import router as gateway_router
 from app.gateway.service import GatewayService
+from app.operation_log import OperationLogRepository, initialize_operation_log_tables
 
 
 def create_app(database_path: str | Path | None = None) -> FastAPI:
@@ -48,11 +56,14 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
         """管理应用启动和关闭阶段的数据库资源。"""
         # 启动时由每个模块分别创建自己拥有的表。
         initialize_auth_tables(database)
+        initialize_operation_log_tables(database)
         initialize_gateway_tables(database)
 
         # Auth 依赖链：Database -> Repository -> Service。
         repository = TokenRepository(database)
-        application.state.token_service = TokenService(repository)
+        operation_repository = OperationLogRepository(database)
+        application.state.operation_log_repository = operation_repository
+        application.state.token_service = TokenService(repository, operation_repository)
 
         # Gateway 依赖链：Parser + Router + Adapters + Usage Repository。
         settings = provider_settings()
@@ -82,6 +93,7 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
             ModelRouter(),
             providers,
             UsageLogRepository(database),
+            operation_repository,
         )
         yield
         # 应用关闭时释放 SQLite 连接，避免测试或热重载残留文件句柄。
@@ -109,3 +121,10 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
 
 # Uvicorn 使用 ``app.main:app`` 导入该对象启动服务。
 app = create_app()
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    # 直接传入应用对象，避免脚本模式下再次导入本模块并创建第二套资源。
+    uvicorn.run(app, host="127.0.0.1", port=8000)

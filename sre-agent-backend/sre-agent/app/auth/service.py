@@ -1,4 +1,4 @@
-"""基于 SQLite 的密码认证和可撤销不透明 Token 实现。"""
+"""基于 MySQL 的密码认证和可撤销不透明 Token 实现。"""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ class AuthService:
             raise ValueError("初始用户名不能为空，密码至少 6 个字符")
         with closing(self.database.connect()) as connection:
             exists = connection.execute(
-                "SELECT 1 FROM users WHERE username = ? COLLATE NOCASE", (normalized,)
+                "SELECT 1 FROM users WHERE username = ?", (normalized,)
             ).fetchone()
             if exists:
                 return
@@ -45,7 +45,7 @@ class AuthService:
         """统一返回 None 表示用户名或密码错误，避免泄露账号是否存在。"""
         with closing(self.database.connect()) as connection:
             user = connection.execute(
-                "SELECT id, username, password_hash FROM users WHERE username = ? COLLATE NOCASE",
+                "SELECT id, username, password_hash FROM users WHERE username = ?",
                 (username.strip(),),
             ).fetchone()
             if user is None or not self._verify_password(password, str(user["password_hash"])):

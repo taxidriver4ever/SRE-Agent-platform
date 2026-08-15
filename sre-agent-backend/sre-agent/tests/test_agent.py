@@ -57,6 +57,34 @@ def test_agent_can_recover_from_invalid_model_output():
     assert "protocol_error" in llm.messages[1][-1].content
 
 
+def test_agent_repairs_common_json_format_without_model_retry():
+    """尾随逗号属于纯格式问题，应先本地 JSON Repair 再做 Schema 校验。"""
+    llm = StubLLM(['模型结果：{"type":"final","answer":"已修复",}'])
+    tools = FastMCPToolClient(FastMCP("agent-json-repair-test"))
+
+    result = asyncio.run(ToolAgent(llm, tools, max_iterations=1).run("test"))
+
+    assert result.answer == "已修复"
+    assert len(llm.messages) == 1
+
+
+def test_agent_uses_template_after_three_model_retries():
+    """初次输出加三次定向重试均失败后，应使用预设模板进行最后回填。"""
+    llm = StubLLM([
+        "bad-initial",
+        "bad-retry-1",
+        "bad-retry-2",
+        "bad-retry-3",
+        '{"type":"final","tool":null,"tool_input":{},"answer":"模板已回填"}',
+    ])
+    tools = FastMCPToolClient(FastMCP("agent-template-refill-test"))
+
+    result = asyncio.run(ToolAgent(llm, tools, max_iterations=5).run("test"))
+
+    assert result.answer == "模板已回填"
+    assert "structured_output_template_refill" in llm.messages[4][-1].content
+
+
 def test_agent_stops_at_iteration_limit():
     """模型持续违反协议时，Agent 必须在配置轮数处停止。"""
     llm = StubLLM(["bad"])

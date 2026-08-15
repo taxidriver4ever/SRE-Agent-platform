@@ -1,115 +1,183 @@
-"""Active Context Compaction、MinIO Evidence Store 和 Source Reference 回归测试。"""
+"""MySQL Conversation Compaction、短 State 与受限 Memory 检索回归测试。"""
 
 from __future__ import annotations
 
-import copy
+import json
 from contextlib import closing
-from datetime import datetime, timezone
-from pathlib import Path
-from uuid import uuid4
 
-from app.context import ActiveContextCompactor, EvidenceStore, SourceReference
-from app.core.database import ApplicationDatabase
-from app.storage import ObjectMetadata
-from app.workflow.models import Evidence
+import pytest
+from pydantic import ValidationError
 
-
-class FakeObjectStore:
-    """只用于单元测试的内存对象存储；生产代码始终使用 Docker MinIO。"""
-
-    bucket = "test-evidence"
-
-    def __init__(self) -> None:
-        self.objects: dict[str, dict] = {}
-
-    def put_json(self, oss_key: str, payload: dict) -> None:
-        """模拟 MinIO JSON 写入，并用深拷贝防止测试误改原对象。"""
-        self.objects[oss_key] = copy.deepcopy(payload)
-
-    def get_json(self, oss_key: str) -> dict:
-        """模拟按 Key 回读完整 Evidence JSON。"""
-        return copy.deepcopy(self.objects[oss_key])
-
-    def stat(self, oss_key: str) -> ObjectMetadata:
-        """本测试只登记 JSON Evidence，因此提供确定的对象元数据。"""
-        payload = str(self.objects[oss_key]).encode("utf-8")
-        return ObjectMetadata(oss_key=oss_key, size=len(payload), content_type="application/json")
-
-    def get_bytes(self, oss_key: str, max_bytes: int | None = None) -> tuple[bytes, bool]:
-        """补足 EvidenceStore 协议；当前两个测试不会走用户上传分支。"""
-        payload = str(self.objects[oss_key]).encode("utf-8")
-        if max_bytes is not None and len(payload) > max_bytes:
-            return payload[:max_bytes], True
-        return payload, False
+from app.conversation import ConversationService
+from app.conversation_memory import ConversationCompactionService, ConversationMemoryRepository
+from app.conversation_memory.models import CompactionOutput, ShortContextState
+from app.llm.base import LLMMessage, LLMResponse
+from tests.mysql_support import mysql_test_database
 
 
-def make_evidence(index: int, source: str, detail: str) -> Evidence:
-    """生成具有完整引用的测试证据，避免测试依赖真实外部系统。"""
-    return Evidence(
-        source=source,
-        tool_name=f"tool_{index}",
-        title=f"证据 {index}",
-        detail=detail,
-        timestamp=datetime.now(timezone.utc),
-        evidence_id=f"ev_{index}",
-        source_references=[SourceReference(
-            kind="logs",
-            uri=f"loki://service/test-{index}",
-            label=f"test-{index}",
-        )],
+class FakeCompactionLLM:
+    def __init__(self, responses: list[dict[str, object] | str]) -> None:
+        self.responses = list(responses)
+        self.calls: list[list[LLMMessage]] = []
+
+    async def complete(self, messages: list[LLMMessage]) -> LLMResponse:
+        self.calls.append(messages.copy())
+        value = self.responses.pop(0)
+        return LLMResponse(
+            value if isinstance(value, str) else json.dumps(value, ensure_ascii=False),
+            "fake-model",
+            "test",
+        )
+
+
+@pytest.fixture
+def memory_stack():
+    database = mysql_test_database()
+    with closing(database.connect()) as connection:
+        for user_id in ("user-a", "user-b"):
+            connection.execute(
+                "INSERT INTO users(id, username, password_hash, created_at) VALUES (?, ?, ?, ?)",
+                (user_id, user_id, "hash", "2026-01-01T00:00:00+00:00"),
+            )
+        connection.commit()
+    return database, ConversationService(database), ConversationMemoryRepository(database)
+
+
+def valid_compaction(source_message_id: str) -> dict[str, object]:
+    return {
+        "conversation_summary": "用户正在调查订单接口延迟，已经完成数据库检查。",
+        "context_state": {
+            "goal": "定位订单延迟",
+            "user_intent": "找到可验证根因",
+            "constraints": ["只读调查"],
+            "confirmed_findings": ["慢 SQL 已确认"],
+            "hypotheses": [],
+            "decisions": [],
+            "open_questions": ["哪个提交引入查询"],
+            "next_actions": ["检查运行版本源码"],
+        },
+        "memory_items": [{
+            "item_type": "evidence",
+            "title": "慢 SQL",
+            "content": "订单查询未命中索引并发生全表扫描",
+            "status": "active",
+            "importance": 0.9,
+            "source_message_id": source_message_id,
+            "source_tool_name": "explain_sql",
+        }],
+    }
+
+
+def test_normal_phase_keeps_messages_tool_calls_and_results_in_active_context(memory_stack):
+    _, conversations, repository = memory_stack
+    conversation_id = conversations.create("user-a", "订单延迟")["id"]
+    conversations.append("user-a", conversation_id, "user", {"message": "为什么慢"})
+    conversations.append(
+        "user-a", conversation_id, "assistant", {"tool_name": "query_logs", "arguments": {}},
+        message_type="tool_call", run_id="run-1", tool_name="query_logs",
+    )
+    conversations.append(
+        "user-a", conversation_id, "assistant", {"result": {"logs": "full raw log"}},
+        message_type="tool_result", run_id="run-1", tool_name="query_logs",
+    )
+    service = ConversationCompactionService(
+        repository, FakeCompactionLLM([]), model_context_window=32768,
+        compaction_ratio=0.8, reserved_output_tokens=512,
     )
 
+    active = service.active_context("user-a", conversation_id)
 
-def _database_path() -> Path:
-    """Windows 沙箱不开放系统 TEMP，所以在被 gitignore 的 .data 下创建唯一测试库。"""
-    return Path(".data") / f"test-evidence-{uuid4().hex}.sqlite3"
-
-
-def test_evidence_store_keeps_full_result_while_preview_is_compacted():
-    """上下文摘要被裁剪后，MinIO 对象仍必须保留完整原始字符串。"""
-    database_path = _database_path()
-    try:
-        store = EvidenceStore(ApplicationDatabase(str(database_path)), FakeObjectStore())
-        raw = {"logs": "x" * 5000}
-        evidence_id = store.put("run-1", "query_logs", {"service": "order-service"}, raw, [])
-        preview = ActiveContextCompactor().compact_result(raw, limit=120)
-
-        assert len(preview) < len(raw["logs"])
-        assert store.get("run-1", evidence_id)["result"] == raw
-    finally:
-        database_path.unlink(missing_ok=True)
-
-
-def test_evidence_mapping_survives_recreation_without_raw_payload_in_database():
-    """新 Store 可凭 oss_key 回查 MinIO，且 SQLite 表中不存在正文列。"""
-    database_path = _database_path()
-    object_store = FakeObjectStore()
-    try:
-        database = ApplicationDatabase(str(database_path))
-        first = EvidenceStore(database, object_store)
-        evidence_id = first.put("run-persisted", "query_trace", {}, {"trace_id": "abc"}, [])
-        reopened = EvidenceStore(ApplicationDatabase(str(database_path)), object_store)
-
-        assert reopened.get("run-persisted", evidence_id)["result"] == {"trace_id": "abc"}
-        # sqlite3.Connection 的 context manager 只管理事务；closing 才会在 Windows
-        # 及时释放句柄，确保 finally 能删除隔离测试库。
-        with closing(reopened.database.connect()) as connection:
-            columns = [row[1] for row in connection.execute("PRAGMA table_info(evidence_objects)")]
-        assert columns == ["run_id", "evidence_id", "oss_key", "created_at"]
-    finally:
-        database_path.unlink(missing_ok=True)
-
-
-def test_active_compaction_preserves_source_diversity_and_ids():
-    """同类日志很多时仍要保留 Trace/Database，并携带可回查 evidence_id。"""
-    evidence = [
-        make_evidence(1, "Loki", "日志一"),
-        make_evidence(2, "Loki", "日志二"),
-        make_evidence(3, "Tempo", "慢 Span"),
-        make_evidence(4, "MySQL", "全表扫描"),
+    assert [item["message_type"] for item in active["recent_history"]] == [
+        "user", "tool_call", "tool_result"
     ]
-    context = ActiveContextCompactor(character_budget=2000, item_budget=3).build_active_context(evidence)
+    assert active["recent_history"][2]["content"]["result"]["logs"] == "full raw log"
 
-    assert "[ev_3] [Tempo]" in context
-    assert "[ev_4] [MySQL]" in context
-    assert "loki://" in context
+
+def test_compaction_triggers_when_active_context_reaches_configured_ratio(memory_stack):
+    _, conversations, repository = memory_stack
+    conversation_id = conversations.create("user-a", "预算")["id"]
+    conversations.append("user-a", conversation_id, "user", {"message": "x" * 9000})
+    service = ConversationCompactionService(
+        repository, FakeCompactionLLM([]), model_context_window=4096,
+        compaction_ratio=0.8, reserved_output_tokens=512,
+    )
+
+    assert service.usage_ratio("user-a", conversation_id) >= 0.8
+    assert service.should_compact("user-a", conversation_id) is True
+
+
+@pytest.mark.asyncio
+async def test_compaction_persists_short_state_memory_and_keeps_original_messages(memory_stack):
+    database, conversations, repository = memory_stack
+    conversation_id = conversations.create("user-a", "订单延迟")["id"]
+    conversations.append("user-a", conversation_id, "user", {"message": "为什么慢"})
+    source_id = conversations.append(
+        "user-a", conversation_id, "assistant", {"result": {"plan": "ALL"}},
+        message_type="tool_result", run_id="run-1", tool_name="explain_sql",
+    )
+    service = ConversationCompactionService(
+        repository, FakeCompactionLLM([valid_compaction(source_id)])
+    )
+
+    output = await service.maybe_compact("user-a", conversation_id, force=True)
+
+    assert output is not None
+    assert output.context_state.goal == "定位订单延迟"
+    assert repository.compaction_count("user-a", conversation_id) == 1
+    assert service.active_context("user-a", conversation_id)["recent_history"] == []
+    assert repository.search("user-a", conversation_id, "全表扫描", ["evidence"], 10)[0]["source_message_id"] == source_id
+    assert repository.search("user-a", conversation_id, "定位订单", ["goal"], 10)[0]["item_type"] == "goal"
+    with closing(database.connect()) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM conversation_messages WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()[0]
+    assert count == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_template_refill_keeps_compaction_boundary_unchanged(memory_stack):
+    _, conversations, repository = memory_stack
+    conversation_id = conversations.create("user-a", "失败保护")["id"]
+    conversations.append("user-a", conversation_id, "user", {"message": "保留原文"})
+    invalid = '{"context_state":{"constraints":"wrong"}}'
+    service = ConversationCompactionService(repository, FakeCompactionLLM([invalid] * 5))
+
+    output = await service.maybe_compact("user-a", conversation_id, force=True)
+
+    assert output is None
+    assert repository.compaction_count("user-a", conversation_id) == 0
+    assert len(service.active_context("user-a", conversation_id)["recent_history"]) == 1
+    assert service.last_failed_raw_output[conversation_id] == invalid
+
+
+def test_short_state_rejects_long_or_excessive_content():
+    with pytest.raises(ValidationError):
+        ShortContextState(goal="x" * 121)
+    with pytest.raises(ValidationError):
+        ShortContextState(constraints=["x"] * 6)
+    with pytest.raises(ValidationError):
+        ShortContextState(confirmed_findings=["x" * 121])
+
+
+def test_memory_search_isolated_by_user_and_conversation(memory_stack):
+    _, conversations, repository = memory_stack
+    conversation_a = conversations.create("user-a", "A")["id"]
+    conversation_b = conversations.create("user-b", "B")["id"]
+    source_a = conversations.append("user-a", conversation_a, "user", {"message": "A"})
+    source_b = conversations.append("user-b", conversation_b, "user", {"message": "B"})
+    repository.commit(
+        "user-a", conversation_a, CompactionOutput.model_validate(valid_compaction(source_a)),
+        source_a, 10,
+    )
+    repository.commit(
+        "user-b", conversation_b, CompactionOutput.model_validate(valid_compaction(source_b)),
+        source_b, 10,
+    )
+
+    own = repository.search("user-a", conversation_a, "全表扫描", None, 20)
+
+    assert len(own) == 1
+    assert own[0]["source_message_id"] == source_a
+    with pytest.raises(KeyError):
+        repository.search("user-a", conversation_b, "全表扫描", None, 20)

@@ -12,17 +12,19 @@ from fastmcp.utilities.lifespan import combine_lifespans
 
 from app.agent import ToolAgent
 from app.api.router import chat_router, router as agent_router
-from app.auth import AuthService, auth_router
-from app.conversation import ConversationService, conversation_router
-from app.context import ActiveContextCompactor, EvidenceStore
+from app.auth import AuthService, auth_router, initialize_auth_schema
+from app.conversation import ConversationService, conversation_router, initialize_conversation_schema
+from app.conversation_memory import (
+    ConversationCompactionService, ConversationMemoryRepository,
+    initialize_conversation_memory_schema,
+)
+from app.code_state import CodeStateRepository, CodeStateService, initialize_code_state_schema
 from app.core.config import get_settings
 from app.core.database import ApplicationDatabase
 from app.llm import GatewayLLM
 from app.mcp_clients import FastMCPToolClient, KubernetesMCPAdapter
 from app.mcp_servers import build_fastmcp_server
 from app.repositories import RepositoryRegistry
-from app.storage import MinioObjectStore
-from app.uploads import UploadService, upload_router
 from app.workflow import DiagnosisWorkflow
 
 
@@ -38,30 +40,24 @@ def create_app() -> FastAPI:
     # 配置在应用创建时形成快照，同一进程内的一次应用生命周期保持一致。
     settings = get_settings()
 
-    # Auth 与 Conversation 共享一份 SQLite 业务库；密码哈希和 Token 逻辑留在
+    # Auth 与 Conversation 共享一份 MySQL 业务库；各模块拥有自己的建表 SQL。
     # AuthService，ConversationService 只接收已经验证过的 user_id。
-    application_database = ApplicationDatabase(settings.application_database_path)
+    application_database = ApplicationDatabase(
+        settings.application_mysql_host,
+        settings.application_mysql_port,
+        settings.application_mysql_user,
+        settings.application_mysql_password,
+        settings.application_mysql_database,
+    )
+    initialize_auth_schema(application_database)
+    initialize_conversation_schema(application_database)
+    initialize_conversation_memory_schema(application_database)
+    initialize_code_state_schema(application_database)
     auth_service = AuthService(application_database, settings.auth_token_ttl_hours)
     auth_service.ensure_user(settings.initial_username, settings.initial_password)
     conversation_service = ConversationService(application_database)
-
-    # 原始 Evidence、用户附件和超长粘贴日志统一保存到 Docker MinIO。public endpoint
-    # 专门用于浏览器签名，未来容器化 Agent 时不必把内部服务名泄漏给浏览器。
-    object_store = MinioObjectStore(
-        endpoint=settings.minio_endpoint,
-        public_endpoint=settings.minio_public_endpoint,
-        access_key=settings.minio_access_key,
-        secret_key=settings.minio_secret_key,
-        bucket=settings.minio_bucket,
-        secure=settings.minio_secure,
-    )
-    upload_service = UploadService(
-        application_database,
-        conversation_service,
-        object_store,
-        max_bytes=settings.upload_max_bytes,
-        presign_expire_minutes=settings.minio_presign_expire_minutes,
-    )
+    memory_repository = ConversationMemoryRepository(application_database)
+    code_state_repository = CodeStateRepository(application_database)
 
     # GatewayLLM 是唯一连接外部模型能力的组件。Agent 不直接访问厂商 API。
     llm = GatewayLLM(
@@ -79,23 +75,40 @@ def create_app() -> FastAPI:
         allowed_hosts=settings.repository_allowed_hosts,
         timeout=settings.tool_timeout_seconds,
     )
-    mcp_server = build_fastmcp_server(settings, repository_registry)
+    code_state_service = CodeStateService(
+        code_state_repository,
+        repository_registry,
+        llm,
+        timeout=settings.tool_timeout_seconds,
+    )
+    mcp_server = build_fastmcp_server(
+        settings,
+        repository_registry,
+        memory_repository,
+        code_state_repository,
+    )
     # 生成标准 Streamable HTTP ASGI 应用；path="/" 是因为下方会挂载到 /mcp。
     mcp_app = mcp_server.http_app(path="/")
     # Kubernetes 不再注册到项目自有 Server，而是由维护活跃的第三方 MCP
     # 以 read-only/core/single-context 模式直接访问 Kubernetes API。
     kubernetes_mcp = KubernetesMCPAdapter(settings.kubernetes_namespace)
     tools = FastMCPToolClient(mcp_server, kubernetes_mcp)
-    evidence_store = EvidenceStore(application_database, object_store)
-    compactor = ActiveContextCompactor(settings.active_context_character_budget)
+    context_service = ConversationCompactionService(
+        memory_repository,
+        llm,
+        model_context_window=settings.model_context_window,
+        compaction_ratio=settings.context_compaction_ratio,
+        reserved_output_tokens=settings.context_reserved_output_tokens,
+    )
     diagnosis_workflow = DiagnosisWorkflow(
         tools=tools,
         catalog_path=settings.service_catalog_path,
         max_steps=max(8, min(settings.agent_max_iterations + 4, 12)),
         llm=llm,
         repository_registry=repository_registry,
-        evidence_store=evidence_store,
-        compactor=compactor,
+        context_service=context_service,
+        conversation_service=conversation_service,
+        code_state_service=code_state_service,
         kubernetes_namespace=settings.kubernetes_namespace,
     )
 
@@ -108,9 +121,10 @@ def create_app() -> FastAPI:
         application.state.tools = tools
         application.state.agent = ToolAgent(llm, tools, settings.agent_max_iterations)
         application.state.diagnosis_workflow = diagnosis_workflow
-        application.state.evidence_store = evidence_store
-        application.state.object_store = object_store
-        application.state.upload_service = upload_service
+        application.state.memory_repository = memory_repository
+        application.state.code_state_repository = code_state_repository
+        application.state.code_state_service = code_state_service
+        application.state.context_service = context_service
         application.state.auth_service = auth_service
         application.state.conversation_service = conversation_service
         yield
@@ -140,7 +154,6 @@ def create_app() -> FastAPI:
     )
     application.include_router(auth_router)
     application.include_router(conversation_router)
-    application.include_router(upload_router)
     application.include_router(agent_router)
     application.include_router(chat_router)
     # 对外端点只暴露项目的 Git/可观测性只读工具。Kubernetes Server 保持独立，

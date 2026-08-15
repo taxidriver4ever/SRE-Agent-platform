@@ -6,7 +6,10 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
-from app.context import ActiveContextCompactor, EvidenceStore, SourceReference, build_source_references
+from app.conversation import ConversationService
+from app.conversation_memory import ConversationCompactionService
+from app.code_state import CodeStateService
+from app.evidence import build_source_references
 from app.llm.base import LLM, LLMMessage
 from app.llm.gateway import GatewayError
 from app.mcp_clients import FastMCPToolClient, ToolExecutionError
@@ -34,8 +37,9 @@ class DiagnosisWorkflow:
         max_steps: int = 12,
         llm: LLM | None = None,
         repository_registry: RepositoryRegistry | None = None,
-        evidence_store: EvidenceStore | None = None,
-        compactor: ActiveContextCompactor | None = None,
+        context_service: ConversationCompactionService | None = None,
+        conversation_service: ConversationService | None = None,
+        code_state_service: CodeStateService | None = None,
         kubernetes_namespace: str = "sre-lab",
     ) -> None:
         self.tools = tools
@@ -44,10 +48,9 @@ class DiagnosisWorkflow:
         # Workflow 只依赖统一 LLM 协议；具体 Provider 必须由 GatewayLLM 隔离。
         self.llm = llm
         self.repository_registry = repository_registry
-        if evidence_store is None:
-            raise ValueError("DiagnosisWorkflow requires a MinIO-backed EvidenceStore")
-        self.evidence_store = evidence_store
-        self.compactor = compactor or ActiveContextCompactor()
+        self.context_service = context_service
+        self.conversation_service = conversation_service
+        self.code_state_service = code_state_service
         self.kubernetes_namespace = kubernetes_namespace
 
     async def run(
@@ -55,56 +58,44 @@ class DiagnosisWorkflow:
         query: str,
         on_event: EventCallback | None = None,
         *,
-        attachment_keys: list[str] | None = None,
+        conversation_id: str | None = None,
+        user_id: str | None = None,
     ) -> DiagnosisReport:
         """从 TRIAGE 走到 REPORT；模型不能跳过基线观测或证据验证。"""
-        state = DiagnosisState(query=query, run_id=uuid4().hex)
+        run_id = uuid4().hex
+        # 没有持久会话的脚本调用使用 run_id 作为独立内存会话，不共享上下文。
+        state = DiagnosisState(
+            query=query,
+            run_id=run_id,
+            conversation_id=conversation_id or run_id,
+            user_id=user_id,
+        )
+        if self.conversation_service and state.user_id:
+            self.conversation_service.append(
+                state.user_id,
+                state.conversation_id,
+                "user",
+                {"message": query},
+                message_type="user",
+                run_id=state.run_id,
+            )
         await self._phase(state, WorkflowPhase.START, on_event)
-        self._ingest_uploaded_evidence(state, attachment_keys or [])
         await self._triage(state, on_event)
         await self._baseline(state, on_event)
         await self._analyze(state, on_event)
         await self._investigate(state, on_event)
         await self._phase(state, WorkflowPhase.VERIFY, on_event)
+        # 在生成模型摘要之前先检查阈值，避免把已经足够大的跨轮增量继续原样传递。
+        await self._compact_context_before_summary(state)
         await self._summarize_with_gateway(state, on_event)
         report = self._report(state)
         await self._phase(state, WorkflowPhase.REPORT, on_event)
         await self._phase(state, WorkflowPhase.END, on_event)
         report.workflow_phases = state.phases
+        await self._update_conversation_context(state, report)
         if on_event:
             await on_event({"type": "final", "report": report.model_dump(mode="json")})
         return report
-
-    def _ingest_uploaded_evidence(self, state: DiagnosisState, oss_keys: list[str]) -> None:
-        """把已完成直传的对象登记为 Evidence，并只把有界文本放进活动上下文。"""
-        active_text_parts: list[str] = []
-        active_text_size = 0
-        for oss_key in oss_keys:
-            evidence_id, raw_item = self.evidence_store.register_uploaded(state.run_id, oss_key)
-            result = raw_item.get("result", {})
-            references = [
-                SourceReference.model_validate(item)
-                for item in raw_item.get("source_references", [])
-            ]
-            detail = self.compactor.compact_result(result)
-            state.evidence.append(Evidence(
-                source="MinIO",
-                tool_name="minio_uploaded_evidence",
-                title=f"用户上传：{oss_key.rsplit('/', 1)[-1]}",
-                detail=detail,
-                timestamp=datetime.now(timezone.utc),
-                evidence_id=evidence_id,
-                source_references=references,
-                supports_conclusion=bool(str(result.get("text", "")).strip()),
-            ))
-            # 最多让 12,000 个字符进入规则识别；完整原文仍只存在 MinIO。
-            text = str(result.get("text", ""))
-            remaining = max(0, 12_000 - active_text_size)
-            if text and remaining:
-                part = text[:remaining]
-                active_text_parts.append(part)
-                active_text_size += len(part)
-        state.attachment_context = "\n".join(active_text_parts)
 
     async def _phase(self, state: DiagnosisState, phase: WorkflowPhase, callback: EventCallback | None) -> None:
         """记录状态迁移并向 SSE 客户端发送进度事件。"""
@@ -115,7 +106,7 @@ class DiagnosisWorkflow:
     async def _triage(self, state: DiagnosisState, callback: EventCallback | None) -> None:
         """确定 service、symptom、environment 与默认最近 30 分钟窗口。"""
         await self._phase(state, WorkflowPhase.TRIAGE, callback)
-        analysis_input = f"{state.query}\n{state.attachment_context}"
+        analysis_input = state.query
         state.service = self.catalog.resolve(analysis_input)
         metadata = self.catalog.services.get(state.service, {})
         state.language = str(metadata.get("language", "unknown"))
@@ -164,7 +155,7 @@ class DiagnosisWorkflow:
     async def _analyze(self, state: DiagnosisState, callback: EventCallback | None) -> None:
         """基于症状生成有限候选集，留待专项调查验证。"""
         await self._phase(state, WorkflowPhase.ANALYZE, callback)
-        analysis_input = f"{state.query}\n{state.attachment_context}".lower()
+        analysis_input = state.query.lower()
         if any(word in analysis_input for word in ("发布", "回归", "deploy", "regression")):
             causes = [("deployment regression", "症状时间与运行版本变更相关，需要比较 GOOD..BAD", 5), ("database slowdown", "查询变更可能导致扫描量增加", 4)]
         elif state.symptom == "latency":
@@ -183,7 +174,7 @@ class DiagnosisWorkflow:
         """按症状选择专项策略，共享同一 State/Tool/Evidence/Report 模型。"""
         await self._phase(state, WorkflowPhase.INVESTIGATE, callback)
         service = state.service if state.service != "unknown" else "order-service"
-        text = f"{state.query}\n{state.attachment_context}".lower()
+        text = state.query.lower()
         is_regression = any(word in text for word in ("发布", "回归", "deploy", "regression"))
         if is_regression and service == "order-service":
             await self._call(state, "query_slow_queries", {"time_range_minutes": 30, "limit": 10}, "回归后的慢查询", callback)
@@ -231,8 +222,58 @@ class DiagnosisWorkflow:
             await self._call(state, "list_changed_files", {"repository": state.repository, "base": f"{state.runtime_commit}^", "head": state.runtime_commit}, "GOOD..BAD 文件清单", callback)
             await self._call(state, "get_commit_diff", {"repository": state.repository, "base": f"{state.runtime_commit}^", "head": state.runtime_commit}, "GOOD..BAD 代码差异", callback)
         source_path = self.catalog.services.get(service, {}).get("source_path")
-        if source_path and state.runtime_commit and len(state.timeline) < self.max_steps:
-            await self._call(state, "read_file_at_commit", {"repository": state.repository, "commit": state.runtime_commit, "path": source_path}, "运行版本源码", callback)
+        navigation_references: list[dict[str, Any]] = []
+        if self.code_state_service and state.repository and state.runtime_commit:
+            try:
+                await self.code_state_service.ensure(state.repository, state.runtime_commit)
+                navigation = await self._call(
+                    state,
+                    "search_code_state",
+                    {
+                        "repository_name": state.repository,
+                        "query": state.service.split("-", 1)[0],
+                        "kinds": ["controller", "service", "repository", "component"],
+                        "limit": 6,
+                    },
+                    "Code State 导航",
+                    callback,
+                )
+                if isinstance(navigation, dict):
+                    seen_paths: set[str] = set()
+                    for item in navigation.get("components", []):
+                        if not isinstance(item, dict) or not item.get("path"):
+                            continue
+                        path = str(item["path"])
+                        if path in seen_paths:
+                            continue
+                        seen_paths.add(path)
+                        navigation_references.append(item)
+                        if len(navigation_references) == 2:
+                            break
+            except (ValueError, ToolExecutionError):
+                navigation_references = []
+        if not navigation_references and source_path:
+            navigation_references = [{"path": str(source_path)}]
+        for reference in navigation_references:
+            if len(state.timeline) >= self.max_steps or not state.runtime_commit:
+                break
+            path = str(reference["path"])
+            arguments: dict[str, Any] = {
+                "repository": state.repository,
+                "commit": str(reference.get("commit_sha") or state.runtime_commit),
+                "path": path,
+            }
+            if reference.get("start_line") is not None:
+                arguments["start_line"] = int(reference["start_line"])
+            if reference.get("end_line") is not None:
+                arguments["end_line"] = int(reference["end_line"])
+            await self._call(
+                state,
+                "read_file_at_commit",
+                arguments,
+                f"Code State 精确源码：{path}",
+                callback,
+            )
 
     async def _call(
         self,
@@ -250,6 +291,16 @@ class DiagnosisWorkflow:
         error: str | None = None
         evidence_id: str | None = None
         result: Any = None
+        if self.conversation_service and state.user_id:
+            self.conversation_service.append(
+                state.user_id,
+                state.conversation_id,
+                "assistant",
+                {"tool_name": tool_name, "arguments": arguments},
+                message_type="tool_call",
+                run_id=state.run_id,
+                tool_name=tool_name,
+            )
         try:
             result = await self.tools.execute(tool_name, arguments)
             references = build_source_references(
@@ -259,10 +310,24 @@ class DiagnosisWorkflow:
                 namespace=self.kubernetes_namespace,
                 repository_url=state.repository_url,
             )
-            evidence_id = self.evidence_store.put(
-                state.run_id, tool_name, arguments, result, references
-            )
-            summary = self.compactor.compact_result(result)
+            if self.conversation_service and state.user_id:
+                evidence_id = self.conversation_service.append(
+                    state.user_id,
+                    state.conversation_id,
+                    "assistant",
+                    {
+                        "tool_name": tool_name,
+                        "arguments": arguments,
+                        "result": result,
+                        "source_references": [item.model_dump(mode="json") for item in references],
+                    },
+                    message_type="tool_result",
+                    run_id=state.run_id,
+                    tool_name=tool_name,
+                )
+            else:
+                evidence_id = f"ev_{uuid4().hex[:16]}"
+            summary = self._compact_result(result)
             state.evidence.append(Evidence(
                 source=self._source(tool_name), tool_name=tool_name, title=title,
                 detail=summary, timestamp=started_at, evidence_id=evidence_id,
@@ -272,6 +337,16 @@ class DiagnosisWorkflow:
         except ToolExecutionError as exc:
             error = str(exc)
             summary = ""
+            if self.conversation_service and state.user_id:
+                self.conversation_service.append(
+                    state.user_id,
+                    state.conversation_id,
+                    "assistant",
+                    {"tool_name": tool_name, "arguments": arguments, "error": error},
+                    message_type="tool_result",
+                    run_id=state.run_id,
+                    tool_name=tool_name,
+                )
         record = ToolCallRecord(
             tool_name=tool_name, arguments=arguments, result_summary=summary,
             timestamp=started_at, duration_ms=int((time.perf_counter() - started) * 1000), error=error,
@@ -281,6 +356,12 @@ class DiagnosisWorkflow:
         if callback:
             await callback({"type": "tool", "record": record.model_dump(mode="json")})
         return result
+
+    @staticmethod
+    def _compact_result(value: Any, limit: int = 900) -> str:
+        """报告只展示有界预览；完整 Tool Result 已进入 Conversation Store。"""
+        text = json.dumps(value, ensure_ascii=False, default=str, sort_keys=True)
+        return text if len(text) <= limit else f"{text[:limit]}…（完整结果见 Conversation Store）"
 
     @staticmethod
     def _source(tool_name: str) -> str:
@@ -387,6 +468,58 @@ class DiagnosisWorkflow:
             return not any(marker in summary for marker in empty_markers)
         return True
 
+    async def _update_conversation_context(
+        self,
+        state: DiagnosisState,
+        report: DiagnosisReport,
+    ) -> None:
+        """保存助手消息，并在达到阈值时合并跨轮 Context State。
+
+        上下文压缩是增强链路：网关暂时不可用或模型返回非法 JSON 时，诊断报告
+        仍然应该正常返回。未成功压缩的 Message 会继续留在增量区，下一轮
+        可以再次触发，而不是错误推进压缩游标。
+        """
+        if self.context_service is None or self.conversation_service is None or not state.user_id:
+            return
+        self.conversation_service.append(
+            state.user_id,
+            state.conversation_id,
+            "assistant",
+            {"report": report.model_dump(mode="json")},
+            message_type="assistant",
+            run_id=state.run_id,
+        )
+        compression_error = ""
+        try:
+            await self.context_service.maybe_compact(state.user_id, state.conversation_id)
+        except (GatewayError, ValueError) as exc:
+            compression_error = str(exc)[:300]
+        report.context_compaction.update({
+            "storage": "mysql",
+            "compaction_ratio": str(self.context_service.compaction_ratio),
+            "active_context_tokens": self.context_service.active_token_count(
+                state.user_id, state.conversation_id
+            ),
+            "compression_count": self.context_service.repository.compaction_count(
+                state.user_id, state.conversation_id
+            ),
+        })
+        if compression_error:
+            report.context_compaction["last_error"] = compression_error
+
+    async def _compact_context_before_summary(self, state: DiagnosisState) -> None:
+        """在本轮 LLM 摘要前压缩达到预算阈值的持久化 Conversation Message。
+
+        压缩失败不推进 MySQL 边界，也不阻断诊断。后续摘要继续使用未压缩原文，
+        报告阶段还会再次尝试压缩，因此不会静默丢失调查信息。
+        """
+        if self.context_service is None or not state.user_id:
+            return
+        try:
+            await self.context_service.maybe_compact(state.user_id, state.conversation_id)
+        except (GatewayError, ValueError):
+            return
+
     def _report(self, state: DiagnosisState) -> DiagnosisReport:
         """仅在至少两个独立证据源时使用确定性结论，否则降级为高可能候选。"""
         sources = {item.source for item in state.evidence if item.supports_conclusion}
@@ -442,9 +575,9 @@ class DiagnosisWorkflow:
             candidates=state.candidates, investigation_timeline=state.timeline,
             workflow_phases=state.phases,
             context_compaction={
-                "strategy": "active-context-compaction-v1",
-                "stored_evidence": len(self.evidence_store.list_run(state.run_id)),
-                "llm_character_budget": self.compactor.character_budget,
+                "strategy": "mysql-conversation-compaction-v1",
+                "storage": "mysql",
+                "stored_evidence": len(state.evidence),
             },
         )
 
@@ -453,11 +586,37 @@ class DiagnosisWorkflow:
         if self.llm is None:
             return
         supported = [item for item in state.evidence if item.supports_conclusion]
-        active_context = self.compactor.build_active_context(supported)
+        historical_memory: Any = {"items": []}
+        try:
+            # Memory MCP 内部从请求 ContextVar 注入用户和 Conversation；这里不能
+            # 提供身份、表名或 SQL。空 query 表示按重要度读取少量当前有效记忆。
+            historical_memory = await self.tools.execute(
+                "search_conversation_memory",
+                {
+                    "query": "",
+                    "item_types": [
+                        "constraint", "confirmed_finding", "decision", "evidence", "open_question"
+                    ],
+                    "limit": 10,
+                },
+            )
+        except ToolExecutionError:
+            # CLI/评测没有认证会话 Scope 时安全降级，不允许绕过工具直接读数据库。
+            historical_memory = {"items": []}
+        conversation_context = (
+            self.context_service.build_active_context(state.user_id, state.conversation_id)
+            if self.context_service and state.user_id
+            else "{}"
+        )
         prompt = (
             "你是 SRE 诊断摘要器。只根据下列事实写一段不超过 120 个汉字的中文决策摘要；"
             "不得添加事实中没有的数字、提交或结论。少于两个独立来源时必须写‘高可能性候选根因’。\n"
-            + active_context
+            "跨轮活动上下文：\n"
+            + conversation_context
+            + "\n当前会话检索到的历史记忆：\n"
+            + json.dumps(historical_memory, ensure_ascii=False, default=str)
+            + "\n本轮支持结论的证据 ID：\n"
+            + json.dumps([item.evidence_id for item in supported], ensure_ascii=False)
         )
         started_at = datetime.now(timezone.utc)
         started = time.perf_counter()
@@ -478,7 +637,7 @@ class DiagnosisWorkflow:
             tool_name="llm_gateway_summary", arguments={
                 "stored_evidence_count": len(state.evidence),
                 "active_evidence_count": len(supported),
-                "context_characters": len(active_context),
+                "context_characters": len(conversation_context),
             },
             result_summary=summary, timestamp=started_at,
             duration_ms=int((time.perf_counter() - started) * 1000), error=error,

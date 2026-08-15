@@ -1,5 +1,7 @@
 """Gateway Token 的 SQLAlchemy Repository。"""
 
+from pathlib import Path
+
 from sqlalchemy import select, update
 
 from app.auth.model import GatewayToken
@@ -8,7 +10,7 @@ from app.core.database import Database
 
 def initialize_auth_tables(database: Database) -> None:
     """幂等创建 Repository 所管理的 Auth 数据表。"""
-    database.create_tables(GatewayToken.__table__)
+    database.execute_schema_file(Path(__file__).resolve().parents[1] / "sql" / "schema.sql")
 
 
 class TokenRepository:
@@ -49,4 +51,3 @@ class TokenRepository:
             )
             session.commit()
         return result.rowcount == 1
-

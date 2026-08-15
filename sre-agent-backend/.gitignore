@@ -34,7 +34,7 @@ dist/
 !.env.example
 !.env.*.example
 
-# SQLite runtime data. Schema lives in SQLAlchemy models, not in DB files.
+# Runtime database data, including backend/data/mysql, must stay outside modules.
 data/
 *.db
 *.db-journal

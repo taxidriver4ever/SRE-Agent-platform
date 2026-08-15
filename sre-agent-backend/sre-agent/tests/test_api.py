@@ -34,8 +34,19 @@ def test_evidence_endpoint_returns_full_stored_result():
     """最终报告中的 evidence_id 必须能回查完整原文，而不只是压缩摘要。"""
     with TestClient(create_app()) as client:
         headers = login_headers(client)
-        evidence_id = client.app.state.evidence_store.put(
-            "run-test", "query_logs", {"service": "order-service"}, {"logs": "full raw log"}, []
+        user = client.get("/api/auth/me", headers=headers).json()
+        conversation = client.post(
+            "/api/conversations", json={"title": "evidence"}, headers=headers
+        ).json()
+        evidence_id = client.app.state.conversation_service.append(
+            user["id"], conversation["id"], "assistant",
+            {
+                "tool_name": "query_logs",
+                "arguments": {"service": "order-service"},
+                "result": {"logs": "full raw log"},
+                "source_references": [],
+            },
+            message_type="tool_result", run_id="run-test", tool_name="query_logs",
         )
         response = client.get(f"/api/agent/evidence/run-test/{evidence_id}", headers=headers)
     assert response.status_code == 200

@@ -7,6 +7,7 @@ from typing import Any
 from fastmcp import Client, FastMCP
 
 from app.mcp_clients.kubernetes import KubernetesMCPAdapter
+from app.conversation_memory.scope import current_conversation_memory_scope
 
 
 class ToolExecutionError(Exception):
@@ -32,7 +33,10 @@ class FastMCPToolClient:
             "name": tool.name,
             "description": tool.description or "",
             "input_schema": tool.inputSchema,
-        } for tool in tools]
+        } for tool in tools if (
+            tool.name != "search_conversation_memory"
+            or current_conversation_memory_scope() is not None
+        )]
         if self.kubernetes:
             specifications.extend(self._kubernetes_specifications())
         return specifications

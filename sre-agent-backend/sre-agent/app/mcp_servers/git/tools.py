@@ -43,6 +43,7 @@ class GitReadBackend:
         base = self._safe_ref(str(arguments.get("base") or f"{commit}^"))
         head = self._safe_ref(str(arguments.get("head") or commit))
         relative_path = self._safe_path(repository, str(arguments.get("path") or ""), required=self.name.startswith("read_file"))
+        start_line, end_line = self._safe_line_range(arguments)
         prefix = ["-C", str(repository)]
 
         mappings: dict[str, list[str]] = {
@@ -60,7 +61,13 @@ class GitReadBackend:
             file_path = (repository / relative_path).resolve()
             if not file_path.is_file() or file_path.stat().st_size > self.output_limit * 4:
                 raise ToolError("文件不存在或超过安全大小限制")
-            return bounded({"path": relative_path, "content": file_path.read_text(encoding="utf-8")}, self.output_limit)
+            content = self._slice_lines(file_path.read_text(encoding="utf-8"), start_line, end_line)
+            return bounded({
+                "path": relative_path,
+                "start_line": start_line,
+                "end_line": end_line,
+                "content": content,
+            }, self.output_limit)
         if self.name == "search_code":
             pattern = str(arguments.get("pattern") or "")
             if not pattern or len(pattern) > 120 or pattern.startswith("-"):
@@ -69,14 +76,41 @@ class GitReadBackend:
         if command is None:
             raise ToolError(f"未审核的 Git 操作: {self.name}")
         raw = await run_fixed_command("git", command, timeout=self.timeout)
+        if self.name == "read_file_at_commit":
+            raw = self._slice_lines(raw, start_line, end_line)
         return bounded({
             "operation": self.name,
             "repository": identifier or repository.name,
             "repository_url": self.registry.remote_url(identifier) if self.registry else None,
             "commit": commit,
             "path": relative_path or None,
+            "start_line": start_line if self.name == "read_file_at_commit" else None,
+            "end_line": end_line if self.name == "read_file_at_commit" else None,
             "output": raw.strip(),
         }, self.output_limit)
+
+    def _safe_line_range(self, arguments: dict[str, Any]) -> tuple[int | None, int | None]:
+        if not self.name.startswith("read_file"):
+            return None, None
+        raw_start = arguments.get("start_line")
+        raw_end = arguments.get("end_line")
+        if raw_start is None and raw_end is None:
+            return None, None
+        try:
+            start = int(raw_start or 1)
+            end = int(raw_end or start + 199)
+        except (TypeError, ValueError) as exc:
+            raise ToolError("start_line/end_line 必须是整数") from exc
+        if start < 1 or end < start or end - start > 399:
+            raise ToolError("源码行范围必须有效且单次最多读取 400 行")
+        return start, end
+
+    @staticmethod
+    def _slice_lines(content: str, start_line: int | None, end_line: int | None) -> str:
+        if start_line is None:
+            return content
+        lines = content.splitlines()
+        return "\n".join(lines[start_line - 1:end_line])
 
     async def _select_repository(self, identifier: str, commit: str | None = None) -> Path:
         """仅允许选择 Service Catalog 中登记的仓库，禁止任意绝对路径读取。"""
@@ -149,6 +183,8 @@ def register_git_tools(
                 head: str | None = None,
                 path: str | None = None,
                 pattern: str | None = None,
+                start_line: int | None = None,
+                end_line: int | None = None,
             ) -> dict[str, Any]:
                 """在 Service Catalog 白名单仓库中执行一个 Git 只读操作。"""
                 return await current_handler.execute({
@@ -158,6 +194,8 @@ def register_git_tools(
                     "head": head,
                     "path": path,
                     "pattern": pattern,
+                    "start_line": start_line,
+                    "end_line": end_line,
                 })
             return git_read
 

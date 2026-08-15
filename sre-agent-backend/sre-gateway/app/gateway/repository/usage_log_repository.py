@@ -1,6 +1,7 @@
 """Gateway Usage/Logs 的 SQLAlchemy Repository。"""
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from app.core.database import Database
 from app.gateway.model import GatewayUsageLog
@@ -25,7 +26,7 @@ class UsageLogEntry:
 
 def initialize_gateway_tables(database: Database) -> None:
     """幂等创建 Gateway 模块负责的 Usage/Logs 表。"""
-    database.create_tables(GatewayUsageLog.__table__)
+    database.execute_schema_file(Path(__file__).resolve().parents[1] / "sql" / "schema.sql")
 
 
 class UsageLogRepository:

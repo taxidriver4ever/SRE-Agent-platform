@@ -9,14 +9,20 @@
 
 两类 Key 相互独立。用户 Gateway API Key 不会作为厂商 Key 发送给 OpenAI、Claude 或 DeepSeek，厂商 Key也不会返回前端或写入 Usage 日志。
 
-`gateway_tokens` 表由 Auth 模块的 `model` 包定义，并由 `repository` 包初始化和访问；`service` 不直接依赖 SQLAlchemy，通用数据库层也不依赖任何业务表。
+数据库建表语句按模块存放，不在 Python 中硬编码：
+
+- `app/auth/sql/schema.sql`：`gateway_tokens`，保存 Gateway API Key 的 Hash、创建时间和禁用状态。
+- `app/gateway/sql/schema.sql`：`gateway_usage_logs`，保存模型调用用量、耗时和结果。
+- `app/operation_log/sql/schema.sql`：`gateway_operation_logs`，保存 API Key 与模型调用操作审计记录。
+
+SQLite 不支持原生字段 `COMMENT` 语法，因此 SQL 文件使用 `-- COMMENT:` 注释每张表、每个字段和索引；对应 ORM 模型同时保留表级和字段级 Comment 元数据。通用数据库层只负责执行各模块自己的 SQL 文件，不依赖任何业务表。
 
 ## 安装与运行
 
 ```bash
 python -m venv .venv
 .venv\Scripts\activate
-pip install -r requirements-dev.txt
+python -m pip install -r requirements.txt
 ```
 
 前端通过以下 HTTP 接口生成 Token。明文只在响应中返回一次，SQLite 中仅保存 SHA-256 Hash：
@@ -28,8 +34,19 @@ POST /v1/auth/tokens
 启动 FastAPI：
 
 ```bash
-uvicorn app.main:app --host 127.0.0.1 --port 8000
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
+
+Windows 下若没有全局 `python`，或 IDE 选到了未安装依赖的解释器，可直接使用
+项目虚拟环境（在 `sre-gateway` 目录执行）：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe app\main.py
+```
+
+IDE 的 Python Interpreter 也应设置为
+`sre-gateway\.venv\Scripts\python.exe`，不要直接使用一个未安装 FastAPI 的全局解释器。
 
 访问受保护接口：
 
@@ -49,7 +66,7 @@ POST /v1/gateway/chat/completions
 Authorization: Bearer gw_sk_xxx
 ```
 
-模型名可使用 `openai/gpt-4o-mini`、`claude/claude-sonnet-4`、`deepseek/deepseek-chat` 或 `ollama/qwen3:8b`。配置通过环境变量提供：
+模型名可使用 `openai/gpt-4o-mini`、`claude/claude-sonnet-4`、`deepseek/deepseek-chat` 或任意已安装的 Ollama 模型（例如 `ollama/llama3.2:3b`）。配置通过环境变量提供：
 
 - `OPENAI_API_KEY`、`OPENAI_BASE_URL`
 - `CLAUDE_API_KEY`（兼容 `ANTHROPIC_API_KEY`）、`CLAUDE_BASE_URL`
@@ -57,7 +74,7 @@ Authorization: Bearer gw_sk_xxx
 - `OLLAMA_BASE_URL`
 - `PROVIDER_TIMEOUT_SECONDS`
 
-每次调用的 Provider、模型、Token 数、耗时和成功状态会写入 `gateway_usage_logs`，不会记录请求消息或模型回复。
+每次调用的 Provider、模型、Token 数、耗时和成功状态会写入 `gateway_usage_logs`。API Key 创建、鉴权、禁用以及 Gateway 模型调用成功或失败会写入 `gateway_operation_logs`。两类日志都不会记录请求消息、模型回复、Gateway API Key 明文或厂商 API Key。
 
 请求示例：
 
@@ -75,38 +92,45 @@ Authorization: Bearer gw_sk_xxx
 
 当前版本只支持非流式请求，`stream: true` 会返回参数校验错误。
 
-## 使用 Docker 运行 Ollama 与 Gateway
+Ollama 模型不是在网关代码中写死的。每次请求都从 JSON 的 `model` 字段选择，
+`ollama/` 是路由前缀，传给 Ollama 的实际名称是斜杠后的部分。例如同一个网关
+进程可先后接收 `ollama/llama3.2:3b` 和 `ollama/deepseek-r1:7b`。目标模型需先
+出现在 `ollama list` 中，否则 Ollama 会返回模型不存在。
 
-Compose 会启动 Ollama、自动拉取 `qwen3:4b`，随后启动 Gateway。模型和 SQLite
-数据分别保存在命名 Volume 中，重建容器不会丢失。
+## 使用 Docker 运行 Ollama
+
+Compose 只启动 Ollama 基础设施，不构建或运行 Gateway 镜像。Gateway 继续使用
+本地 Python/IDE 运行。若设置了 `OLLAMA_MODEL`，初始化容器会预先拉取该模型；
+未设置时跳过预拉取，不再默认绑定到 qwen3。模型保存在命名 Volume 中。
 
 CPU 模式：
 
 ```powershell
-docker-compose -f compose.yaml up -d --build
+cd ..
+docker-compose -f compose.yml up -d ollama ollama-model-init
 ```
 
 NVIDIA GPU 模式（Docker Desktop + WSL2 需要具备 GPU 容器支持）：
 
 ```powershell
-docker-compose -f compose.yaml -f compose.gpu.yaml up -d --build
+cd ..
+docker-compose -f compose.yml -f compose.gpu.yml up -d ollama ollama-model-init
 ```
 
-首次启动需要下载约 2.5GB 的 `qwen3:4b`。可在 `.env` 中用
-`OLLAMA_MODEL=qwen3:1.7b` 等值替换默认模型，但 Agent 的 `GATEWAY_MODEL` 也要
-设置为对应的 `ollama/qwen3:1.7b`。
+可在启动 Compose 前设置 `OLLAMA_MODEL=llama3.2:3b` 预拉取常用模型，也可以直接执行
+`docker exec sre-ollama ollama pull deepseek-r1:7b` 安装更多模型。这个环境变量
+只控制容器初始化，不控制请求路由；调用时仍以 JSON 中的
+`"model": "ollama/deepseek-r1:7b"` 为准。
 
 检查服务：
 
 ```powershell
-docker-compose -f compose.yaml ps
+docker-compose -f compose.yml ps
 Invoke-RestMethod http://127.0.0.1:11434/api/tags
-Invoke-RestMethod http://127.0.0.1:8000/health
 ```
 
-Gateway 容器通过 `http://ollama:11434` 访问 Ollama；宿主机仍可通过
-`http://127.0.0.1:11434` 调试 Ollama。官方镜像和 GPU 参数说明见
-[Ollama Docker 文档](https://docs.ollama.com/docker)。
+本地 Gateway 通过 `http://127.0.0.1:11434` 访问 Ollama。官方镜像和 GPU 参数
+说明见 [Ollama Docker 文档](https://docs.ollama.com/docker)。
 
 ## 测试
 

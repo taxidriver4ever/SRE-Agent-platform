@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from app.context.sources import SourceReference
+from app.evidence import SourceReference
 
 
 class WorkflowPhase(StrEnum):
@@ -84,7 +84,7 @@ class DiagnosisReport(BaseModel):
     candidates: list[CandidateCause]
     investigation_timeline: list[ToolCallRecord]
     workflow_phases: list[WorkflowPhase]
-    # 说明送入 LLM 的是活动压缩上下文，而完整原文保存在 Evidence Store。
+    # 说明送入 LLM 的是活动上下文，完整消息与 Tool Result 保存在 MySQL。
     context_compaction: dict[str, int | str]
 
 
@@ -92,8 +92,9 @@ class DiagnosisState(BaseModel):
     """工作流节点间共享的显式状态。"""
 
     query: str
-    # 用户上传日志的有界活动文本仅存在于本次工作流内，不写入 DiagnosisReport/SQLite。
-    attachment_context: str = ""
+    # Conversation ID 把多次诊断汇入同一组持久化 Summary、State 和 Memory。
+    conversation_id: str = ""
+    user_id: str | None = None
     run_id: str = ""
     service: str = "unknown"
     symptom: str = "待确定"

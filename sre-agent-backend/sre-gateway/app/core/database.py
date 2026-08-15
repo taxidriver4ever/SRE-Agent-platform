@@ -1,12 +1,12 @@
 """SQLAlchemy 数据库基础设施。
 
-本模块只负责创建 Engine、Session 和执行指定表的建表操作，不直接导入任何
-业务模型。每个业务模块应自行声明 ORM 模型，并显式传入自己负责的表。
+本模块只负责创建 Engine、Session 和执行模块 SQL 文件，不直接导入任何业务模型。
 """
 
 from pathlib import Path
+import sqlite3
 
-from sqlalchemy import Table, create_engine
+from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 
@@ -41,18 +41,12 @@ class Database:
             expire_on_commit=False,
         )
 
-    def create_tables(self, *tables: Table) -> None:
-        """创建调用模块明确传入的表。
-
-        Args:
-            *tables: 当前业务模块负责的 SQLAlchemy ``Table`` 对象。
-
-        只创建指定表，而不是创建 ``Base.metadata`` 中注册的全部表，以保持模块
-        边界清晰。``create_all`` 是幂等操作，表已存在时不会清空或覆盖数据。
-        """
-        # SQLite 不会自动创建父目录，因此首次启动时先确保目录存在。
+    def execute_schema_file(self, sql_file: str | Path) -> None:
+        """执行业务模块自己的 SQLite SQL 文件。"""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        Base.metadata.create_all(self.engine, tables=list(tables))
+        sql_text = Path(sql_file).read_text(encoding="utf-8")
+        with sqlite3.connect(self.path) as connection:
+            connection.executescript(sql_text)
 
     def session(self) -> Session:
         """创建一个新的 SQLAlchemy Session。
