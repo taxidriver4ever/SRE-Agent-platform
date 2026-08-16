@@ -12,6 +12,7 @@ class AgentRunRequest(BaseModel):
         description="需要 Agent 分析并处理的用户问题",
         examples=["计算 (12 + 8) * 3"],
     )
+    project_id: str = Field(default="sre-lab", pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$")
 
 
 class DiagnosisChatRequest(BaseModel):
@@ -25,3 +26,5 @@ class DiagnosisChatRequest(BaseModel):
     )
     # 首次提问可省略，由服务器创建会话；后续提问必须回传 SSE conversation 事件中的 ID。
     conversation_id: str | None = Field(default=None, min_length=32, max_length=64)
+    # project_id 只选择服务端白名单项目，不能携带 namespace、repo、path 或凭证。
+    project_id: str = Field(default="sre-lab", pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$")

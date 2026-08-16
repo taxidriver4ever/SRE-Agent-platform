@@ -6,6 +6,9 @@
 
 - `app/llm/`：Provider 无关协议与 Gateway Client，Agent 不使用厂商 SDK。
 - `app/intent/`：LLM Structured Output 意图分类与工作流闸门；合法意图确认前禁止进入工具 Runtime。
+- `app/security/`：项目级 Tool Policy、严格参数 Schema 与服务端 Task Scope。
+- `app/audit/`：按 user/project/task 记录的 MySQL Tool Audit Log。
+- `app/sandbox/`：一次性 Task Workspace 与未来 CodeExecuteTool 的 Docker 隔离层。
 - `app/agent/`：通用 JSON-ReAct Runtime，不再保留 calculator/current_time 等凑框架工具。
 - `app/mcp_servers/`：项目自有 FastMCP Server，只注册 Prometheus/Loki/Tempo/MySQL 与 Git 只读工具。
 - `app/mcp_clients/`：FastMCP 官方 Client 聚合层，以及第三方 Kubernetes MCP 的只读语义适配；Client 不放在 tools 中。
@@ -48,6 +51,16 @@ APPLICATION_MYSQL_PORT=13308
 APPLICATION_MYSQL_USER=sre_agent
 APPLICATION_MYSQL_DATABASE=sre_agent
 AUTH_TOKEN_TTL_HOURS=24
+SRE_DEFAULT_PROJECT_ID=sre-lab
+SRE_TOOL_POLICY_PATH=D:\SRE-Agent-platform\sre-agent-backend\sre-agent\config\tool-policy.yaml
+PROMETHEUS_BEARER_TOKEN=                   # 可选，仅保留在后端
+LOKI_BEARER_TOKEN=                         # 可选，仅保留在后端
+SRE_SANDBOX_WORKSPACE_ROOT=D:\SRE-Agent-platform\sre-agent-backend\sre-agent\.sandbox-tasks
+SRE_SANDBOX_IMAGE=python:3.12-alpine
+SRE_SANDBOX_CPUS=1.0
+SRE_SANDBOX_MEMORY_MB=512
+SRE_SANDBOX_PIDS_LIMIT=128
+SRE_SANDBOX_TIMEOUT_SECONDS=120
 ```
 
 本地登录用户名和密码只保存在未提交的 `.env` 中，不写入本配置示例或文档。
@@ -58,6 +71,7 @@ AUTH_TOKEN_TTL_HOURS=24
 - `app/conversation/sql/schema.sql`：`conversations`、`conversation_messages`
 - `app/conversation_memory/sql/schema.sql`：`conversation_compactions`、`conversation_memory_items`
 - `app/code_state/sql/schema.sql`：`code_state_repositories`、`code_state_components`
+- `app/audit/sql/schema.sql`：`tool_audit_logs`
 
 每份 SQL 都包含字段级 `COMMENT` 和表级 `COMMENT`。各模块的 `schema.py` 只负责定位并执行本模块 SQL；`app/core/database.py` 只负责通用 MySQL 连接、事务和 SQL 文件执行，不依赖任何业务表。
 
@@ -90,7 +104,7 @@ $login = Invoke-RestMethod -Method Post http://127.0.0.1:8001/api/auth/login `
     password=$credentials.SRE_INITIAL_PASSWORD
   } | ConvertTo-Json)
 $headers = @{ Authorization = "Bearer $($login.access_token)" }
-$body = @{ message = "为什么订单模块最近这么慢？"; conversation_id = $null } | ConvertTo-Json
+$body = @{ message = "为什么订单模块最近这么慢？"; conversation_id = $null; project_id = "sre-lab" } | ConvertTo-Json
 Invoke-RestMethod -Method Post http://127.0.0.1:8001/api/agent/chat `
   -Headers $headers -ContentType application/json -Body $body
 ```
@@ -168,10 +182,23 @@ Intent Router 在模板回填仍失败时采用更严格的失败策略：保存
 
 ## 安全
 
-- 所有工具由 `@mcp.tool()` 注册，输入 Schema 和参数验证由 FastMCP 从类型注解生成。
-- 工具 annotations 明确设置 `readOnlyHint=true`、`destructiveHint=false`。
-- 第三方 Kubernetes MCP 使用 `--read-only --toolsets core --disable-multi-cluster`，Client 仅暴露 list/get/events/image/restart-count 语义；建议再叠加 Namespace 级只读 RBAC。
+### Tool Policy 与项目隔离
+
+- `config/tool-policy.yaml` 是唯一项目级白名单，绑定 `project_id → namespace → repositories → allowed_paths → enabled_tools`。
+- Tool Client 只把白名单中的工具暴露给模型，并把通用 MCP Schema 收窄成逐工具最小 Schema；执行前再次校验，不能依赖模型自律。
+- 当前没有 Shell、`run_code`、`write_code`、Kubernetes 写入或 Git 写入 Tool。未来执行型 Tool 必须标为高风险并强制走 Sandbox，不得接入普通只读 Client。
+- `project_id` 只能选择服务端已配置项目。namespace、repo、path、user_id 和 task_id 均由服务端策略或 Scope 控制，浏览器和模型不能自由指定。
+- Git 路径先与仓库根目录组合并 `resolve()`，再检查真实路径仍位于项目 allowed paths 内，阻止 `../` 和软链接越界。
+- PromQL、LogQL 结构参数、label selector、trace ID、源码行范围、时间窗口和条数均有类型、字符、长度与范围限制；额外字段直接拒绝。
+
+### 凭证与 RBAC
+
+- 所有工具由 `@mcp.tool()` 注册，annotations 明确为只读、非破坏、幂等。
+- 第三方 Kubernetes MCP 使用 `--read-only --toolsets core --disable-multi-cluster`；生产 Client 不暴露 `list_namespaces`，只允许项目 namespace 内的 list/get/events/image/restart-count。
+- `deploy/kubernetes-mcp-reader.yaml` 创建独立 ServiceAccount、Role 和 RoleBinding，仅授予 `get/list/watch` 与 `pods/log`，不允许读取 Secret，也没有任何写动词。
 - MySQL 账号只读，代码仅放行单条 SELECT/EXPLAIN SELECT。
+- Git 远程地址必须为白名单主机上的无凭证 HTTPS URL；只读 Token 由后端 Git 凭证机制提供，不写入 URL、Tool 参数或模型上下文。
+- Prometheus/Loki Bearer Token 仅由后端 HTTP Client 注入 Authorization Header，不进入 Tool Schema、Audit 参数、前端或 LLM。
 - 用户密码使用独立随机盐和 60 万轮 PBKDF2-HMAC-SHA256；数据库不保存明文密码或明文 Token。
 - 诊断、会话与 Evidence API 强制 Bearer Token，Conversation 查询始终同时校验 user_id。
 - Git 仅 read/search/diff；`repository` 必须来自 Service Catalog 白名单，路径不能逃逸对应独立仓库，并优先读取 Pod 正在运行的 SHA。
@@ -181,11 +208,37 @@ Intent Router 在模板回填仍失败时采用更严格的失败策略：保存
 - Tool 有参数校验、15 秒超时、结构化错误；工作流最多 12 步。
 - VERIFY 过滤空查询；少于两个独立证据源只能报告“高可能性候选根因”。
 
+### Task Workspace 与 Docker Sandbox
+
+每个 Agent API 请求都会生成服务端 `task_id` 和独立 `.sandbox-tasks/<task_id>`，请求结束或取消后校验路径并销毁任务目录。当前只读 Tool 不在容器内执行，Workspace 用于项目数据隔离；代码执行能力尚未暴露给模型。
+
+未来 `CodeExecuteTool` 只能调用内部 `DockerSandboxManager.run()`。安全选项由后端固定，模型不能覆盖：
+
+```text
+--network none
+--cpus <limit>
+--memory <limit>
+--pids-limit <limit>
+--cap-drop ALL
+--security-opt no-new-privileges:true
+--read-only
+--tmpfs /tmp:rw,noexec,nosuid,size=64m
+--mount type=bind,source=<task-workspace>,target=/workspace
+```
+
+Docker 使用 argv + `shell=False` 启动，并有硬超时。未来工作流为：仓库副本 → Task Workspace → 修改/编译/测试 → `git diff` → 销毁 Sandbox。
+
+### Audit Log
+
+每次 Tool 成功、失败或被策略拒绝都会追加到 `tool_audit_logs`：`user_id`、`project_id`、`task_id`、`tool_name`、脱敏参数、`result_status`、`execution_time_ms`、`error_type`、UTC 时间。密码、Token、Authorization 和 Credential 字段统一替换为 `[REDACTED]`。
+
 ## 测试与评测
 
 ```powershell
 python -m pytest -q
 python evals/run_evals.py --case SRE-001
+# 使用本地已有 mysql:8.4 镜像验证真实 Docker 隔离参数
+python scripts/verify_sandbox.py
 ```
 
 当前代码包含 MCP 安全、Agent、API、MySQL Conversation Compaction、Memory 权限隔离、Code State 增量更新与 Source Reference 回归测试；最终通过数以本机 `pytest` 输出为准。

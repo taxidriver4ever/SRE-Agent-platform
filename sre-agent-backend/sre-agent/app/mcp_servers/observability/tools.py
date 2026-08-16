@@ -29,11 +29,13 @@ class HttpObservabilityBackend:
         endpoints: dict[str, str],
         timeout: float,
         output_limit: int,
+        bearer_tokens: dict[str, str | None] | None = None,
     ) -> None:
         self.name = name
         self.endpoints = endpoints
         self.timeout = timeout
         self.output_limit = output_limit
+        self.bearer_tokens = bearer_tokens or {}
 
     async def execute(self, arguments: dict[str, Any]) -> Any:
         """根据工具名选择固定 GET API；参数会由 httpx 正确 URL 编码。"""
@@ -50,12 +52,12 @@ class HttpObservabilityBackend:
                     query = str(arguments.get("query") or "").strip()
                     if not query or len(query) > 2000:
                         raise ToolError("query_metrics 需要 1~2000 字符的 PromQL")
-                    response = await client.get(f"{self.endpoints['prometheus']}/api/v1/query", params={"query": query})
+                    response = await client.get(f"{self.endpoints['prometheus']}/api/v1/query", params={"query": query}, headers=self._headers("prometheus"))
                 elif self.name == "get_service_health":
                     if not service:
                         raise ToolError("get_service_health 必须提供 service")
                     query = f'up{{service="{service}"}}'
-                    response = await client.get(f"{self.endpoints['prometheus']}/api/v1/query", params={"query": query})
+                    response = await client.get(f"{self.endpoints['prometheus']}/api/v1/query", params={"query": query}, headers=self._headers("prometheus"))
                 elif self.name == "query_logs":
                     response = await self._query_logs(client, arguments, service, minutes, limit, now)
                 elif self.name == "query_trace":
@@ -71,6 +73,10 @@ class HttpObservabilityBackend:
         body = response.json()
         data = body.get("data", body)
         return bounded({"source": self.name, "time_range_minutes": minutes, "result": data}, self.output_limit)
+
+    def _headers(self, provider: str) -> dict[str, str]:
+        token = self.bearer_tokens.get(provider)
+        return {"Authorization": f"Bearer {token}"} if token else {}
 
     async def _query_logs(
         self,
@@ -101,7 +107,7 @@ class HttpObservabilityBackend:
                 "end": str(int(now.timestamp() * 1_000_000_000)),
                 "limit": limit,
                 "direction": "backward",
-            },
+            }, headers=self._headers("loki"),
         )
 
     async def _query_trace(
@@ -211,6 +217,10 @@ def register_observability_tools(mcp: FastMCP, settings: Any) -> None:
         "loki": settings.loki_base_url,
         "tempo": settings.tempo_base_url,
     }
+    bearer_tokens = {
+        "prometheus": settings.prometheus_bearer_token,
+        "loki": settings.loki_bearer_token,
+    }
     db = {
         "host": settings.mysql_host, "port": settings.mysql_port, "user": settings.mysql_user,
         "password": settings.mysql_password, "database": settings.mysql_database,
@@ -220,6 +230,7 @@ def register_observability_tools(mcp: FastMCP, settings: Any) -> None:
     for operation in http_names:
         handler = HttpObservabilityBackend(
             operation, endpoints, settings.tool_timeout_seconds, settings.tool_output_limit,
+            bearer_tokens,
         )
 
         def create_http_tool(current_handler: HttpObservabilityBackend):

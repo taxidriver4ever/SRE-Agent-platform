@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastmcp.utilities.lifespan import combine_lifespans
 
 from app.agent import ToolAgent
+from app.audit import ToolAuditRepository, initialize_audit_schema
 from app.api.router import chat_router, router as agent_router
 from app.auth import AuthService, auth_router, initialize_auth_schema
 from app.conversation import ConversationService, conversation_router, initialize_conversation_schema
@@ -23,6 +24,8 @@ from app.core.config import get_settings
 from app.core.database import ApplicationDatabase
 from app.llm import GatewayLLM
 from app.intent import IntentRouter, IntentWorkflowRouter
+from app.security import ToolPolicy
+from app.sandbox import DockerSandboxManager
 from app.mcp_clients import FastMCPToolClient, KubernetesMCPAdapter
 from app.mcp_servers import build_fastmcp_server
 from app.repositories import RepositoryRegistry
@@ -54,6 +57,7 @@ def create_app() -> FastAPI:
     initialize_conversation_schema(application_database)
     initialize_conversation_memory_schema(application_database)
     initialize_code_state_schema(application_database)
+    initialize_audit_schema(application_database)
     auth_service = AuthService(application_database, settings.auth_token_ttl_hours)
     auth_service.ensure_user(settings.initial_username, settings.initial_password)
     conversation_service = ConversationService(application_database)
@@ -76,6 +80,16 @@ def create_app() -> FastAPI:
         allowed_hosts=settings.repository_allowed_hosts,
         timeout=settings.tool_timeout_seconds,
     )
+    tool_policy = ToolPolicy(settings.tool_policy_path, repository_registry.local_paths)
+    audit_repository = ToolAuditRepository(application_database)
+    sandbox_manager = DockerSandboxManager(
+        settings.sandbox_workspace_root,
+        image=settings.sandbox_image,
+        cpus=settings.sandbox_cpus,
+        memory_mb=settings.sandbox_memory_mb,
+        pids_limit=settings.sandbox_pids_limit,
+        timeout_seconds=settings.sandbox_timeout_seconds,
+    )
     code_state_service = CodeStateService(
         code_state_repository,
         repository_registry,
@@ -93,7 +107,13 @@ def create_app() -> FastAPI:
     # Kubernetes 不再注册到项目自有 Server，而是由维护活跃的第三方 MCP
     # 以 read-only/core/single-context 模式直接访问 Kubernetes API。
     kubernetes_mcp = KubernetesMCPAdapter(settings.kubernetes_namespace)
-    tools = FastMCPToolClient(mcp_server, kubernetes_mcp)
+    tools = FastMCPToolClient(
+        mcp_server,
+        kubernetes_mcp,
+        policy=tool_policy,
+        audit_repository=audit_repository,
+        default_project_id=settings.default_project_id,
+    )
     context_service = ConversationCompactionService(
         memory_repository,
         llm,
@@ -134,6 +154,10 @@ def create_app() -> FastAPI:
         application.state.code_state_repository = code_state_repository
         application.state.code_state_service = code_state_service
         application.state.context_service = context_service
+        application.state.tool_policy = tool_policy
+        application.state.audit_repository = audit_repository
+        application.state.sandbox_manager = sandbox_manager
+        application.state.default_project_id = settings.default_project_id
         application.state.auth_service = auth_service
         application.state.conversation_service = conversation_service
         yield

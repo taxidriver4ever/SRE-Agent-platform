@@ -15,6 +15,8 @@ from app.mcp_servers import build_fastmcp_server
 from app.mcp_servers.common import bounded
 from app.mcp_servers.git.tools import GitReadBackend
 from app.mcp_servers.observability.tools import MySQLReadBackend
+from app.repositories import RepositoryRegistry
+from app.security import ToolPolicy
 from app.workflow.diagnosis import DiagnosisWorkflow
 from app.workflow.models import DiagnosisState
 from tests.mysql_support import mysql_test_database
@@ -24,20 +26,28 @@ def test_mcp_factory_exposes_required_read_tools_only():
     """工具清单必须覆盖任务要求，同时不能出现任何集群写操作。"""
     async def list_names() -> set[str]:
         settings = get_settings()
+        registry = RepositoryRegistry(
+            settings.repository_path,
+            settings.service_catalog_path,
+            settings.repository_cache_path,
+            settings.repository_allowed_hosts,
+            settings.tool_timeout_seconds,
+        )
         client = FastMCPToolClient(
-            build_fastmcp_server(settings), KubernetesMCPAdapter(settings.kubernetes_namespace)
+            build_fastmcp_server(settings), KubernetesMCPAdapter(settings.kubernetes_namespace),
+            policy=ToolPolicy(settings.tool_policy_path, registry.local_paths),
         )
         return {tool["name"] for tool in await client.specifications()}
 
     names = asyncio.run(list_names())
     required = {
-        "list_namespaces", "list_deployments", "list_pods", "get_pod", "get_pod_events",
+        "list_deployments", "list_pods", "get_pod", "get_pod_events",
         "get_container_image", "query_metrics", "query_logs", "query_trace",
         "query_slow_queries", "query_sql_digest", "explain_sql", "get_commit_diff",
         "read_file_at_commit", "search_code", "list_changed_files",
     }
     assert required.issubset(names)
-    assert names.isdisjoint({"delete_pod", "restart", "scale", "apply", "patch"})
+    assert names.isdisjoint({"list_namespaces", "delete_pod", "restart", "scale", "apply", "patch", "shell", "exec"})
 
 
 def test_memory_tool_schema_exposes_no_identity_table_or_sql_parameters(tmp_path):

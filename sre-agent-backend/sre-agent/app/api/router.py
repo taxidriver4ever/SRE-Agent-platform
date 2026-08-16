@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from typing import Annotated
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
@@ -17,6 +18,8 @@ from app.conversation.service import ConversationService
 from app.conversation_memory import conversation_memory_scope
 from app.llm import GatewayConfigurationError, GatewayRequestError
 from app.intent import IntentReply, IntentWorkflowRouter, SREIntent
+from app.sandbox import DockerSandboxManager
+from app.security import ToolPolicy, ToolPolicyError, task_security_scope
 from app.workflow import DiagnosisReport, DiagnosisWorkflow
 
 # 所有 Agent 能力统一挂在版本化前缀下，后续协议演进可保留 v1 兼容性。
@@ -44,24 +47,46 @@ def get_workflow_router(request: Request) -> IntentWorkflowRouter:
     return request.app.state.intent_workflow_router
 
 
+def get_tool_policy(request: Request) -> ToolPolicy:
+    return request.app.state.tool_policy
+
+
+def get_sandbox_manager(request: Request) -> DockerSandboxManager:
+    return request.app.state.sandbox_manager
+
+
+def require_project(policy: ToolPolicy, project_id: str) -> None:
+    """在 SSE 响应开始前拒绝未知项目，避免它绕过普通回复路径。"""
+    try:
+        policy.project(project_id)
+    except ToolPolicyError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+
+
 @router.post("/run", response_model=AgentResult)
 async def run_agent(
     body: AgentRunRequest,
     agent: Annotated[ToolAgent, Depends(get_agent)],
     workflow_router: Annotated[IntentWorkflowRouter, Depends(get_workflow_router)],
-    _user: Annotated[CurrentUser, Depends(require_user)],
+    user: Annotated[CurrentUser, Depends(require_user)],
+    policy: Annotated[ToolPolicy, Depends(get_tool_policy)],
+    sandbox: Annotated[DockerSandboxManager, Depends(get_sandbox_manager)],
 ) -> AgentResult:
     """执行一个用户问题并返回答案、工具轨迹及 Token 统计。
 
     HTTP 层不参与推理，只负责输入验证、调用 ToolAgent 和异常语义转换。
     """
+    require_project(policy, body.project_id)
+    task_id = uuid4().hex
     try:
-        decision = await workflow_router.intent_router.classify(body.query)
-        if decision.intent is SREIntent.NEED_CLARIFICATION:
-            return AgentResult(answer="请补充具体服务、故障现象和发生时间。", steps=[])
-        if decision.intent is SREIntent.OUT_OF_SCOPE:
-            return AgentResult(answer="当前仅支持运维、系统巡检和故障排查问题。", steps=[])
-        return await agent.run(body.query)
+        async with sandbox.task_workspace(task_id) as workspace:
+            with task_security_scope(user["id"], body.project_id, task_id, str(workspace)):
+                decision = await workflow_router.intent_router.classify(body.query)
+                if decision.intent is SREIntent.NEED_CLARIFICATION:
+                    return AgentResult(answer="请补充具体服务、故障现象和发生时间。", steps=[])
+                if decision.intent is SREIntent.OUT_OF_SCOPE:
+                    return AgentResult(answer="当前仅支持运维、系统巡检和故障排查问题。", steps=[])
+                return await agent.run(body.query)
     except GatewayConfigurationError as exc:
         # 缺少 Gateway Token 属于服务端未配置，而非用户请求格式错误。
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
@@ -79,18 +104,24 @@ async def diagnose(
     workflow_router: Annotated[IntentWorkflowRouter, Depends(get_workflow_router)],
     user: Annotated[CurrentUser, Depends(require_user)],
     conversations: Annotated[ConversationService, Depends(get_conversation_service)],
+    policy: Annotated[ToolPolicy, Depends(get_tool_policy)],
+    sandbox: Annotated[DockerSandboxManager, Depends(get_sandbox_manager)],
 ) -> DiagnosisReport:
     """同步返回完整的结构化诊断报告，适合脚本、评测和 API 测试。"""
+    require_project(policy, body.project_id)
     try:
         conversation_id = conversations.ensure(user["id"], body.conversation_id, body.message)
     except KeyError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="conversation not found") from exc
-    with conversation_memory_scope(user["id"], conversation_id):
-        result = await workflow_router.dispatch(
-            body.message,
-            conversation_id=conversation_id,
-            user_id=user["id"],
-        )
+    task_id = uuid4().hex
+    async with sandbox.task_workspace(task_id) as workspace:
+        with task_security_scope(user["id"], body.project_id, task_id, str(workspace)):
+            with conversation_memory_scope(user["id"], conversation_id):
+                result = await workflow_router.dispatch(
+                    body.message,
+                    conversation_id=conversation_id,
+                    user_id=user["id"],
+                )
     result.conversation_id = conversation_id
     return result
 
@@ -101,13 +132,17 @@ async def diagnose_stream(
     workflow_router: Annotated[IntentWorkflowRouter, Depends(get_workflow_router)],
     user: Annotated[CurrentUser, Depends(require_user)],
     conversations: Annotated[ConversationService, Depends(get_conversation_service)],
+    policy: Annotated[ToolPolicy, Depends(get_tool_policy)],
+    sandbox: Annotated[DockerSandboxManager, Depends(get_sandbox_manager)],
 ) -> StreamingResponse:
     """以 SSE 逐步发送 phase、tool、final 事件，供问答页面实时展示。"""
+    require_project(policy, body.project_id)
     try:
         conversation_id = conversations.ensure(user["id"], body.conversation_id, body.message)
     except KeyError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="conversation not found") from exc
     queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+    task_id = uuid4().hex
 
     async def publish(event: dict[str, object]) -> None:
         """工作流先完成持久化，再把事件入队发送。"""
@@ -119,13 +154,15 @@ async def diagnose_stream(
     async def execute() -> None:
         """后台执行工作流，并把未预期错误转换为可读 SSE 事件。"""
         try:
-            with conversation_memory_scope(user["id"], conversation_id):
-                await workflow_router.dispatch(
-                    body.message,
-                    publish,
-                    conversation_id=conversation_id,
-                    user_id=user["id"],
-                )
+            async with sandbox.task_workspace(task_id) as workspace:
+                with task_security_scope(user["id"], body.project_id, task_id, str(workspace)):
+                    with conversation_memory_scope(user["id"], conversation_id):
+                        await workflow_router.dispatch(
+                            body.message,
+                            publish,
+                            conversation_id=conversation_id,
+                            user_id=user["id"],
+                        )
         except Exception as exc:  # HTTP 流已开始，只能通过事件报告错误。
             detail = str(exc).strip()
             error_message = f"{exc.__class__.__name__}: {detail}" if detail else exc.__class__.__name__

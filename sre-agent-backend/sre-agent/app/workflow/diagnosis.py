@@ -210,14 +210,14 @@ class DiagnosisWorkflow:
             f'histogram_quantile(0.95, sum(rate(http_server_requests_seconds_bucket'
             f'{{service="{service}"}}[5m])) by (le))'
         )
-        await self._call(state, "query_metrics", {"query": latency, **common}, "HTTP P95", callback)
+        await self._call(state, "query_metrics", {"query": latency, "time_range_minutes": state.time_range_minutes}, "HTTP P95", callback)
         errors = f'sum(rate(http_server_requests_seconds_count{{service="{service}",status=~"5.."}}[5m]))'
-        await self._call(state, "query_metrics", {"query": errors, **common}, "HTTP 5xx 速率", callback)
+        await self._call(state, "query_metrics", {"query": errors, "time_range_minutes": state.time_range_minutes}, "HTTP 5xx 速率", callback)
         resources = (
             f'sum by (pod) (rate(container_cpu_usage_seconds_total{{namespace="sre-lab",pod=~"{service}.*"}}[5m])) '
             f'or sum by (pod) (container_memory_working_set_bytes{{namespace="sre-lab",pod=~"{service}.*"}})'
         )
-        await self._call(state, "query_metrics", {"query": resources, **common}, "Pod 级 CPU/内存", callback)
+        await self._call(state, "query_metrics", {"query": resources, "time_range_minutes": state.time_range_minutes}, "Pod 级 CPU/内存", callback)
         await self._call(state, "query_logs", {**common, "level": "error", "limit": 20}, "近期异常日志", callback)
 
     async def _analyze(self, state: DiagnosisState, callback: EventCallback | None) -> None:

@@ -7,6 +7,8 @@ import { nextTick, onMounted, reactive, ref } from "vue";
 
 // 允许通过 Vite 环境变量覆盖本地 Agent 地址。
 const apiBaseUrl = import.meta.env.VITE_AGENT_API_BASE_URL || "http://127.0.0.1:8001";
+// 第一版只允许服务端 Tool Policy 中登记的 sre-lab 项目；namespace/repo/path 不由浏览器传入。
+const projectId = "sre-lab";
 const token = ref(localStorage.getItem("sre_agent_token") || "");
 const currentUser = ref(null);
 const authLoading = ref(true);
@@ -92,6 +94,7 @@ async function sendQuestion() {
       body: JSON.stringify({
         message: query,
         conversation_id: currentConversationId.value || null,
+        project_id: projectId,
       }),
     });
     if (!response.ok) {
@@ -281,6 +284,7 @@ onMounted(restoreSession);
           <div><dt>Gateway</dt><dd>:8000</dd></div>
           <div><dt>Ollama</dt><dd>:11434</dd></div>
           <div><dt>Kind</dt><dd>sre-lab</dd></div>
+          <div><dt>Project</dt><dd>{{ projectId }}</dd></div>
         </dl>
       </section>
 

@@ -1,0 +1,36 @@
+projects:
+  sre-lab:
+    namespace: sre-lab
+    repositories:
+      order-service: ["."]
+      inventory-service: ["."]
+      user-service: ["."]
+      payment-service: ["."]
+      notification-service: ["."]
+      recommendation-service: ["."]
+    enabled_tools:
+      - list_deployments
+      - list_pods
+      - get_pod
+      - get_pod_events
+      - get_restart_count
+      - get_deployment
+      - get_container_image
+      - query_metrics
+      - get_service_health
+      - query_logs
+      - query_trace
+      - query_slow_queries
+      - query_sql_digest
+      - explain_sql
+      - get_repository
+      - get_current_commit
+      - get_commit
+      - get_previous_commit
+      - get_commit_diff
+      - read_file
+      - read_file_at_commit
+      - search_code
+      - list_changed_files
+      - search_conversation_memory
+      - search_code_state

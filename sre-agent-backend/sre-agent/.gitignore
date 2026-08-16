@@ -7,3 +7,5 @@ __pycache__/
 .data/
 # 本地联调进程日志不属于源码交付物。
 .agent-*.log
+.runtime-logs/
+.sandbox-tasks/

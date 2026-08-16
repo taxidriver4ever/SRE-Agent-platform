@@ -55,6 +55,7 @@ npm run preview
 ## 安全与数据边界
 
 - 浏览器只保存 Agent 登录 Token；Gateway Token、Provider Key、MySQL 和 Kubernetes 凭证不会进入前端。
+- 第一版前端固定发送 `project_id=sre-lab`；它只用于选择服务端白名单项目，前端不能提交 namespace、repo、allowed paths 或 Tool 凭证。
 - Conversation ID 由后端创建并按当前用户校验，前端不能借 ID 读取其他用户的会话。
 - 页面只显示后端公开的阶段和工具摘要，不显示模型隐藏推理。
 - 完整 Tool Result 和 Evidence 通过受保护的后端接口按需读取。

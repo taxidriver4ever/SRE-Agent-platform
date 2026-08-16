@@ -67,6 +67,16 @@ class Settings:
     auth_token_ttl_hours: int
     initial_username: str
     initial_password: str
+    default_project_id: str
+    tool_policy_path: str
+    prometheus_bearer_token: str | None
+    loki_bearer_token: str | None
+    sandbox_workspace_root: str
+    sandbox_image: str
+    sandbox_cpus: float
+    sandbox_memory_mb: int
+    sandbox_pids_limit: int
+    sandbox_timeout_seconds: float
 
 
 def get_settings() -> Settings:
@@ -127,4 +137,21 @@ def get_settings() -> Settings:
         # 登录凭据必须来自未提交的 .env 或进程环境，源码不再提供默认密码。
         initial_username=_required_env("SRE_INITIAL_USERNAME"),
         initial_password=_required_env("SRE_INITIAL_PASSWORD"),
+        default_project_id=os.getenv("SRE_DEFAULT_PROJECT_ID", "sre-lab"),
+        tool_policy_path=os.getenv(
+            "SRE_TOOL_POLICY_PATH",
+            str(Path(__file__).resolve().parents[2] / "config" / "tool-policy.yaml"),
+        ),
+        # 真实观测凭证仅由后端 HTTP Client 使用，不会进入 Tool Schema 或 LLM 上下文。
+        prometheus_bearer_token=os.getenv("PROMETHEUS_BEARER_TOKEN") or None,
+        loki_bearer_token=os.getenv("LOKI_BEARER_TOKEN") or None,
+        sandbox_workspace_root=os.getenv(
+            "SRE_SANDBOX_WORKSPACE_ROOT",
+            str(Path(__file__).resolve().parents[2] / ".sandbox-tasks"),
+        ),
+        sandbox_image=os.getenv("SRE_SANDBOX_IMAGE", "python:3.12-alpine"),
+        sandbox_cpus=float(os.getenv("SRE_SANDBOX_CPUS", "1.0")),
+        sandbox_memory_mb=int(os.getenv("SRE_SANDBOX_MEMORY_MB", "512")),
+        sandbox_pids_limit=int(os.getenv("SRE_SANDBOX_PIDS_LIMIT", "128")),
+        sandbox_timeout_seconds=float(os.getenv("SRE_SANDBOX_TIMEOUT_SECONDS", "120")),
     )

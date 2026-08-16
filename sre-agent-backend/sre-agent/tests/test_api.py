@@ -58,3 +58,15 @@ def test_protected_endpoint_rejects_missing_token():
     with TestClient(create_app()) as client:
         response = client.get("/api/conversations")
     assert response.status_code == 401
+
+
+def test_chat_rejects_project_outside_server_policy_before_llm_or_tools():
+    """project_id 只能选择服务端 Tool Policy 中的项目。"""
+    with TestClient(create_app()) as client:
+        response = client.post(
+            "/api/agent/chat",
+            json={"message": "检查订单延迟", "project_id": "another-project"},
+            headers=login_headers(client),
+        )
+    assert response.status_code == 403
+    assert "unauthorized project_id" in response.json()["detail"]
