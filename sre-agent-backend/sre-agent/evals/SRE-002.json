@@ -1,9 +1,10 @@
 {
   "_comment": "连接池耗尽：应关联 Hikari 等待、慢查询和 5xx，而非下游库存。",
-  "question": "为什么 order 接口突然大量报 500？",
+  "case_id": "SRE-002",
+  "symptom": "为什么 order 接口突然大量报 500？",
   "expected_service": "order-service",
   "expected_root_cause": ["connection pool", "连接池", "Hikari"],
-  "expected_evidence_types": ["Loki", "MySQL"],
-  "forbidden_wrong_causes": ["inventory OOM", "CPU saturation"],
+  "required_evidence": ["Loki", "MySQL"],
+  "forbidden_shortcuts": ["SRE-002", "Hikari", "固定表名"],
   "minimum_confidence": 0.65
 }

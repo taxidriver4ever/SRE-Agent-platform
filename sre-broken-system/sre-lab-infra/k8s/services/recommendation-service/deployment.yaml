@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: recommendation-service
+  namespace: sre-lab
+  labels: {app: recommendation-service, service: recommendation-service}
+  annotations: {sre.agent/repository: recommendation-service, sre.agent/git-sha: 96a6db3092b31a4e1493d9e9c7f7aa2d2af463df}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: recommendation-service}}
+  template:
+    metadata:
+      labels: {app: recommendation-service, service: recommendation-service, version: 96a6db3092b31a4e1493d9e9c7f7aa2d2af463df}
+      annotations: {prometheus.io/scrape: "true", prometheus.io/path: /metrics, prometheus.io/port: "8085", sre.agent/repository: recommendation-service, sre.agent/git-sha: 96a6db3092b31a4e1493d9e9c7f7aa2d2af463df}
+    spec:
+      containers:
+        - name: recommendation-service
+          image: sre-lab/recommendation-service:96a6db3092b31a4e1493d9e9c7f7aa2d2af463df
+          env:
+            - {name: SERVICE_VERSION, value: 96a6db3092b31a4e1493d9e9c7f7aa2d2af463df}
+            - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+          ports: [{name: http, containerPort: 8085}]
+          readinessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 4, periodSeconds: 5}
+          livenessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 12, periodSeconds: 10}
+          resources: {requests: {cpu: 75m, memory: 96Mi}, limits: {cpu: 700m, memory: 256Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: recommendation-service, namespace: sre-lab}
+spec: {selector: {app: recommendation-service}, ports: [{name: http, port: 8085, targetPort: http}]}

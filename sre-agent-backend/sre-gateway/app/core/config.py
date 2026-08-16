@@ -49,5 +49,6 @@ def provider_settings() -> ProviderSettings:
         deepseek_api_key=os.getenv("DEEPSEEK_API_KEY"),
         deepseek_base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
-        timeout_seconds=float(os.getenv("PROVIDER_TIMEOUT_SECONDS", "60")),
+        # Evidence Planner 的本地模型请求可能超过一分钟；仍以有限超时防止挂死。
+        timeout_seconds=float(os.getenv("PROVIDER_TIMEOUT_SECONDS", "180")),
     )

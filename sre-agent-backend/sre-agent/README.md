@@ -161,6 +161,12 @@ Intent Router 在模板回填仍失败时采用更严格的失败策略：保存
 
 最终报告中的每条证据包含 `evidence_id` 和 `source_references`。User/Assistant Message、Tool Call 和完整 Tool Result 全部永久写入 MySQL Conversation Store；正常阶段全部保留在 Active Context。活动上下文加预留输出达到模型窗口约 80% 后，模型生成短 Conversation Summary、短 Context State 和可检索 Memory Item，成功提交后旧消息退出 Active Context，但原始记录不删除。`evidence_id` 就是原始 Tool Result Message ID，可通过 `GET /api/agent/evidence/{run_id}/{evidence_id}` 在当前用户权限内回查。
 
+### Evidence-driven Investigation
+
+Workflow 只控制阶段、预算、Tool 调度、Evidence 持久化和终止条件，不包含服务专属根因、固定 SQL、固定 Trace ID 或 Eval Case 答案。Baseline 建立通用 Metrics、Logs、Pod 与健康视图；随后 Evidence Planner 只使用 Tool Result 中实际出现的关联字段推进：日志中的 `trace_id` → 精确 Trace，Trace/慢日志中的 SQL → `EXPLAIN`，Pod 重启 → Pod/Events/restart，运行 commit 与发布现象 → Git Diff。
+
+所有成功 Tool Result 都会归一化为 `tool/status/summary/data/structured_data/references/next_hints`，Evidence 同时记录 `source_type`、短 `summary`、`parent_evidence_ids` 和原始 Tool Result 的 `evidence_id`。最终 Finding 必须列出有效 Evidence ID。Evidence Gate 会检查引用是否存在、是否包含直接运行时证据以及证据是否矛盾；不满足条件时报告状态为 `insufficient_evidence`，不会把模型猜测包装成根因。
+
 历史 State/Evidence 只允许通过 `search_conversation_memory` MCP 工具读取。该工具的 SQL 和表名固定为 `conversation_memory_items`，用户与 Conversation 从服务端请求 Scope 注入；模型不能传入身份、会话、表名或原始 SQL，最多读取当前会话 20 条有效记忆。
 
 ## Code State 与精确源码读取
@@ -206,7 +212,7 @@ Intent Router 在模板回填仍失败时采用更严格的失败策略：保存
 - Tool Call 与 Tool Result 原文永久进入 MySQL Conversation Store；压缩成功后旧原文退出 Active Context，短 State/Evidence 进入专用 Memory 表。
 - Intent 判断仅调用 LLM Gateway；分类成功前不会读取工具清单或执行任何 MCP/Kubernetes 调用。
 - Tool 有参数校验、15 秒超时、结构化错误；工作流最多 12 步。
-- VERIFY 过滤空查询；少于两个独立证据源只能报告“高可能性候选根因”。
+- VERIFY 过滤空结果并校验 Finding 引用；缺少至少两条互相支持的证据、缺少直接运行时证据或存在矛盾时返回 `insufficient_evidence`。
 
 ### Task Workspace 与 Docker Sandbox
 
@@ -237,10 +243,13 @@ Docker 使用 argv + `shell=False` 启动，并有硬超时。未来工作流为
 ```powershell
 python -m pytest -q
 python evals/run_evals.py --case SRE-001
+python evals/run_evals.py
 # 使用本地已有 mysql:8.4 镜像验证真实 Docker 隔离参数
 python scripts/verify_sandbox.py
 ```
 
 当前代码包含 MCP 安全、Agent、API、MySQL Conversation Compaction、Memory 权限隔离、Code State 增量更新与 Source Reference 回归测试；最终通过数以本机 `pytest` 输出为准。
+
+固定评测只读取 `SRE-001`～`SRE-010`。Runner 发送给 Agent 的请求只有 `symptom + project_id`，`expected_root_cause`、`required_evidence` 和 `forbidden_shortcuts` 只由 Evaluator 使用。每次运行都会在 `evals/results/latest.json` 保存逐 Case 的服务定位、根因、Evidence 完整度、Tool Calls、耗时、Token、最终状态和失败原因，以及整体 Accuracy/平均值；失败 Case 不会被过滤。
 
 返回 [平台总览](../../README.md)。

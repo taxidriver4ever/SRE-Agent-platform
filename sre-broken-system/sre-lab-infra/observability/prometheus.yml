@@ -1,0 +1,53 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # 业务端点使用稳定的 ClusterIP DNS；service 标签由应用指标本身提供。
+  - job_name: sre-lab-services
+    static_configs:
+      - targets:
+          - order-service.sre-lab.svc.cluster.local:8080
+        labels: {service: order-service}
+      - targets:
+          - inventory-service.sre-lab.svc.cluster.local:8081
+        labels: {service: inventory-service}
+      - targets:
+          - user-service.sre-lab.svc.cluster.local:8082
+        labels: {service: user-service}
+      - targets:
+          - payment-service.sre-lab.svc.cluster.local:8083
+        labels: {service: payment-service}
+      - targets:
+          - notification-service.sre-lab.svc.cluster.local:8084
+        labels: {service: notification-service}
+      - targets:
+          - recommendation-service.sre-lab.svc.cluster.local:8085
+        labels: {service: recommendation-service}
+    metrics_path: /metrics
+    relabel_configs:
+      # Spring Boot 的指标路径与其他服务不同，单独 job 在下方覆盖。
+      - source_labels: [service]
+        regex: order-service
+        action: drop
+
+  - job_name: order-service
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: [order-service.sre-lab.svc.cluster.local:8080]
+        labels: {service: order-service}
+
+  - job_name: kube-state-metrics
+    static_configs:
+      - targets: [kube-state-metrics.sre-lab.svc.cluster.local:8080]
+
+  # 从 kubelet/cAdvisor 获取每个 Pod/Container 的真实 CPU 与内存使用量。
+  - job_name: kubernetes-cadvisor
+    scheme: https
+    authorization:
+      credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    tls_config:
+      insecure_skip_verify: true
+    kubernetes_sd_configs:
+      - role: node
+    metrics_path: /metrics/cadvisor

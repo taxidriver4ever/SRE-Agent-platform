@@ -1,9 +1,10 @@
 {
   "_comment": "重试风暴：应识别无退避重试对下游超时的放大作用。",
-  "question": "order 调用库存时为什么请求量被放大，是否存在重试风暴？",
+  "case_id": "SRE-006",
+  "symptom": "order 调用库存时为什么请求量被放大，是否存在重试风暴？",
   "expected_service": "order-service",
   "expected_root_cause": ["重试", "retry", "下游", "timeout"],
-  "expected_evidence_types": ["Tempo", "Loki", "Prometheus"],
-  "forbidden_wrong_causes": ["OOM", "missing index"],
+  "required_evidence": ["Tempo", "Loki", "Prometheus"],
+  "forbidden_shortcuts": ["SRE-006", "retry 正确答案", "固定下游服务"],
   "minimum_confidence": 0.65
 }

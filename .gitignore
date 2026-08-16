@@ -239,6 +239,10 @@ Desktop.ini
 .idea/
 .vscode/
 
+# Local repository migration metadata and temporary workspaces.
+.tmp/
+sre-broken-system/.legacy-monorepo-git/
+
 # -----------------------------------------------------------------------------
 # SRE Agent monorepo local/runtime files
 # -----------------------------------------------------------------------------

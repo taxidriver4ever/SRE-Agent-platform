@@ -1,0 +1,11 @@
+scenarios:
+  SRE-001: {title: "Real slow SQL", service: order-service, mechanism: "BAD leading-wildcard LIKE bypasses B-Tree index", evidence: [Prometheus P95, Tempo JDBC span, MySQL slow_log, EXPLAIN type ALL, Git diff]}
+  SRE-002: {title: "DB pool exhaustion", service: order-service, mechanism: "small Hikari pool plus CPU-expensive MySQL statement and concurrency", evidence: [Hikari active/pending/max, connection timeout logs, HTTP 5xx, MySQL]}
+  SRE-003: {title: "Dependency timeout", service: inventory-service, mechanism: "inventory reservation exceeds order client read timeout", evidence: [cross-service Trace, timeout logs, dependency latency]}
+  SRE-004: {title: "CPU saturation", service: user-service, mechanism: "real prime calculation blocks workers", evidence: [Pod CPU, Python blocking gauge, HTTP P95]}
+  SRE-005: {title: "Memory leak and OOMKilled", service: payment-service, mechanism: "retained Node Buffers exceed 128Mi limit", evidence: [RSS/heap metrics, K8s OOMKilled event, restart count]}
+  SRE-006: {title: "Retry storm", service: inventory-service, mechanism: "BAD no-backoff retries amplify slow recommendation calls", evidence: [version metric, retry traffic, cross-service Trace, Git diff]}
+  SRE-007: {title: "Deployment regression", service: order-service, mechanism: "all replicas roll from indexed GOOD to wildcard BAD", evidence: [image SHA, before/after P95, Git diff, EXPLAIN]}
+  SRE-008: {title: "Single Pod degradation", service: order-service, mechanism: "one selected Pod performs CPU-heavy work", evidence: [service intermittent P95, per-Pod P95/CPU, Pod identity]}
+  SRE-009: {title: "Mixed version deployment", service: order-service, mechanism: "Service balances two GOOD Pods and one BAD canary", evidence: [Pod images, version-level metrics, MySQL, Git diff]}
+  SRE-010: {title: "Bad health check / CrashLoop", service: order-service, mechanism: "invalid liveness path restarts healthy process", evidence: [probe failures, K8s events, restart count, Deployment diff]}

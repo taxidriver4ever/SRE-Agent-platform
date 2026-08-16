@@ -1,0 +1,79 @@
+services:
+  order-service:
+    aliases: [order, orders, 订单, 订单模块]
+    language: Java 21
+    framework: Spring Boot 3 / JDBC / HikariCP
+    repository: ../order-service
+    port: 8080
+    dependencies: [inventory-service, user-service, payment-service, notification-service]
+    database: MySQL [orders, order_items]
+    owner: commerce-order-team
+    description: 订单创建、查询、列表、取消与跨服务交易编排
+    source_path: src/main/java/local/srelab/order/repository/OrderRepository.java
+    good_commit: dbf1473f182ecf4d157e57dd4486701fc2de53b6
+    bad_commit: f23997c13f1a8ffe7f8d3fd48ec9f45823860435
+  inventory-service:
+    aliases: [inventory, stock, 库存, 库存模块]
+    language: Go 1.23
+    framework: net/http / internal packages
+    repository: ../inventory-service
+    port: 8081
+    dependencies: [recommendation-service]
+    database: MySQL inventory model plus concurrency-safe lab repository
+    owner: supply-chain-team
+    description: 库存查询、预占、释放与推荐预热
+    source_path: internal/client/recommendation.go
+    good_commit: 21ca3f0e4d51483ff9f5f387a037708620a1a6e9
+    bad_commit: c8ea801137f9fc2da2674e6f0591e98189ebeb5b
+  user-service:
+    aliases: [user, users, 用户, 会员]
+    language: Python 3.12
+    framework: FastAPI / SQLAlchemy
+    repository: ../user-service
+    port: 8082
+    dependencies: []
+    database: MySQL users
+    owner: identity-team
+    description: 用户资料、状态、会员等级与折扣
+    source_path: app/api/routes.py
+    good_commit: dd8d255ce1a483689ca1b472d1ae99e1425c92c2
+    bad_commit: 3ff57f4054ed4302ef036591c6c090d2d9b86069
+  payment-service:
+    aliases: [payment, payments, 支付, 退款]
+    language: Node.js 22 / TypeScript
+    framework: Express 5
+    repository: ../payment-service
+    port: 8083
+    dependencies: [notification-service]
+    database: payments domain repository
+    owner: payment-platform-team
+    description: 支付授权、幂等查询、状态和退款
+    source_path: src/repositories/payment-repository.ts
+    good_commit: a0a1e56b9556ff07a3ea5d7b758df8ee346e6090
+    bad_commit: f40de2d0171decc48eb242d3ad89c30b4723ce90
+  notification-service:
+    aliases: [notification, notifications, 通知, 消息]
+    language: Go 1.23
+    framework: net/http / bounded worker queue
+    repository: ../notification-service
+    port: 8084
+    dependencies: [external-provider-simulator]
+    database: bounded in-process queue for version one
+    owner: engagement-team
+    description: 订单与支付异步通知、重试和状态查询
+    source_path: cmd/server/main.go
+    good_commit: 670879a11d609d88863a6e6fb83e1cee1b15b6f8
+    bad_commit: 37f13a41f5c17476f8d2d0076c0d10d7966560b9
+  recommendation-service:
+    aliases: [recommendation, recommend, 推荐, 推荐模块]
+    language: Python 3.12
+    framework: FastAPI / in-memory ranking
+    repository: ../recommendation-service
+    port: 8085
+    dependencies: []
+    database: synthetic product catalog
+    owner: personalization-team
+    description: 商品与用户推荐、缓存和排名
+    source_path: app/service/recommendation_service.py
+    good_commit: 96a6db3092b31a4e1493d9e9c7f7aa2d2af463df
+    bad_commit: 33447e194e32a2e1b64172287e891ee7a13a1129

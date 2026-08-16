@@ -1,0 +1,47 @@
+server:
+  port: 8080
+spring:
+  application:
+    name: order-service
+  datasource:
+    url: ${DB_URL:jdbc:mysql://mysql:3306/sre_lab?useSSL=false&allowPublicKeyRetrieval=true}
+    username: ${DB_USERNAME:sre_reader}
+    password: ${DB_PASSWORD:sre_reader_dev_only}
+    hikari:
+      # 小连接池是 SRE-002 的必要条件；正常模式下仍足以处理演示流量。
+      maximum-pool-size: ${DB_POOL_MAX:3}
+      minimum-idle: 1
+      connection-timeout: ${DB_CONNECTION_TIMEOUT_MS:600}
+service:
+  # 镜像构建和 K8s Deployment 会注入完整 Git SHA；日志、Metrics、Trace 共享该版本。
+  version: ${SERVICE_VERSION:dev}
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      service: order-service
+      version: ${SERVICE_VERSION:dev}
+      pod: ${POD_NAME:local}
+    distribution:
+      # Prometheus 只有拿到 bucket 才能用 histogram_quantile 计算真实 P95/P99。
+      # 这里仅对 HTTP server timer 开启直方图，避免为所有 Micrometer 指标扩大时序数量。
+      percentiles-histogram:
+        http.server.requests: true
+      # 导出常用分位数便于演示面板直接读取；直方图仍是跨 Pod 聚合的权威来源。
+      percentiles:
+        http.server.requests: 0.5,0.95,0.99
+logging:
+  pattern:
+    console: '{"timestamp":"%d{yyyy-MM-dd''T''HH:mm:ss.SSSXXX}","service":"order-service","level":"%level","trace_id":"%X{trace_id:-}","message":"%replace(%msg){''"'',''\"''}"}%n'
+dependencies:
+  inventory: ${INVENTORY_BASE_URL:http://inventory-service:8081}
+  user: ${USER_BASE_URL:http://user-service:8082}
+  payment: ${PAYMENT_BASE_URL:http://payment-service:8083}
+  notification: ${NOTIFICATION_BASE_URL:http://notification-service:8084}

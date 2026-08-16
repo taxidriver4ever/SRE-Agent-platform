@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sre-lab
+  labels:
+    app.kubernetes.io/part-of: sre-agent-platform
+    sre.agent/environment: local-lab

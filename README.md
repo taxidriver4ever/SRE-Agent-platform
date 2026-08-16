@@ -30,15 +30,18 @@ flowchart LR
     G --> O["Ollama :11434"]
     G -.-> P["云端模型 Provider"]
     A --> M[("Agent MySQL :13308")]
-    A --> T["只读 MCP 工具"]
+    A --> PL["Evidence Planner"]
+    PL --> T["只读 MCP 工具"]
     T --> K["Kind / Kubernetes"]
     T --> OBS["Prometheus / Loki / Tempo"]
     T --> DB[("Lab MySQL :13307")]
     T --> R["Git 仓库与精确 commit"]
+    T --> E[("Evidence Chain")]
+    E --> V["Evidence Gate / Diagnosis"]
     K --> S["六个故障实验服务"]
 ```
 
-一次诊断遵循：确定范围 → 建立健康、指标和日志基线 → 生成候选根因 → 专项调查 → 跨源验证 → 输出带 Evidence Reference 的报告。证据不足时只报告候选根因，不把推测包装成事实。
+一次诊断遵循：确定范围 → 建立通用基线 → Planner 根据当前 Evidence 选择下一步 → 保存父子 Evidence Chain → Evidence Gate 校验引用与直接证据 → 输出报告。Workflow 不包含固定服务、SQL、Trace ID 或 Case 答案；证据不足时明确返回 `insufficient_evidence`。
 
 ## 意图识别与工作流分流
 
@@ -95,6 +98,13 @@ JSON 格式错误先进行有限 Repair；字段或类型错误会携带安全�
 - 足够运行 Kind、六个服务、可观测性组件和本地模型的内存
 
 `kind` 也可放在 `sre-broken-system/tools/kind.exe`。
+
+```powershell
+git clone https://github.com/taxidriver4ever/SRE-Agent-platform.git
+Set-Location SRE-Agent-platform
+```
+
+六个 Broken Service 与 Infra 已作为主仓库普通目录交付，不再依赖缺失 remote 的 Gitlink，因此普通 `git clone` 即可取得启动 Demo 所需源码。
 
 ### 2. 启动模型和 Agent 数据库
 
@@ -200,7 +210,16 @@ Set-Location ..\..\sre-agent-frontend
 npm run build
 ```
 
-端到端评测可在 Agent 目录运行 `python evals/run_evals.py --case SRE-001`。
+端到端评测可在 Agent 目录运行：
+
+```powershell
+# 单项调试
+python evals/run_evals.py --case SRE-001
+# 固定全量 SRE-001～SRE-010，并写入 evals/results/latest.json
+python evals/run_evals.py
+```
+
+Runner 只把 Case 的 `symptom` 发送给 Agent；Expected Answer、Required Evidence 与 Forbidden Shortcuts 只存在于 Evaluator。报告保留所有失败 Case，并统计 Service Accuracy、Root Cause Accuracy、Evidence Completion、平均 Tool Calls、平均耗时和平均 Token Usage。README 只展示成功完成的真实全量结果，不填造 100% 数据。
 
 ## 更多文档
 

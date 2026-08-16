@@ -1,0 +1,28 @@
+{
+  "generated_at": "2026-08-16T11:55:04.939416+00:00",
+  "agent_input_contract": "symptom_only; expected values remain evaluator-only",
+  "metrics": {
+    "cases": 1,
+    "passed": 0,
+    "service_accuracy": 0.0,
+    "root_cause_accuracy": 0.0,
+    "evidence_completion_rate": 0.0,
+    "average_tool_calls": 0.0,
+    "average_diagnosis_time_ms": 300030.0,
+    "average_token_usage": 0.0
+  },
+  "cases": [
+    {
+      "case_id": "SRE-001",
+      "passed": false,
+      "service_correct": false,
+      "root_cause_correct": false,
+      "evidence_status": "MISSING",
+      "tool_calls": 0,
+      "diagnosis_time_ms": 300030,
+      "token_usage": 0,
+      "final_status": "error",
+      "failure_reason": "API 调用失败: timed out"
+    }
+  ]
+}

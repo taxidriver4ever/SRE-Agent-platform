@@ -1,0 +1,41 @@
+// Kind 节点会把 Pod 日志放在 /var/log/pods/<namespace>_<pod>_<uid>/<container>/0.log。
+// 这里直接匹配 sre-lab 命名空间，避免不同 Kubernetes 版本中 discovery 元数据拼接路径的差异。
+local.file_match "sre_lab_pod_logs" {
+  path_targets = [{
+    "__path__"  = "/var/log/pods/sre-lab_*/*/*.log",
+    "namespace" = "sre-lab",
+    "job"       = "kubernetes-pods",
+  }]
+
+  // 每 5 秒重新扫描一次，因此 Pod 重建或滚动更新后无需人工修改配置。
+  sync_period = "5s"
+}
+
+// 持续跟踪匹配到的 CRI 日志文件，并把每一行交给解析流水线。
+loki.source.file "containers" {
+  targets = local.file_match.sre_lab_pod_logs.targets
+  forward_to = [loki.process.containers.receiver]
+}
+
+// stage.cri 会解析时间戳、stdout/stderr 与分段标记，防止原始 CRI 前缀污染应用日志正文。
+loki.process "containers" {
+  stage.cri {}
+
+  // 日志文件名中包含 Pod 与容器名；正则将它们提取为可检索的 Loki 标签。
+  stage.regex {
+    source     = "filename"
+    expression = "/var/log/pods/sre-lab_(?P<pod>[^_]+)_[^/]+/(?P<container>[^/]+)/\\d+\\.log"
+  }
+  stage.labels {
+    values = {
+      pod       = "",
+      container = "",
+    }
+  }
+  forward_to = [loki.write.default.receiver]
+}
+
+// Loki 位于同一命名空间，使用集群内 Service 地址传输日志，不依赖宿主机端口。
+loki.write "default" {
+  endpoint { url = "http://loki:3100/loki/api/v1/push" }
+}

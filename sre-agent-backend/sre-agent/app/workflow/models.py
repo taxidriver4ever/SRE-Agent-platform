@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -40,14 +40,40 @@ class Evidence(BaseModel):
     """从真实系统取得的一条证据，而不是模型猜测。"""
 
     source: str
+    source_type: str = ""
     tool_name: str
     title: str
     detail: str
+    summary: str = ""
+    structured_data: dict[str, Any] = Field(default_factory=dict)
     timestamp: datetime
     evidence_id: str
     source_references: list[SourceReference] = Field(default_factory=list)
+    reference: list[SourceReference] = Field(default_factory=list)
+    parent_evidence_ids: list[str] = Field(default_factory=list)
+    next_hints: list[str] = Field(default_factory=list)
     # 空查询仍保留在时间线中，但不能被 VERIFY 当作支持根因的独立证据。
     supports_conclusion: bool = True
+    direct_evidence: bool = False
+
+
+class DiagnosisFinding(BaseModel):
+    """一条必须能够反向追溯到 Tool Result 的诊断结论。"""
+
+    finding: str
+    evidence_ids: list[str] = Field(min_length=1)
+
+
+class DiagnosisSynthesis(BaseModel):
+    """Planner 完成调查后由证据约束的结构化综合结果。"""
+
+    status: Literal["confirmed", "insufficient_evidence"]
+    root_cause: str
+    evidence_ids: list[str] = Field(default_factory=list)
+    root_cause_chain: list[str] = Field(default_factory=list, max_length=8)
+    recommended_fix: list[str] = Field(default_factory=list, max_length=6)
+    confidence: float = Field(ge=0, le=1)
+    contradictions: list[str] = Field(default_factory=list, max_length=5)
 
 
 class CandidateCause(BaseModel):
@@ -75,13 +101,16 @@ class DiagnosisReport(BaseModel):
     environment: str
     time_range: str
     conclusion: str
+    status: Literal["confirmed", "insufficient_evidence"] = "insufficient_evidence"
     # Ollama 经统一 Gateway 生成的简短决策摘要；根因字段仍由证据门槛约束。
     decision_summary: str
     root_cause: str
+    findings: list[DiagnosisFinding] = Field(default_factory=list)
     evidence: list[Evidence]
     root_cause_chain: list[str]
     recommended_fix: list[str]
     confidence: float = Field(ge=0, le=1)
+    token_usage: int = Field(default=0, ge=0)
     candidates: list[CandidateCause]
     investigation_timeline: list[ToolCallRecord]
     workflow_phases: list[WorkflowPhase]
@@ -101,6 +130,7 @@ class DiagnosisState(BaseModel):
     symptom: str = "待确定"
     environment: str = "local-kind/sre-lab"
     time_range_minutes: int = 30
+    max_tool_steps: int = 12
     pod_name: str | None = None
     runtime_commit: str | None = None
     language: str = "unknown"
@@ -114,3 +144,6 @@ class DiagnosisState(BaseModel):
     timeline: list[ToolCallRecord] = Field(default_factory=list)
     phases: list[WorkflowPhase] = Field(default_factory=list)
     llm_decision_summary: str = ""
+    synthesis: DiagnosisSynthesis | None = None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0

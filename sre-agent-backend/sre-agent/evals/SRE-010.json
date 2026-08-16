@@ -1,9 +1,10 @@
 {
   "_comment": "健康检查错误：应用进程正常但错误 liveness path 造成重复重启。",
-  "question": "order-service 为什么不断重启，但启动日志看起来没有应用崩溃？",
+  "case_id": "SRE-010",
+  "symptom": "order-service 为什么不断重启，但启动日志看起来没有应用崩溃？",
   "expected_service": "order-service",
   "expected_root_cause": ["liveness", "健康检查", "probe", "重启"],
-  "expected_evidence_types": ["Kubernetes"],
-  "forbidden_wrong_causes": ["OOM", "慢 SQL"],
+  "required_evidence": ["Kubernetes"],
+  "forbidden_shortcuts": ["SRE-010", "固定 liveness path", "probe 正确答案"],
   "minimum_confidence": 0.6
 }

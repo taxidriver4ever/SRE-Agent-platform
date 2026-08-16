@@ -1,0 +1,1 @@
+{"name":"sre-lab-payment-service","version":"1.0.0","private":true,"type":"module","scripts":{"build":"tsc -p tsconfig.json","test":"npm run build && node --test dist/tests/*.test.js","start":"node dist/src/index.js"},"dependencies":{"express":"^5.1.0","prom-client":"^15.1.3"},"devDependencies":{"@types/express":"^5.0.3","@types/node":"^22.15.0","typescript":"^5.8.3"}}

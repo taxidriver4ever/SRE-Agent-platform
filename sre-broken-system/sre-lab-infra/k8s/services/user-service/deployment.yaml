@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+  namespace: sre-lab
+  labels: {app: user-service, service: user-service}
+  annotations: {sre.agent/repository: user-service, sre.agent/git-sha: dd8d255ce1a483689ca1b472d1ae99e1425c92c2}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: user-service}}
+  template:
+    metadata:
+      labels: {app: user-service, service: user-service, version: dd8d255ce1a483689ca1b472d1ae99e1425c92c2}
+      annotations: {prometheus.io/scrape: "true", prometheus.io/path: /metrics, prometheus.io/port: "8082", sre.agent/repository: user-service, sre.agent/git-sha: dd8d255ce1a483689ca1b472d1ae99e1425c92c2}
+    spec:
+      containers:
+        - name: user-service
+          image: sre-lab/user-service:dd8d255ce1a483689ca1b472d1ae99e1425c92c2
+          env:
+            - {name: DATABASE_URL, value: "mysql+pymysql://sre_app:sre_app_dev_only@mysql:3306/sre_lab"}
+            - {name: SERVICE_VERSION, value: dd8d255ce1a483689ca1b472d1ae99e1425c92c2}
+            - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector:4318"}
+            - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+          ports: [{name: http, containerPort: 8082}]
+          readinessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 4, periodSeconds: 5}
+          livenessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 12, periodSeconds: 10}
+          resources: {requests: {cpu: 75m, memory: 96Mi}, limits: {cpu: 700m, memory: 256Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: user-service, namespace: sre-lab}
+spec: {selector: {app: user-service}, ports: [{name: http, port: 8082, targetPort: http}]}

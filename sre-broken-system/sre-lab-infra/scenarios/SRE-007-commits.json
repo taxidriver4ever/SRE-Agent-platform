@@ -1,0 +1,8 @@
+{
+  "scenario": "SRE-007",
+  "description": "order-service 部署回归：索引等值查询退化为无索引前导通配查询",
+  "good_commit": "dbf1473f182ecf4d157e57dd4486701fc2de53b6",
+  "bad_commit": "f23997c13f1a8ffe7f8d3fd48ec9f45823860435",
+  "compare": "dbf1473f182ecf4d157e57dd4486701fc2de53b6..f23997c13f1a8ffe7f8d3fd48ec9f45823860435",
+  "runtime_rule": "Agent 必须先读 Deployment 的 sre.agent/git-sha，再读取该 SHA 的源码，禁止默认读取 HEAD。"
+}

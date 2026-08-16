@@ -72,7 +72,7 @@ Authorization: Bearer gw_sk_xxx
 - `CLAUDE_API_KEY`（兼容 `ANTHROPIC_API_KEY`）、`CLAUDE_BASE_URL`
 - `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`
 - `OLLAMA_BASE_URL`
-- `PROVIDER_TIMEOUT_SECONDS`
+- `PROVIDER_TIMEOUT_SECONDS`（本地 Evidence Planner 建议至少 `180` 秒）
 
 每次调用的 Provider、模型、Token 数、耗时和成功状态会写入 `gateway_usage_logs`。API Key 创建、鉴权、禁用以及 Gateway 模型调用成功或失败会写入 `gateway_operation_logs`。两类日志都不会记录请求消息、模型回复、Gateway API Key 明文或厂商 API Key。
 

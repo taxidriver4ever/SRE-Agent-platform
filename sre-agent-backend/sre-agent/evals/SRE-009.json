@@ -1,9 +1,10 @@
 {
   "_comment": "混合版本：Agent 必须识别少数 BAD SHA 并读取对应仓库 diff。",
-  "question": "订单接口间歇性变慢，检查是否滚动发布时混入了坏版本。",
+  "case_id": "SRE-009",
+  "symptom": "订单接口间歇性变慢，检查是否滚动发布时混入了坏版本。",
   "expected_service": "order-service",
   "expected_root_cause": ["混合", "BAD", "版本", "全表扫描"],
-  "expected_evidence_types": ["Kubernetes", "Prometheus", "Git", "MySQL"],
-  "forbidden_wrong_causes": ["所有版本相同", "纯网络抖动"],
+  "required_evidence": ["Kubernetes", "Prometheus", "Git", "MySQL"],
+  "forbidden_shortcuts": ["SRE-009", "BAD SHA", "固定版本答案"],
   "minimum_confidence": 0.8
 }

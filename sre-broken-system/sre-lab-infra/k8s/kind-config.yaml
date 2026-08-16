@@ -1,0 +1,15 @@
+# kind 单节点集群将 NodePort 映射到宿主机，Windows 无需长期维护 port-forward 进程。
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: sre-lab
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - {containerPort: 30080, hostPort: 18080, protocol: TCP}
+      - {containerPort: 30081, hostPort: 18081, protocol: TCP}
+      - {containerPort: 30082, hostPort: 18082, protocol: TCP}
+      - {containerPort: 30083, hostPort: 18083, protocol: TCP}
+      - {containerPort: 30090, hostPort: 19090, protocol: TCP}
+      - {containerPort: 30100, hostPort: 13100, protocol: TCP}
+      - {containerPort: 30200, hostPort: 13200, protocol: TCP}
+      - {containerPort: 30306, hostPort: 13307, protocol: TCP}

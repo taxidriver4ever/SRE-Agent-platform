@@ -11,20 +11,23 @@ from uuid import uuid4
 from app.conversation import ConversationService
 from app.conversation_memory import ConversationCompactionService
 from app.code_state import CodeStateService
-from app.evidence import build_source_references
-from app.llm.base import LLM, LLMMessage
+from app.evidence import build_source_references, normalize_tool_result
+from app.llm.base import LLM
 from app.llm.gateway import GatewayError
-from app.mcp_clients import FastMCPToolClient, ToolExecutionError
+from app.mcp_clients import FastMCPToolClient
 from app.repositories import RepositoryRegistry
 from app.workflow.catalog import ServiceCatalog
 from app.workflow.models import (
     CandidateCause,
     DiagnosisReport,
+    DiagnosisFinding,
+    DiagnosisSynthesis,
     DiagnosisState,
     Evidence,
     ToolCallRecord,
     WorkflowPhase,
 )
+from app.workflow.planner import EvidencePlanner
 
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 logger = logging.getLogger(__name__)
@@ -78,7 +81,9 @@ class DiagnosisWorkflow:
             user_id=user_id,
             service=target or "unknown",
             symptom=symptom or "待确定",
+            max_tool_steps=self.max_steps,
         )
+        planner = EvidencePlanner(self.llm) if self.llm is not None else None
         if self.conversation_service and state.user_id:
             self.conversation_service.append(
                 state.user_id,
@@ -94,11 +99,11 @@ class DiagnosisWorkflow:
         await self._triage(state, on_event, system_scan=system_scan)
         await self._baseline(state, on_event, system_scan=system_scan)
         await self._analyze(state, on_event)
-        await self._investigate(state, on_event, system_scan=system_scan)
+        await self._investigate(state, on_event, planner=planner, system_scan=system_scan)
         await self._phase(state, WorkflowPhase.VERIFY, on_event)
         # 在生成模型摘要之前先检查阈值，避免把已经足够大的跨轮增量继续原样传递。
         await self._compact_context_before_summary(state)
-        await self._summarize_with_gateway(state, on_event)
+        await self._synthesize_with_gateway(state, planner, on_event)
         report = self._report(state)
         await self._phase(state, WorkflowPhase.REPORT, on_event)
         await self._phase(state, WorkflowPhase.END, on_event)
@@ -138,8 +143,17 @@ class DiagnosisWorkflow:
         state.source_code_location = metadata.get("source_path")
         state.repository_url = metadata.get("repository_url")
         text = analysis_input.lower()
-        if state.symptom != "待确定":
-            pass
+        routed_symptom = state.symptom.lower()
+        if state.symptom != "待确定" and any(word in routed_symptom for word in ("重试", "retry", "依赖", "dependency", "timeout")):
+            state.symptom = "dependency_timeout"
+        elif state.symptom != "待确定" and any(word in routed_symptom for word in ("重启", "restart", "oom", "memory")):
+            state.symptom = "pod_restart"
+        elif state.symptom != "待确定" and any(word in routed_symptom for word in ("latency", "slow", "delay")):
+            state.symptom = "latency"
+        elif state.symptom != "待确定" and any(word in routed_symptom for word in ("5xx", "error", "failure")):
+            state.symptom = "5xx"
+        elif state.symptom != "待确定":
+            state.symptom = "general_incident"
         elif any(word in text for word in ("重试", "retry", "依赖", "dependency", "timeout", "超时")):
             state.symptom = "dependency_timeout"
         elif any(word in text for word in ("慢", "延迟", "latency")):
@@ -185,7 +199,10 @@ class DiagnosisWorkflow:
                 state,
                 "query_metrics",
                 {
-                    "query": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"sre-lab\"}[5m])) or sum by (pod) (container_memory_working_set_bytes{namespace=\"sre-lab\"})",
+                    "query": (
+                        f'sum by (pod) (rate(container_cpu_usage_seconds_total{{namespace="{self.kubernetes_namespace}"}}[5m])) '
+                        f'or sum by (pod) (container_memory_working_set_bytes{{namespace="{self.kubernetes_namespace}"}})'
+                    ),
                     "time_range_minutes": state.time_range_minutes,
                 },
                 "全局 Pod CPU/内存",
@@ -199,11 +216,28 @@ class DiagnosisWorkflow:
                 callback,
             )
             return
-        service = state.service if state.service != "unknown" else "order-service"
+        if state.service == "unknown":
+            await self._call(
+                state,
+                "query_metrics",
+                {"query": "sum by (service) (up)", "time_range_minutes": state.time_range_minutes},
+                "全服务健康基线",
+                callback,
+            )
+            await self._call(
+                state,
+                "query_logs",
+                {"time_range_minutes": state.time_range_minutes, "limit": 50},
+                "跨服务近期日志",
+                callback,
+            )
+            return
+        service = state.service
         common = {"service": service, "time_range_minutes": state.time_range_minutes}
         # Pod 清单必须先于聚合指标采集，以便识别单实例异常与混合镜像版本。
         pods = await self._call(state, "list_pods", {"label_selector": f"app={service}"}, "服务 Pod 与运行版本", callback)
         self._extract_pod_runtime(state, pods)
+        state.pod_name = state.pod_name or self._find_pod_name(pods, service)
         await self._call(state, "get_service_health", {"service": service}, "服务健康", callback)
         # 优先查询 P95 直方图；服务未开启 histogram 时 INVESTIGATE 仍可依赖日志、Trace 和数据库证据。
         latency = (
@@ -214,166 +248,72 @@ class DiagnosisWorkflow:
         errors = f'sum(rate(http_server_requests_seconds_count{{service="{service}",status=~"5.."}}[5m]))'
         await self._call(state, "query_metrics", {"query": errors, "time_range_minutes": state.time_range_minutes}, "HTTP 5xx 速率", callback)
         resources = (
-            f'sum by (pod) (rate(container_cpu_usage_seconds_total{{namespace="sre-lab",pod=~"{service}.*"}}[5m])) '
-            f'or sum by (pod) (container_memory_working_set_bytes{{namespace="sre-lab",pod=~"{service}.*"}})'
+            f'sum by (pod) (rate(container_cpu_usage_seconds_total{{namespace="{self.kubernetes_namespace}",pod=~"{service}.*"}}[5m])) '
+            f'or sum by (pod) (container_memory_working_set_bytes{{namespace="{self.kubernetes_namespace}",pod=~"{service}.*"}})'
         )
         await self._call(state, "query_metrics", {"query": resources, "time_range_minutes": state.time_range_minutes}, "Pod 级 CPU/内存", callback)
-        await self._call(state, "query_logs", {**common, "level": "error", "limit": 20}, "近期异常日志", callback)
+        await self._call(state, "query_logs", {**common, "limit": 20}, "近期服务日志", callback)
 
     async def _analyze(self, state: DiagnosisState, callback: EventCallback | None) -> None:
-        """基于症状生成有限候选集，留待专项调查验证。"""
+        """候选原因由后续 Planner 从 Evidence 生成，Workflow 不预置故障答案。"""
         await self._phase(state, WorkflowPhase.ANALYZE, callback)
-        analysis_input = state.query.lower()
-        if any(word in analysis_input for word in ("发布", "回归", "deploy", "regression")):
-            causes = [("deployment regression", "症状时间与运行版本变更相关，需要比较 GOOD..BAD", 5), ("database slowdown", "查询变更可能导致扫描量增加", 4)]
-        elif state.symptom == "latency":
-            causes = [
-                ("database slowdown", "SQL 或连接池可能占用请求时间", 5),
-                ("downstream dependency", "下游超时会表现为本服务低 CPU、高延迟", 4),
-                ("CPU saturation", "计算饱和可能提升排队时间", 3),
-            ]
-        elif state.symptom == "pod_restart":
-            causes = [("OOM / restart", "容器内存越界或进程崩溃", 5), ("deployment regression", "新镜像可能引入资源泄漏", 4)]
-        else:
-            causes = [("connection pool exhaustion", "错误高峰可能由池等待超时产生", 5), ("deployment regression", "近期发布可能改变失败率", 4)]
-        state.candidates = [CandidateCause(cause=c, reason=r, priority=p) for c, r, p in causes]
+        state.candidates = []
 
     async def _investigate(
         self,
         state: DiagnosisState,
         callback: EventCallback | None,
         *,
+        planner: EvidencePlanner | None,
         system_scan: bool = False,
     ) -> None:
-        """按症状选择专项策略，共享同一 State/Tool/Evidence/Report 模型。"""
+        """由 Planner 根据当前 Evidence 逐步选择工具，不按 Service/Case 分支。"""
         await self._phase(state, WorkflowPhase.INVESTIGATE, callback)
-        if system_scan and state.service == "unknown":
-            await self._call(
-                state,
-                "query_logs",
-                {"time_range_minutes": state.time_range_minutes, "limit": 50},
-                "跨服务近期日志",
-                callback,
-            )
-            await self._call(state, "query_slow_queries", {"time_range_minutes": 30, "limit": 10}, "系统慢查询", callback)
+        del system_scan
+        if planner is None or state.service == "unknown":
             return
-        service = state.service if state.service != "unknown" else "order-service"
-        text = state.query.lower()
-        is_regression = any(word in text for word in ("发布", "回归", "deploy", "regression"))
-        if is_regression and service == "order-service":
-            await self._call(state, "query_slow_queries", {"time_range_minutes": 30, "limit": 10}, "回归后的慢查询", callback)
-            await self._call(state, "explain_sql", {"sql": "SELECT COUNT(*) FROM orders WHERE customer_email LIKE '%slow.example.com%'"}, "回归 SQL 执行计划", callback)
-        elif state.symptom == "latency" and service == "order-service":
-            # 先从包含业务上下文的慢请求日志取得 trace_id，再用它精确查询 Tempo。
-            # 这种 Logs -> Traces 的关联可以避免拿到健康检查 Trace，并能证明慢 HTTP 请求
-            # 与 JDBC 慢查询确实属于同一次端到端调用，而不是仅凭时间接近进行猜测。
-            slow_request_logs = await self._call(
-                state,
-                "query_logs",
-                {"service": service, "keyword": "mode=slow_sql", "limit": 5},
-                "慢请求关联日志",
-                callback,
-            )
-            trace_id = self._extract_trace_id(slow_request_logs)
-            trace_arguments = {"trace_id": trace_id} if trace_id else {"service": service, "limit": 10}
-            await self._call(state, "query_trace", trace_arguments, "慢请求端到端 Trace", callback)
-            await self._call(state, "query_slow_queries", {"time_range_minutes": 30, "limit": 10}, "MySQL 慢查询", callback)
-            await self._call(state, "explain_sql", {"sql": "SELECT COUNT(*) FROM orders WHERE customer_email LIKE '%slow.example.com%'"}, "SQL 执行计划", callback)
-        elif state.symptom == "dependency_timeout":
-            await self._call(state, "query_trace", {"service": service, "limit": 10}, "依赖 Trace", callback)
-            await self._call(state, "query_logs", {"service": "inventory-service", "keyword": "timeout", "limit": 20}, "下游日志", callback)
-        elif state.symptom == "pod_restart" or service == "payment-service":
-            pods = await self._call(state, "list_pods", {}, "Pod 清单", callback)
-            state.pod_name = self._find_pod_name(pods, service)
-            if state.pod_name:
-                await self._call(state, "get_pod_events", {"name": state.pod_name}, "Pod Events", callback)
-                await self._call(state, "get_restart_count", {"name": state.pod_name}, "容器重启次数", callback)
-        elif service == "user-service" and any(word in text for word in ("cpu", "打满", "饱和")):
-            await self._call(state, "query_logs", {"service": service, "keyword": "cpu_saturation", "limit": 20}, "CPU 故障模式日志", callback)
-        else:
-            await self._call(state, "query_logs", {"service": service, "keyword": "Hikari", "limit": 20}, "连接池日志", callback)
-            await self._call(state, "query_slow_queries", {"time_range_minutes": 30, "limit": 10}, "慢查询交叉验证", callback)
-
-        # 所有专项策略最终都检查当前运行镜像及其 Git SHA，为 Runtime→Source 映射提供锚点。
-        if not state.runtime_commit:
-            runtime = await self._call(state, "get_container_image", {"name": service}, "运行镜像与 Git SHA", callback)
-            state.runtime_commit = self._extract_git_sha(runtime)
-        # 发布回归场景需要提交元数据来建立变更时间线；普通性能诊断直接读取运行
-        # SHA 对应源码即可，把有限的工具预算留给日志与 Trace 的精确关联。
-        if is_regression and state.runtime_commit and len(state.timeline) < self.max_steps:
-            await self._call(state, "get_commit", {"repository": state.repository, "commit": state.runtime_commit}, "运行提交元数据", callback)
-        if is_regression and state.runtime_commit and len(state.timeline) < self.max_steps:
-            await self._call(state, "list_changed_files", {"repository": state.repository, "base": f"{state.runtime_commit}^", "head": state.runtime_commit}, "GOOD..BAD 文件清单", callback)
-            await self._call(state, "get_commit_diff", {"repository": state.repository, "base": f"{state.runtime_commit}^", "head": state.runtime_commit}, "GOOD..BAD 代码差异", callback)
-        source_path = self.catalog.services.get(service, {}).get("source_path")
-        navigation_references: list[dict[str, Any]] = []
-        if self.code_state_service and state.repository and state.runtime_commit:
-            navigation_started = time.perf_counter()
-            try:
-                await self.code_state_service.ensure(state.repository, state.runtime_commit)
-                navigation = await self._call(
-                    state,
-                    "search_code_state",
-                    {
-                        "repository_name": state.repository,
-                        "query": state.service.split("-", 1)[0],
-                        "kinds": ["controller", "service", "repository", "component"],
-                        "limit": 6,
-                    },
-                    "Code State 导航",
-                    callback,
-                )
-                if isinstance(navigation, dict):
-                    seen_paths: set[str] = set()
-                    for item in navigation.get("components", []):
-                        if not isinstance(item, dict) or not item.get("path"):
-                            continue
-                        path = str(item["path"])
-                        if path in seen_paths:
-                            continue
-                        seen_paths.add(path)
-                        navigation_references.append(item)
-                        if len(navigation_references) == 2:
-                            break
-            except Exception as exc:
-                # Code State 是源码导航增强，不得因为首次扫描、Git 历史缺失或
-                # 可选模型增强失败而中断主诊断。记录可见错误后回退 Catalog 路径。
-                navigation_references = []
-                error = self._exception_text(exc)
-                record = ToolCallRecord(
-                    tool_name="refresh_code_state",
-                    arguments={"repository": state.repository, "commit": state.runtime_commit},
-                    result_summary="",
-                    timestamp=datetime.now(timezone.utc),
-                    duration_ms=int((time.perf_counter() - navigation_started) * 1000),
-                    error=error,
-                    evidence_id=None,
-                )
-                state.timeline.append(record)
-                if callback:
-                    await callback({"type": "tool", "record": record.model_dump(mode="json")})
-        if not navigation_references and source_path:
-            navigation_references = [{"path": str(source_path)}]
-        for reference in navigation_references:
-            if len(state.timeline) >= self.max_steps or not state.runtime_commit:
+        investigation_tools = {
+            "query_metrics", "query_logs", "query_trace", "query_slow_queries",
+            "query_sql_digest", "explain_sql", "get_pod", "get_pod_events",
+            "get_restart_count", "get_deployment", "get_container_image",
+            "get_repository", "get_current_commit", "get_commit", "get_previous_commit",
+            "list_changed_files", "get_commit_diff", "search_code_state",
+            "read_file_at_commit", "search_code",
+        }
+        tool_specs = [
+            item for item in await self.tools.specifications()
+            if item.get("name") in investigation_tools
+        ]
+        while len(state.timeline) < self.max_steps:
+            decision = await planner.decide(state, tool_specs)
+            if decision.action != "tool":
                 break
-            path = str(reference["path"])
-            arguments: dict[str, Any] = {
-                "repository": state.repository,
-                "commit": str(reference.get("commit_sha") or state.runtime_commit),
-                "path": path,
-            }
-            if reference.get("start_line") is not None:
-                arguments["start_line"] = int(reference["start_line"])
-            if reference.get("end_line") is not None:
-                arguments["end_line"] = int(reference["end_line"])
-            await self._call(
-                state,
-                "read_file_at_commit",
-                arguments,
-                f"Code State 精确源码：{path}",
-                callback,
+            signature = json.dumps(
+                [decision.tool_name, decision.arguments], ensure_ascii=False, sort_keys=True
             )
+            repeated = any(
+                item.error is None
+                and json.dumps([item.tool_name, item.arguments], ensure_ascii=False, sort_keys=True) == signature
+                for item in state.timeline
+            )
+            if repeated:
+                break
+            if decision.reason:
+                state.candidates = [
+                    CandidateCause(cause=decision.title, reason=decision.reason, priority=5)
+                ]
+            result = await self._call(
+                state,
+                decision.tool_name or "",
+                decision.arguments,
+                decision.title,
+                callback,
+                parent_evidence_ids=decision.parent_evidence_ids,
+            )
+            if decision.tool_name in {"list_pods", "get_pod"}:
+                self._extract_pod_runtime(state, result)
+            elif decision.tool_name == "get_container_image":
+                state.runtime_commit = self._extract_git_sha(result) or state.runtime_commit
 
     async def _call(
         self,
@@ -382,6 +322,7 @@ class DiagnosisWorkflow:
         arguments: dict[str, Any],
         title: str,
         callback: EventCallback | None,
+        parent_evidence_ids: list[str] | None = None,
     ) -> Any:
         """执行工具并记录 timestamp/duration/error；到达 max_steps 后拒绝继续。"""
         if len(state.timeline) >= self.max_steps:
@@ -410,6 +351,7 @@ class DiagnosisWorkflow:
                 namespace=self.kubernetes_namespace,
                 repository_url=state.repository_url,
             )
+            normalized = normalize_tool_result(tool_name, arguments, result, references)
             if self.conversation_service and state.user_id:
                 evidence_id = self.conversation_service.append(
                     state.user_id,
@@ -419,7 +361,9 @@ class DiagnosisWorkflow:
                         "tool_name": tool_name,
                         "arguments": arguments,
                         "result": result,
+                        "normalized_result": normalized.model_dump(mode="json"),
                         "source_references": [item.model_dump(mode="json") for item in references],
+                        "parent_evidence_ids": parent_evidence_ids or [],
                     },
                     message_type="tool_result",
                     run_id=state.run_id,
@@ -427,12 +371,17 @@ class DiagnosisWorkflow:
                 )
             else:
                 evidence_id = f"ev_{uuid4().hex[:16]}"
-            summary = self._compact_result(result)
+            summary = normalized.summary
             state.evidence.append(Evidence(
-                source=self._source(tool_name), tool_name=tool_name, title=title,
-                detail=summary, timestamp=started_at, evidence_id=evidence_id,
-                source_references=references,
+                source=self._source(tool_name), source_type=self._source(tool_name),
+                tool_name=tool_name, title=title, detail=summary, summary=summary,
+                timestamp=started_at, evidence_id=evidence_id,
+                structured_data=normalized.structured_data,
+                source_references=references, reference=references,
+                parent_evidence_ids=parent_evidence_ids or [],
+                next_hints=normalized.next_hints,
                 supports_conclusion=self._supports_conclusion(tool_name, summary),
+                direct_evidence=self._is_direct_evidence(tool_name, arguments, summary),
             ))
         except Exception as exc:
             error = self._exception_text(exc)
@@ -442,7 +391,21 @@ class DiagnosisWorkflow:
                     state.user_id,
                     state.conversation_id,
                     "assistant",
-                    {"tool_name": tool_name, "arguments": arguments, "error": error},
+                    {
+                        "tool_name": tool_name,
+                        "arguments": arguments,
+                        "error": error,
+                        "normalized_result": {
+                            "tool": tool_name,
+                            "status": "error",
+                            "summary": error,
+                            "data": {},
+                            "structured_data": {},
+                            "references": [],
+                            "next_hints": [],
+                        },
+                        "parent_evidence_ids": parent_evidence_ids or [],
+                    },
                     message_type="tool_result",
                     run_id=state.run_id,
                     tool_name=tool_name,
@@ -573,6 +536,19 @@ class DiagnosisWorkflow:
             return not any(marker in summary for marker in empty_markers)
         return True
 
+    @staticmethod
+    def _is_direct_evidence(tool_name: str, arguments: dict[str, Any], summary: str) -> bool:
+        """标记能够直接观测故障机制的数据，代码和服务清单仅作旁证。"""
+        if not DiagnosisWorkflow._supports_conclusion(tool_name, summary):
+            return False
+        if tool_name == "query_trace":
+            return bool(arguments.get("trace_id"))
+        return tool_name in {
+            "query_metrics", "get_service_health", "query_logs", "query_slow_queries",
+            "query_sql_digest", "explain_sql", "get_pod", "get_pod_events",
+            "get_restart_count", "get_deployment", "get_container_image",
+        }
+
     async def _update_conversation_context(
         self,
         state: DiagnosisState,
@@ -644,48 +620,73 @@ class DiagnosisWorkflow:
         except (GatewayError, ValueError, TimeoutError):
             return
 
-    def _report(self, state: DiagnosisState) -> DiagnosisReport:
-        """仅在至少两个独立证据源时使用确定性结论，否则降级为高可能候选。"""
-        sources = {item.source for item in state.evidence if item.supports_conclusion}
-        text = state.query.lower()
-        is_regression = any(word in text for word in ("发布", "回归", "deploy", "regression"))
-        if state.mixed_versions and state.service == "order-service":
-            root = "同一 order-service 后端池混合运行 GOOD/BAD 镜像，少数 BAD Pod 引入全表扫描并造成间歇性慢请求"
-            chain = ["Service 负载均衡到不同版本", "BAD Pod 执行前导通配查询", "MySQL 全表扫描", "BAD Pod P95 上升", "用户观察到间歇性延迟"]
-            fixes = ["停止 BAD canary 并恢复一致的 GOOD SHA", "修复模糊搜索查询或采用专用搜索索引", "发布门禁检查 ReplicaSet 镜像一致性和按 version 聚合的 P95"]
-        elif is_regression and state.service == "order-service":
-            root = "BAD 提交将带索引等值查询改成无索引前导通配查询，引入部署回归"
-            chain = ["GOOD..BAD 查询代码变化", "索引失效并全表扫描", "慢 SQL", "HTTP P95 上升", "发布后性能回归"]
-            fixes = ["回退 BAD 提交或恢复等值/可索引查询", "恢复 customer_email 索引", "在发布门禁中加入 SQL 执行计划和 P95 回归测试"]
-        elif state.service == "order-service" and state.symptom == "latency":
-            root = "缺少有效索引的前导通配符查询造成全表扫描与慢 SQL"
-            chain = ["前导通配符 LIKE", "扫描大量订单行", "MySQL 查询延迟", "连接长时间占用", "HTTP P95 上升"]
-            fixes = ["为实际过滤字段设计合适索引并改为可使用索引的等值/前缀查询", "移除人工 SLEEP 并增加分页", "修复后用相同负载复测 P95、Trace 与 rows_examined"]
-        elif state.symptom == "pod_restart" or state.service == "payment-service":
-            root = "payment-service 持续保留 Buffer 导致容器内存增长并触发 OOM 重启"
-            chain = ["对象引用未释放", "工作集持续增长", "超过容器 memory limit", "OOMKilled", "Pod 重启"]
-            fixes = ["移除全局 Buffer 引用并为缓存设置上限", "增加内存增长与重启告警", "用稳定负载验证工作集不再单调增长"]
-        elif state.service == "user-service" and any(word in text for word in ("cpu", "打满", "饱和")):
-            root = "user-service 的低效质数计算使容器 CPU 饱和并拉高请求延迟"
-            chain = ["CPU 密集计算", "容器 CPU 饱和/限流", "请求排队", "HTTP 延迟上升"]
-            fixes = ["移除同步 CPU 密集演示路径", "为计算任务设置预算或异步队列", "复测 CPU 与 P95 回落"]
-        elif state.symptom == "dependency_timeout":
-            if any(word in text for word in ("重试", "retry", "放大")):
-                root = "order-service 对超时的 inventory-service 执行无退避重试，形成请求放大"
-                chain = ["下游超时", "无退避连续重试", "请求量放大", "资源占用与上游失败"]
-                fixes = ["限制重试次数并加入指数退避与抖动", "只重试幂等瞬时错误", "增加熔断和重试放大指标"]
-            else:
-                root = "inventory-service 下游响应延迟造成 order-service 调用超时"
-                chain = ["下游延迟", "客户端等待", "超时异常", "上游延迟或 5xx"]
-                fixes = ["修复下游慢路径", "校准连接/读取超时并增加熔断", "用 Trace 验证耗时归属"]
+    async def _synthesize_with_gateway(
+        self,
+        state: DiagnosisState,
+        planner: EvidencePlanner | None,
+        callback: EventCallback | None,
+    ) -> None:
+        """让模型只综合 Evidence；失败时保留原始证据并安全降级。"""
+        started_at = datetime.now(timezone.utc)
+        started = time.perf_counter()
+        error: str | None = None
+        if planner is None:
+            state.synthesis = DiagnosisSynthesis(
+                status="insufficient_evidence",
+                root_cause="证据综合模型不可用，无法确认根因",
+                confidence=0.0,
+            )
         else:
-            root = state.candidates[0].cause if state.candidates else "证据不足"
-            chain = ["候选异常", "请求失败或延迟"]
-            fixes = ["补充更长时间窗口的 Metrics、Logs 与 Trace 后再确认根因"]
+            try:
+                state.synthesis = await planner.synthesize(state)
+            except GatewayError as exc:
+                error = self._exception_text(exc)
+                state.synthesis = DiagnosisSynthesis(
+                    status="insufficient_evidence",
+                    root_cause="证据综合失败，无法确认根因",
+                    confidence=0.0,
+                )
+            state.prompt_tokens = planner.prompt_tokens
+            state.completion_tokens = planner.completion_tokens
+        summary = state.synthesis.root_cause if state.synthesis else ""
+        record = ToolCallRecord(
+            tool_name="llm_evidence_synthesis",
+            arguments={"evidence_count": len(state.evidence)},
+            result_summary=summary,
+            timestamp=started_at,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            error=error,
+        )
+        state.timeline.append(record)
+        if callback:
+            await callback({"type": "tool", "record": record.model_dump(mode="json")})
 
-        enough = len(sources) >= 2
-        confidence = min(0.94, 0.58 + 0.09 * len(sources)) if enough else 0.45
-        conclusion = f"已确认：{root}" if enough else f"高可能性候选根因：{root}（独立证据不足）"
+    def _report(self, state: DiagnosisState) -> DiagnosisReport:
+        """Evidence Gate 验证引用、直接证据和矛盾后才允许 confirmed。"""
+        synthesis = state.synthesis or DiagnosisSynthesis(
+            status="insufficient_evidence",
+            root_cause="证据不足，无法确认根因",
+            confidence=0.0,
+        )
+        evidence_by_id = {item.evidence_id: item for item in state.evidence}
+        cited_ids = list(dict.fromkeys(
+            evidence_id for evidence_id in synthesis.evidence_ids if evidence_id in evidence_by_id
+        ))
+        cited = [evidence_by_id[evidence_id] for evidence_id in cited_ids]
+        gate_passed = (
+            synthesis.status == "confirmed"
+            and len(cited) >= 2
+            and any(item.direct_evidence and item.supports_conclusion for item in cited)
+            and all(item.supports_conclusion for item in cited)
+            and not synthesis.contradictions
+        )
+        status = "confirmed" if gate_passed else "insufficient_evidence"
+        root = synthesis.root_cause.strip() or "证据不足，无法确认根因"
+        confidence = synthesis.confidence if gate_passed else min(synthesis.confidence, 0.49)
+        conclusion = f"已确认：{root}" if gate_passed else f"证据不足：{root}"
+        findings = [DiagnosisFinding(finding=root, evidence_ids=cited_ids)] if gate_passed else []
+        chain = synthesis.root_cause_chain or ["当前观测证据", "尚不足以形成可验证根因"]
+        fixes = synthesis.recommended_fix or ["补充与候选机制直接相关的 Metrics、Logs、Trace 或运行时状态后重新诊断"]
         return DiagnosisReport(
             query=state.query, run_id=state.run_id, service=state.service, affected_pod=state.pod_name,
             language=state.language, running_version=state.runtime_commit, git_sha=state.runtime_commit,
@@ -693,9 +694,11 @@ class DiagnosisWorkflow:
             symptom=state.symptom,
             environment=state.environment, time_range=f"最近 {state.time_range_minutes} 分钟",
             conclusion=conclusion,
-            decision_summary=state.llm_decision_summary or conclusion,
-            root_cause=root, evidence=state.evidence,
+            status=status,
+            decision_summary=conclusion,
+            root_cause=root, findings=findings, evidence=state.evidence,
             root_cause_chain=chain, recommended_fix=fixes, confidence=confidence,
+            token_usage=state.prompt_tokens + state.completion_tokens,
             candidates=state.candidates, investigation_timeline=state.timeline,
             workflow_phases=state.phases,
             context_compaction={
@@ -704,68 +707,3 @@ class DiagnosisWorkflow:
                 "stored_evidence": len(state.evidence),
             },
         )
-
-    async def _summarize_with_gateway(self, state: DiagnosisState, callback: EventCallback | None) -> None:
-        """让本地 Ollama 只总结已取得的证据，不允许它替代 VERIFY 的硬规则。"""
-        if self.llm is None:
-            return
-        supported = [item for item in state.evidence if item.supports_conclusion]
-        historical_memory: Any = {"items": []}
-        try:
-            # Memory MCP 内部从请求 ContextVar 注入用户和 Conversation；这里不能
-            # 提供身份、表名或 SQL。空 query 表示按重要度读取少量当前有效记忆。
-            historical_memory = await self.tools.execute(
-                "search_conversation_memory",
-                {
-                    "query": "",
-                    "item_types": [
-                        "constraint", "confirmed_finding", "decision", "evidence", "open_question"
-                    ],
-                    "limit": 10,
-                },
-            )
-        except ToolExecutionError:
-            # CLI/评测没有认证会话 Scope 时安全降级，不允许绕过工具直接读数据库。
-            historical_memory = {"items": []}
-        conversation_context = (
-            self.context_service.build_active_context(state.user_id, state.conversation_id)
-            if self.context_service and state.user_id
-            else "{}"
-        )
-        prompt = (
-            "你是 SRE 诊断摘要器。只根据下列事实写一段不超过 120 个汉字的中文决策摘要；"
-            "不得添加事实中没有的数字、提交或结论。少于两个独立来源时必须写‘高可能性候选根因’。\n"
-            "跨轮活动上下文：\n"
-            + conversation_context
-            + "\n当前会话检索到的历史记忆：\n"
-            + json.dumps(historical_memory, ensure_ascii=False, default=str)
-            + "\n本轮支持结论的证据 ID：\n"
-            + json.dumps([item.evidence_id for item in supported], ensure_ascii=False)
-        )
-        started_at = datetime.now(timezone.utc)
-        started = time.perf_counter()
-        error: str | None = None
-        try:
-            response = await self.llm.complete([
-                # Qwen3 的 /no_think 开关可减少本地摘要延迟；前端也不需要隐藏推理内容。
-                LLMMessage(role="system", content="严格基于证据回答，不输出思维链。/no_think"),
-                LLMMessage(role="user", content=prompt),
-            ])
-            # 去掉多余空白并限制长度，避免模型输出长篇 Markdown 破坏结构化页面。
-            state.llm_decision_summary = " ".join(response.content.split())[:500]
-            summary = f"{response.provider or 'gateway'}/{response.model}: {state.llm_decision_summary}"
-        except GatewayError as exc:
-            error = str(exc)
-            summary = ""
-        record = ToolCallRecord(
-            tool_name="llm_gateway_summary", arguments={
-                "stored_evidence_count": len(state.evidence),
-                "active_evidence_count": len(supported),
-                "context_characters": len(conversation_context),
-            },
-            result_summary=summary, timestamp=started_at,
-            duration_ms=int((time.perf_counter() - started) * 1000), error=error,
-        )
-        state.timeline.append(record)
-        if callback:
-            await callback({"type": "tool", "record": record.model_dump(mode="json")})

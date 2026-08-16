@@ -78,6 +78,10 @@ class GatewayLLM:
                         {"role": message.role, "content": message.content}
                         for message in messages
                     ],
+                    # 当前调用均依赖 JSON/短摘要；限制生成长度并降低随机性可减少
+                    # 本地模型超时和 Structured Output 重试。
+                    "temperature": 0,
+                    "max_tokens": 1200,
                     # 当前网关明确拒绝流式请求，Agent 循环也按完整 JSON 响应解析。
                     "stream": False,
                 },

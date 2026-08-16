@@ -1,9 +1,10 @@
 {
   "_comment": "慢 SQL：必须从 order-service 追到 MySQL 扫描证据，不能误判为 CPU。",
-  "question": "为什么订单模块最近这么慢？",
+  "case_id": "SRE-001",
+  "symptom": "为什么订单模块最近这么慢？",
   "expected_service": "order-service",
   "expected_root_cause": ["慢 SQL", "全表扫描", "索引", "LIKE"],
-  "expected_evidence_types": ["Prometheus", "Tempo", "MySQL"],
-  "forbidden_wrong_causes": ["CPU saturation", "OOM"],
+  "required_evidence": ["Prometheus", "Tempo", "MySQL"],
+  "forbidden_shortcuts": ["SRE-001", "slow.example.com", "固定 SQL"],
   "minimum_confidence": 0.75
 }

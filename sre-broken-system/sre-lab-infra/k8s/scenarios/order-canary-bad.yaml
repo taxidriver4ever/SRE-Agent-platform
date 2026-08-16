@@ -1,0 +1,41 @@
+# SRE-009 canary uses the BAD repository commit but keeps app=order-service so the stable Service balances to it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service-canary
+  namespace: sre-lab
+  labels: {app: order-service, service: order-service, track: canary}
+  annotations:
+    sre.agent/repository: order-service
+    sre.agent/git-sha: f23997c13f1a8ffe7f8d3fd48ec9f45823860435
+    sre.agent/previous-git-sha: dbf1473f182ecf4d157e57dd4486701fc2de53b6
+spec:
+  replicas: 0
+  selector: {matchLabels: {app: order-service, track: canary}}
+  template:
+    metadata:
+      labels: {app: order-service, service: order-service, track: canary, version: f23997c13f1a8ffe7f8d3fd48ec9f45823860435}
+      annotations: {prometheus.io/scrape: "true", prometheus.io/path: /actuator/prometheus, prometheus.io/port: "8080", sre.agent/repository: order-service, sre.agent/git-sha: f23997c13f1a8ffe7f8d3fd48ec9f45823860435}
+    spec:
+      containers:
+        - name: order-service
+          image: sre-lab/order-service:f23997c13f1a8ffe7f8d3fd48ec9f45823860435
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: DB_URL, value: "jdbc:mysql://mysql:3306/sre_lab?useSSL=false&allowPublicKeyRetrieval=true"}
+            - {name: DB_USERNAME, value: sre_app}
+            - {name: DB_PASSWORD, value: sre_app_dev_only}
+            - {name: INVENTORY_BASE_URL, value: "http://inventory-service:8081"}
+            - {name: USER_BASE_URL, value: "http://user-service:8082"}
+            - {name: PAYMENT_BASE_URL, value: "http://payment-service:8083"}
+            - {name: NOTIFICATION_BASE_URL, value: "http://notification-service:8084"}
+            - {name: SERVICE_VERSION, value: f23997c13f1a8ffe7f8d3fd48ec9f45823860435}
+            - {name: OTEL_SERVICE_NAME, value: order-service}
+            - {name: OTEL_RESOURCE_ATTRIBUTES, value: "service.version=f23997c13f1a8ffe7f8d3fd48ec9f45823860435,deployment.environment=sre-lab"}
+            - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector:4318"}
+            - {name: OTEL_EXPORTER_OTLP_PROTOCOL, value: http/protobuf}
+            - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /actuator/health/readiness, port: http}, initialDelaySeconds: 15, periodSeconds: 5}
+          livenessProbe: {httpGet: {path: /actuator/health/liveness, port: http}, initialDelaySeconds: 30, periodSeconds: 10}
+          resources: {requests: {cpu: 100m, memory: 192Mi}, limits: {cpu: "1", memory: 512Mi}}

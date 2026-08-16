@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  namespace: sre-lab
+  labels: {app: payment-service, service: payment-service}
+  annotations: {sre.agent/repository: payment-service, sre.agent/git-sha: a0a1e56b9556ff07a3ea5d7b758df8ee346e6090}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: payment-service}}
+  template:
+    metadata:
+      labels: {app: payment-service, service: payment-service, version: a0a1e56b9556ff07a3ea5d7b758df8ee346e6090}
+      annotations: {prometheus.io/scrape: "true", prometheus.io/path: /metrics, prometheus.io/port: "8083", sre.agent/repository: payment-service, sre.agent/git-sha: a0a1e56b9556ff07a3ea5d7b758df8ee346e6090}
+    spec:
+      containers:
+        - name: payment-service
+          image: sre-lab/payment-service:a0a1e56b9556ff07a3ea5d7b758df8ee346e6090
+          env:
+            - {name: SERVICE_VERSION, value: a0a1e56b9556ff07a3ea5d7b758df8ee346e6090}
+            - {name: NOTIFICATION_BASE_URL, value: "http://notification-service:8084"}
+            - {name: NODE_OPTIONS, value: "--max-old-space-size=96"}
+            - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+          ports: [{name: http, containerPort: 8083}]
+          readinessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 3, periodSeconds: 5}
+          livenessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 10, periodSeconds: 10}
+          resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 600m, memory: 128Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: payment-service, namespace: sre-lab}
+spec: {selector: {app: payment-service}, ports: [{name: http, port: 8083, targetPort: http}]}

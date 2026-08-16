@@ -1,6 +1,0 @@
-0000000000000000000000000000000000000000 ee665a35f3551a44d17bf98c1981c019d684daac SRE Lab <sre-lab@local.invalid> 1786302022 +0800	commit (initial): SRE lab GOOD baseline with indexed order lookup
-ee665a35f3551a44d17bf98c1981c019d684daac 5d99aa4f8f089a9a11f83cb2d6284b4f649891ed SRE Lab <sre-lab@local.invalid> 1786302047 +0800	commit (amend): SRE lab GOOD baseline with indexed order lookup
-5d99aa4f8f089a9a11f83cb2d6284b4f649891ed 54dfd4fded40c0317b7f3f2336f175155cba96fc SRE Lab <sre-lab@local.invalid> 1786302076 +0800	commit: SRE-007 BAD regression: wildcard scan and slow SQL
-54dfd4fded40c0317b7f3f2336f175155cba96fc 1d8bee25cade12bcca20afb3108414cbcd01e5ce SRE Lab <sre-lab@local.invalid> 1786303653 +0800	commit: Add SRE runbooks, runtime mapping metadata, and reliable reset
-1d8bee25cade12bcca20afb3108414cbcd01e5ce 0ef3777b17425383ffe4dc25dc9c2537425a2405 SRE Lab <sre-lab@local.invalid> 1786304094 +0800	commit (amend): Add SRE runbooks, runtime mapping metadata, and reliable reset
-0ef3777b17425383ffe4dc25dc9c2537425a2405 9813d613002cfb45c0a69e3025bbc441a05b0cb5 SRE Lab <sre-lab@local.invalid> 1786304796 +0800	commit: docs: record exact trace correlation verification
