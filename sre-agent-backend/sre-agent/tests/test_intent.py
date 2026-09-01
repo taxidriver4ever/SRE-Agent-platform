@@ -49,6 +49,35 @@ def test_intent_router_classifies_specific_incident() -> None:
     assert decision.symptom == "high_latency"
 
 
+def test_explicit_service_incident_uses_deterministic_fast_path() -> None:
+    llm = StubLLM([])
+
+    decision = asyncio.run(IntentRouter(llm).classify("inventory-service 接口延迟很高"))
+
+    assert decision.intent is SREIntent.SPECIFIC_INCIDENT
+    assert decision.target == "inventory-service"
+    assert decision.symptom == "latency"
+    assert llm.messages == []
+
+
+def test_catalog_short_service_name_uses_deterministic_fast_path() -> None:
+    llm = StubLLM([])
+    router = IntentRouter(llm, service_names=["order-service", "payment-service"])
+    decision = asyncio.run(router.classify("order 接口突然大量报 500"))
+    assert decision.target == "order-service"
+    assert decision.symptom == "5xx"
+    assert llm.messages == []
+
+
+def test_catalog_chinese_alias_uses_deterministic_fast_path() -> None:
+    llm = StubLLM([])
+    router = IntentRouter(llm, service_aliases={"用户": "user-service"})
+    decision = asyncio.run(router.classify("用户模块响应变慢，CPU 是否打满？"))
+    assert decision.target == "user-service"
+    assert decision.symptom == "latency"
+    assert llm.messages == []
+
+
 def test_intent_router_repairs_json_before_retry() -> None:
     llm = StubLLM([
         '结果：{"intent":"GENERAL_DIAGNOSIS","target":null,"symptom":"system_health",}'
@@ -114,6 +143,22 @@ def test_specific_and_general_intents_route_with_explicit_scope() -> None:
     assert workflow.calls[0]["target"] == "payment-service"
     assert workflow.calls[0]["system_scan"] is False
     assert workflow.calls[1]["system_scan"] is True
+
+
+def test_optional_multi_service_scope_is_forwarded_as_seed_set() -> None:
+    llm = StubLLM([
+        '{"intent":"GENERAL_DIAGNOSIS","target":null,"symptom":"timeout"}',
+    ])
+    workflow = RecordingWorkflow()
+    router = IntentWorkflowRouter(IntentRouter(llm), workflow)  # type: ignore[arg-type]
+
+    asyncio.run(router.dispatch(
+        "最近请求大量超时",
+        selected_services=["order-service", "payment-service"],
+    ))
+
+    assert workflow.calls[0]["target"] == "order-service"
+    assert workflow.calls[0]["selected_services"] == ["order-service", "payment-service"]
 
 
 def test_general_diagnosis_uses_global_scan_without_order_fallback() -> None:

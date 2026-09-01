@@ -1,6 +1,6 @@
 # SRE Agent Backend
 
-单 Agent 后端通过统一 `GatewayLLM` 连接 `sre-gateway → Docker Ollama`，实际模型由请求数据指定。项目自有工具使用 FastMCP 3.4.5；Kubernetes 改为维护活跃的 `containers/kubernetes-mcp-server`，以只读、单集群、core 工具集模式直接调用 Kubernetes API。
+单 Agent 后端通过统一 `GatewayLLM` 连接 `sre-gateway → Docker vLLM`，实际模型由请求数据指定；迁移期仍可显式切回 Ollama。项目自有工具使用 FastMCP 3.4.5；Kubernetes 改为维护活跃的 `containers/kubernetes-mcp-server`，以只读、单集群、core 工具集模式直接调用 Kubernetes API。
 
 ## 模块
 
@@ -19,7 +19,9 @@
 - `app/evidence/`：Tool Result 的外部来源引用模型；完整原文仍属于 Conversation Message。
 - `app/code_state/`：Git 仓库导航 State、首次有限扫描、按 commit diff 增量更新与固定表只读检索。
 - `app/workflow/`：八阶段硬性工作流、专项策略、证据门槛与统一报告模型。
-- `app/api/`：旧 `/v1/agent/run`、结构化 `/api/agent/chat` 和 SSE `/api/agent/chat/stream`。
+- `app/api/`：保留旧 `/v1/agent/run` 与 `/api/agent/chat` 兼容接口。
+- `app/diagnosis/`：Diagnosis Session、Step、Evidence Store、Incident Graph、Root Cause、Repository、Orchestrator 与 SSE API。
+- `app/resources/`：后端 Service Catalog 与只读 Kubernetes Pod 浏览接口。
 - `skills/`：12 个独立 SRE Skill，覆盖语言运行时、Kubernetes、数据库、依赖、发布、Tracing 与证据综合。
 - `evals/`：SRE-001～010 评测数据与 Runner。
 
@@ -28,7 +30,8 @@
 ```text
 GATEWAY_BASE_URL=http://127.0.0.1:8000
 GATEWAY_API_KEY=gw_sk_...                 # 只保存 Gateway Token，不是 Provider Key
-GATEWAY_MODEL=ollama/qwen3:4b
+GATEWAY_MODEL=vllm/qwen3-4b
+GATEWAY_MAX_TOKENS=512
 PROMETHEUS_BASE_URL=http://127.0.0.1:19090
 LOKI_BASE_URL=http://127.0.0.1:13100
 TEMPO_BASE_URL=http://127.0.0.1:13200
@@ -85,7 +88,7 @@ Set-Location D:\SRE-Agent-platform\sre-agent-backend
 docker-compose -f compose.yml up -d mysql
 
 # Compose 只启动基础设施；Gateway 保持本地 Python 进程运行。
-docker-compose -f compose.yml up -d ollama ollama-model-init
+docker-compose -f compose.yml up -d vllm
 
 Set-Location D:\SRE-Agent-platform\sre-agent-backend\sre-agent
 $env:GATEWAY_API_KEY = "从 POST /v1/auth/tokens 获得的 Token"
@@ -110,6 +113,19 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8001/api/agent/chat `
 ```
 
 `/api/agent/chat/stream` 返回 SSE `intent`、`phase`、`tool`、`message`、`final` 事件。前端可展示公开调查步骤、工具参数与摘要，但不展示隐藏 Chain-of-Thought。
+
+新的 SRE Console 使用统一的 Incident/Diagnosis Session API：
+
+- `POST /api/diagnoses`：使用 `QUESTION`、`SERVICE` 或 `POD` 创建独立 Session。
+- `GET /api/diagnoses`、`GET /api/diagnoses/{id}`：读取历史和完整聚合。
+- `GET /api/diagnoses/{id}/steps`：公开、可审计的 Investigation Timeline。
+- `GET /api/diagnoses/{id}/evidence`：Evidence Store 的摘要、结构化数据与原始结果引用。
+- `GET /api/diagnoses/{id}/graph`：由后端生成的跨服务 Incident Graph。
+- `GET /api/diagnoses/{id}/root-cause`：结构化根因、置信度与建议。
+- `GET /api/diagnoses/{id}/events`：支持 `Last-Event-ID` 回放的持久化 SSE 事件流。
+- `GET /api/services`、`GET /api/services/{name}/pods`、`GET /api/pods/{name}`：服务目录和真实只读 Kubernetes 资源浏览。
+
+Session 状态机为 `PENDING -> INVESTIGATING -> COMPLETED`，会话级异常进入 `FAILED`。单一 Tool 失败只产生 `FAILED` Step，Orchestrator 会继续尝试其余证据源。
 
 每条请求先被分类为 `SPECIFIC_INCIDENT`、`GENERAL_DIAGNOSIS`、`NEED_CLARIFICATION` 或 `OUT_OF_SCOPE`。具体故障进入 Investigation Workflow；整体巡检先执行全局 System Scan；信息不足或非运维问题只返回普通消息，不允许调用 Kubernetes、Prometheus、Loki、Tempo、MySQL 或 Git 工具。
 

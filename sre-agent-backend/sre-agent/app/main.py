@@ -4,6 +4,7 @@
 网关协议和工具逻辑分别保留在各自模块中，避免入口文件演变成业务逻辑集合。
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -22,6 +23,11 @@ from app.conversation_memory import (
 from app.code_state import CodeStateRepository, CodeStateService, initialize_code_state_schema
 from app.core.config import get_settings
 from app.core.database import ApplicationDatabase
+from app.diagnosis import (
+    DiagnosisOrchestrator, DiagnosisRepository, DiagnosisService,
+    initialize_diagnosis_schema,
+)
+from app.diagnosis.router import router as diagnosis_router
 from app.llm import GatewayLLM
 from app.intent import IntentRouter, IntentWorkflowRouter
 from app.security import ToolPolicy
@@ -29,6 +35,7 @@ from app.sandbox import DockerSandboxManager
 from app.mcp_clients import FastMCPToolClient, KubernetesMCPAdapter
 from app.mcp_servers import build_fastmcp_server
 from app.repositories import RepositoryRegistry
+from app.resources import router as resources_router
 from app.workflow import DiagnosisWorkflow
 
 
@@ -58,6 +65,8 @@ def create_app() -> FastAPI:
     initialize_conversation_memory_schema(application_database)
     initialize_code_state_schema(application_database)
     initialize_audit_schema(application_database)
+    # Diagnosis 表依赖 users 与 conversations，必须在这两个模块之后初始化。
+    initialize_diagnosis_schema(application_database)
     auth_service = AuthService(application_database, settings.auth_token_ttl_hours)
     auth_service.ensure_user(settings.initial_username, settings.initial_password)
     conversation_service = ConversationService(application_database)
@@ -70,6 +79,7 @@ def create_app() -> FastAPI:
         api_key=settings.gateway_api_key,
         model=settings.gateway_model,
         timeout=settings.gateway_timeout_seconds,
+        max_tokens=settings.gateway_max_tokens,
     )
     # FastMCP 负责工具注册、Schema、参数校验和标准 MCP 调用；Agent 只持有官方
     # in-memory Client 的薄适配器，没有自研 MCP 注册中心或协议实现。
@@ -132,7 +142,21 @@ def create_app() -> FastAPI:
         code_state_service=code_state_service,
         kubernetes_namespace=settings.kubernetes_namespace,
     )
-    intent_router = IntentRouter(llm)
+    diagnosis_repository = DiagnosisRepository(application_database)
+    diagnosis_service = DiagnosisService(diagnosis_repository, conversation_service)
+    diagnosis_orchestrator = DiagnosisOrchestrator(
+        diagnosis_workflow, diagnosis_service, diagnosis_repository,
+    )
+    service_aliases = {
+        str(alias): service_name
+        for service_name, metadata in diagnosis_workflow.catalog.services.items()
+        for alias in metadata.get("aliases", [])
+    }
+    intent_router = IntentRouter(
+        llm,
+        service_names=list(diagnosis_workflow.catalog.services),
+        service_aliases=service_aliases,
+    )
     intent_workflow_router = IntentWorkflowRouter(
         intent_router,
         diagnosis_workflow,
@@ -148,6 +172,10 @@ def create_app() -> FastAPI:
         application.state.tools = tools
         application.state.agent = ToolAgent(llm, tools, settings.agent_max_iterations)
         application.state.diagnosis_workflow = diagnosis_workflow
+        application.state.diagnosis_repository = diagnosis_repository
+        application.state.diagnosis_service = diagnosis_service
+        application.state.diagnosis_orchestrator = diagnosis_orchestrator
+        application.state.diagnosis_tasks = set()
         application.state.intent_router = intent_router
         application.state.intent_workflow_router = intent_workflow_router
         application.state.memory_repository = memory_repository
@@ -161,6 +189,13 @@ def create_app() -> FastAPI:
         application.state.auth_service = auth_service
         application.state.conversation_service = conversation_service
         yield
+        # 先取消仍在运行的 Diagnosis Session，再关闭共享 MCP/LLM 资源。
+        # CancelledError 会由 Diagnosis Router 将会话持久化为 CANCELLED。
+        pending_diagnoses = list(application.state.diagnosis_tasks)
+        for task in pending_diagnoses:
+            task.cancel()
+        if pending_diagnoses:
+            await asyncio.gather(*pending_diagnoses, return_exceptions=True)
         # 只有 GatewayLLM 自己创建的客户端会被关闭，注入客户端的所有权规则
         # 由 GatewayLLM.close() 内部负责判断。
         await tools.close()
@@ -180,6 +215,7 @@ def create_app() -> FastAPI:
         allow_origins=[
             "http://127.0.0.1:5173", "http://localhost:5173",
             "http://127.0.0.1:3000", "http://localhost:3000",
+            "http://127.0.0.1:3001", "http://localhost:3001",
         ],
         allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
@@ -189,6 +225,8 @@ def create_app() -> FastAPI:
     application.include_router(conversation_router)
     application.include_router(agent_router)
     application.include_router(chat_router)
+    application.include_router(diagnosis_router)
+    application.include_router(resources_router)
     # 对外端点只暴露项目的 Git/可观测性只读工具。Kubernetes Server 保持独立，
     # 这样第三方版本、RBAC 和进程生命周期不会被伪装成项目自研工具。
     application.mount("/mcp", mcp_app)

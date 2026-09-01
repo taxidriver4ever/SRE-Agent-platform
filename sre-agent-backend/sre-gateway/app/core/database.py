@@ -1,12 +1,8 @@
-"""SQLAlchemy 数据库基础设施。
-
-本模块只负责创建 Engine、Session 和执行模块 SQL 文件，不直接导入任何业务模型。
-"""
+"""Gateway 共用的 MySQL SQLAlchemy 基础设施。"""
 
 from pathlib import Path
-import sqlite3
 
-from sqlalchemy import create_engine
+from sqlalchemy import URL, create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 
@@ -15,23 +11,24 @@ class Base(DeclarativeBase):
 
 
 class Database:
-    """封装 SQLite Engine 与 Session 工厂。
+    """封装 MySQL Engine、Session 工厂和模块化 SQL 初始化。"""
 
-    Args:
-        path: SQLite 数据库文件路径，可以是字符串或 ``Path``。
-
-    一个 ``Database`` 实例可以在应用生命周期内复用；具体查询使用短生命周期
-    Session，避免连接和事务长期占用。
-    """
-
-    def __init__(self, path: str | Path) -> None:
-        """创建数据库配置，Engine 会在首次访问数据库时建立真实连接。"""
-        self.path = Path(path)
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        user: str,
+        password: str,
+        database: str,
+    ) -> None:
+        self.database_name = database
         self.engine = create_engine(
-            f"sqlite:///{self.path.as_posix()}",
-            # FastAPI 的同步依赖可能在线程池中运行，SQLite 默认的线程检查会
-            # 阻止连接跨线程使用，因此在应用层显式关闭该检查。
-            connect_args={"check_same_thread": False},
+            URL.create(
+                "mysql+pymysql", username=user, password=password,
+                host=host, port=port, database=database,
+            ),
+            pool_pre_ping=True,
+            pool_recycle=1800,
         )
         self._session_factory = sessionmaker(
             bind=self.engine,
@@ -42,11 +39,12 @@ class Database:
         )
 
     def execute_schema_file(self, sql_file: str | Path) -> None:
-        """执行业务模块自己的 SQLite SQL 文件。"""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        """逐条执行业务模块自己的 MySQL SQL 文件。"""
         sql_text = Path(sql_file).read_text(encoding="utf-8")
-        with sqlite3.connect(self.path) as connection:
-            connection.executescript(sql_text)
+        statements = [statement.strip() for statement in sql_text.split(";") if statement.strip()]
+        with self.engine.begin() as connection:
+            for statement in statements:
+                connection.exec_driver_sql(statement)
 
     def session(self) -> Session:
         """创建一个新的 SQLAlchemy Session。

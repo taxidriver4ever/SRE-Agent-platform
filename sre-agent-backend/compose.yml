@@ -1,5 +1,53 @@
-# 后端基础设施统一编排：Ollama 与 Agent 使用的 MySQL。
+# 后端基础设施统一编排：vLLM、迁移期 Ollama 与 Agent 使用的 MySQL。
 services:
+  vllm:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.15.0}
+    container_name: sre-vllm
+    restart: unless-stopped
+    gpus: all
+    ipc: host
+    ports:
+      # 仅暴露给本机 Gateway；vLLM 默认 8000 与 Gateway 端口冲突。
+      - "127.0.0.1:18000:8000"
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      # vLLM 官方支持的国内模型下载通道，减少 Hugging Face 大文件重试。
+      VLLM_USE_MODELSCOPE: ${VLLM_USE_MODELSCOPE:-true}
+      # EMPTY 只是本地环回环境的非空占位符，正式部署必须注入随机密钥。
+      VLLM_API_KEY: ${VLLM_API_KEY:-EMPTY}
+    command:
+      - --model
+      - ${VLLM_MODEL:-Qwen/Qwen3-4B-AWQ}
+      - --served-model-name
+      - ${VLLM_SERVED_MODEL_NAME:-qwen3-4b}
+      - --max-model-len
+      - ${VLLM_MAX_MODEL_LEN:-8192}
+      - --gpu-memory-utilization
+      - ${VLLM_GPU_MEMORY_UTILIZATION:-0.85}
+      - --swap-space
+      - ${VLLM_SWAP_SPACE_GIB:-1}
+      - --reasoning-parser
+      - qwen3
+      - --default-chat-template-kwargs
+      - '{"enable_thinking": false}'
+      - --api-key
+      - ${VLLM_API_KEY:-EMPTY}
+    volumes:
+      - huggingface-cache:/root/.cache/huggingface
+      - modelscope-cache:/root/.cache/modelscope
+      - vllm-cache:/root/.cache/vllm
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python3 -c "import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 180s
+
+  # 迁移期保留，确认 vLLM 稳定后再移除服务和数据卷。
   ollama:
     image: ollama/ollama:latest
     container_name: sre-ollama
@@ -63,5 +111,11 @@ services:
       - ./sre-agent/docker/mysql/init:/docker-entrypoint-initdb.d:ro
 
 volumes:
+  huggingface-cache:
+    name: sre-huggingface-cache
+  vllm-cache:
+    name: sre-vllm-cache
+  modelscope-cache:
+    name: sre-modelscope-cache
   ollama-data:
     name: sre-ollama-data

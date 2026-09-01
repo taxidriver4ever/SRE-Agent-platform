@@ -29,4 +29,4 @@ SRE-008 只劣化一个稳定 Pod；SRE-009 让同一个 Service 同时路由到
 - rollout 失败：查看 `kubectl -n sre-lab get pods` 和 Events；部署脚本遇非零退出会立即停止。
 - Loki 空结果：检查 Alloy DaemonSet 是否挂载 `/var/log/pods`。
 - Trace 空结果：检查 otel-collector 和 Tempo ready。
-- Agent 503：缺少 `GATEWAY_API_KEY`；502：Gateway/Ollama 上游失败。
+- Agent 503：缺少 `GATEWAY_API_KEY`；502：Gateway/vLLM 上游失败。迁移期可临时把 `GATEWAY_MODEL` 切回 `ollama/...` 验证是否为 vLLM 故障。

@@ -1,407 +1,206 @@
 <script setup>
-/**
- * SRE 证据诊断问答页。
- * 浏览器只连接 Agent SSE；Gateway Token、Ollama、K8s 与数据库凭证均保留在后端。
- */
-import { nextTick, onMounted, reactive, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import ServiceGraph from "./components/ServiceGraph.vue";
+import { getService, services, statusLabel } from "./data/services";
 
-// 允许通过 Vite 环境变量覆盖本地 Agent 地址。
 const apiBaseUrl = import.meta.env.VITE_AGENT_API_BASE_URL || "http://127.0.0.1:8001";
-// 第一版只允许服务端 Tool Policy 中登记的 sre-lab 项目；namespace/repo/path 不由浏览器传入。
 const projectId = "sre-lab";
+const uiPreview = import.meta.env.VITE_UI_PREVIEW === "true";
 const token = ref(localStorage.getItem("sre_agent_token") || "");
-const currentUser = ref(null);
-const authLoading = ref(true);
-// 用户名可以提供本地默认值，但密码输入始终为空，避免源码或浏览器自动暴露密码。
+const currentUser = ref(uiPreview ? { username: "preview" } : null);
+const authLoading = ref(!uiPreview);
 const loginForm = reactive({ username: "admin", password: "", error: "", submitting: false });
+const serviceCatalog = ref(uiPreview ? services : []);
+const serviceSearch = ref("");
+const statusFilter = ref("all");
+const servicePods = ref([]);
+const podDetail = ref(null);
+const resourceLoading = ref(false);
 const conversations = ref([]);
-const currentConversationId = ref("");
-const question = ref("");
-const sending = ref(false);
-const conversationRef = ref(null);
-const messages = ref([{ id: 1, role: "assistant", content: "请描述故障现象。我会定位服务，并通过指标、日志、Trace、数据库和运行源码建立证据链。" }]);
-const suggestions = [
-  "为什么订单接口有时候很快，有时候特别慢？",
-  "payment-service 为什么一直重启？",
-  "为什么 order 很慢，但是 CPU 又不高？",
-];
+const chatList = ref(null);
+const route = reactive({ name: "services", serviceId: "", podName: "" });
+const chat = reactive({ conversationId: "", messages: [], input: "", selectedServices: [], sending: false, error: "" });
+const quick = reactive({ targetType: "SERVICE", targetName: "", running: false, phases: [], tools: [], result: null, error: "" });
+
 const phaseLabels = {
-  START: "启动诊断", SYSTEM_SCAN: "系统整体扫描", TRIAGE: "定位服务与症状", BASELINE_OBSERVATION: "采集健康、指标和日志基线",
-  ANALYZE: "生成候选根因", INVESTIGATE: "专项调查与交叉验证", VERIFY: "检查独立证据数量",
-  REPORT: "生成结构化报告", END: "诊断完成",
+  START: "准备诊断范围", SYSTEM_SCAN: "系统整体扫描", TRIAGE: "定位服务与症状",
+  BASELINE_OBSERVATION: "Metrics 基线分析", ANALYZE: "生成候选根因",
+  INVESTIGATE: "Trace / Logs / K8s 调查", VERIFY: "证据交叉验证",
+  REPORT: "生成根因报告", END: "诊断完成",
 };
+const displayServices = computed(() => serviceCatalog.value);
+const filteredServices = computed(() => {
+  const keyword = serviceSearch.value.trim().toLowerCase();
+  return displayServices.value.filter((service) => {
+    const statusMatch = statusFilter.value === "all" || service.status === statusFilter.value;
+    const textMatch = !keyword || `${service.name} ${service.description} ${service.owner}`.toLowerCase().includes(keyword);
+    return statusMatch && textMatch;
+  });
+});
+const statusSummary = computed(() => ({
+  healthy: displayServices.value.filter((item) => item.status === "healthy").length,
+  warning: displayServices.value.filter((item) => item.status === "warning").length,
+  critical: displayServices.value.filter((item) => item.status === "critical").length,
+}));
+const currentService = computed(() => displayServices.value.find((item) => item.id === route.serviceId) || getService(route.serviceId));
+const catalogGraph = computed(() => {
+  const known = new Set(displayServices.value.map((item) => item.id));
+  return {
+    nodes: displayServices.value.map((item) => ({ id: `service:${item.id}`, type: "SERVICE", name: item.id, status: item.status === "healthy" ? "HEALTHY" : item.status === "critical" ? "AFFECTED" : "UNKNOWN" })),
+    edges: displayServices.value.flatMap((item) => (item.dependencies || []).filter((id) => known.has(id)).map((id) => ({ id: `${item.id}-${id}`, source: `service:${item.id}`, target: `service:${id}`, relation: "DEPENDS_ON" }))),
+  };
+});
+const quickReport = computed(() => quick.result?.report || null);
+const quickRoot = computed(() => quick.result?.root_cause || null);
+const quickGraph = computed(() => quick.result?.graph || { nodes: [], edges: [] });
+const quickServices = computed(() => quick.result?.affected_services || [quick.targetName].filter(Boolean));
 
-/** 等待 DOM 更新后滚动到底部，让流式事件始终可见。 */
-async function scrollToBottom() {
-  await nextTick();
-  const element = conversationRef.value;
-  if (element) element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
+function authHeaders(json = false) { return { ...(json ? { "Content-Type": "application/json" } : {}), Authorization: `Bearer ${token.value}` }; }
+function navigate(path) { window.location.hash = path; }
+function openService(id) { navigate(`/services/${id}`); }
+function openPod(name) { navigate(`/pods/${encodeURIComponent(name)}`); }
+function openEventDiagnosis() { navigate("/diagnosis"); }
+function parseRoute() {
+  const segments = (window.location.hash.replace(/^#\/?/, "") || "services").split("/").filter(Boolean);
+  route.serviceId = ""; route.podName = "";
+  if (segments[0] === "services" && segments[1]) {
+    route.name = "service-detail"; route.serviceId = segments[1]; resetQuick(); loadServicePods(route.serviceId);
+  } else if (segments[0] === "pods" && segments[1]) {
+    route.name = "pod-detail"; route.podName = decodeURIComponent(segments[1]); resetQuick(); loadPodDetail(route.podName);
+  } else if (segments[0] === "diagnosis") route.name = "event-diagnosis";
+  else route.name = "services";
+  window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "auto" }));
 }
-
-/** 把公开阶段、Tool 摘要和最终报告合并到消息；不显示隐藏思维链。 */
-function applyEvent(message, event) {
-  if (event.type === "conversation") currentConversationId.value = event.conversation_id;
-  else if (event.type === "intent") message.intent = event.intent;
-  else if (event.type === "phase") message.phases.push(event.phase);
-  else if (event.type === "tool") message.tools.push(event.record);
-  else if (event.type === "final") { message.report = event.report; message.content = ""; }
-  else if (event.type === "message") { message.content = event.message || ""; message.intent = event.intent; }
-  else if (event.type === "error") message.error = event.message || "诊断流发生未知错误";
+function resetQuick() { quick.targetName = ""; quick.running = false; quick.phases = []; quick.tools = []; quick.result = null; quick.error = ""; }
+function toggleService(id) { const index = chat.selectedServices.indexOf(id); if (index >= 0) chat.selectedServices.splice(index, 1); else chat.selectedServices.push(id); }
+function normalizeHistoryMessage(item) {
+  const content = item.content || {};
+  if (item.message_type === "tool_call" || item.message_type === "tool_result") return null;
+  if (item.role === "user") return { id: item.id, role: "user", text: content.message || String(content) };
+  if (content.report) return { id: item.id, role: "assistant", report: content.report, text: content.report.decision_summary || content.report.conclusion };
+  if (content.root_cause || content.decision_summary) return { id: item.id, role: "assistant", report: content, text: content.decision_summary || content.conclusion };
+  return { id: item.id, role: "assistant", text: content.message || content.error || "诊断消息" };
 }
-
-/** 按空行拆分 SSE data 帧；stream 解码避免中文跨网络分片时乱码。 */
-async function consumeEventStream(response, message) {
+async function consumeSse(response, handler) {
   if (!response.body) throw new Error("浏览器未提供可读取的 SSE 响应体");
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder("utf-8");
-  let buffer = "";
+  const reader = response.body.getReader(); const decoder = new TextDecoder("utf-8"); let buffer = "";
   while (true) {
-    const packet = await reader.read();
-    buffer += decoder.decode(packet.value || new Uint8Array(), { stream: !packet.done });
-    // ASGI/代理可能使用 CRLF，也可能使用 LF；同时兼容两种 SSE 帧分隔符。
-    const frames = buffer.split(/\r?\n\r?\n/);
-    buffer = frames.pop() || "";
-    for (const frame of frames) {
-      const dataLine = frame.split("\n").find((line) => line.startsWith("data:"));
-      if (!dataLine) continue;
-      applyEvent(message, JSON.parse(dataLine.slice(5).trim()));
-      await scrollToBottom();
-    }
+    const packet = await reader.read(); buffer += decoder.decode(packet.value || new Uint8Array(), { stream: !packet.done });
+    const frames = buffer.split(/\r?\n\r?\n/); buffer = frames.pop() || "";
+    for (const frame of frames) { const data = frame.split("\n").find((line) => line.startsWith("data:")); if (data) handler(JSON.parse(data.slice(5).trim())); }
     if (packet.done) break;
   }
 }
-
-/** 提交问题并创建一个由 SSE 持续更新的 assistant 消息。 */
-async function sendQuestion() {
-  const query = question.value.trim();
-  if (!query || sending.value) return;
-  sending.value = true;
-  let diagnosis = null;
+function applyChatEvent(event, message) {
+  if (event.type === "conversation") chat.conversationId = event.conversation_id;
+  else if (event.type === "intent") message.intent = event.intent;
+  else if (event.type === "phase" && !message.phases.includes(event.phase)) message.phases.push(event.phase);
+  else if (event.type === "tool") message.tools.push(event.record);
+  else if (event.type === "final") { message.report = event.report; message.text = event.report?.decision_summary || event.report?.conclusion || "诊断完成"; }
+  else if (event.type === "message") { message.text = event.message; message.intent = event.intent; }
+  else if (event.type === "error") message.error = event.message;
+}
+async function sendChat() {
+  const text = chat.input.trim(); if (!text || chat.sending) return;
+  chat.error = ""; chat.messages.push({ id: crypto.randomUUID(), role: "user", text });
+  const assistant = reactive({ id: crypto.randomUUID(), role: "assistant", text: "", intent: "", phases: [], tools: [], report: null, error: "" });
+  chat.messages.push(assistant); chat.input = ""; chat.sending = true;
+  await nextTick(); chatList.value?.scrollTo({ top: chatList.value.scrollHeight, behavior: "smooth" });
+  if (uiPreview) { assistant.intent = "SPECIFIC_INCIDENT"; assistant.phases = ["TRIAGE", "BASELINE_OBSERVATION"]; assistant.text = "预览模式不会请求后端。登录实际环境后，Agent 会保留这段会话记忆并继续诊断。"; chat.sending = false; return; }
   try {
-    messages.value.push({ id: Date.now(), role: "user", content: query });
-    // 必须使用 reactive：若把普通对象 push 进 reactive 数组后仍修改原始引用，
-    // Vue 不会逐帧触发渲染，只会在请求结束的其他状态更新时一次性显示结果。
-    diagnosis = reactive({
-      id: Date.now() + 1, role: "assistant", content: "正在建立诊断范围…",
-      phases: [], tools: [], report: null, error: "",
-    });
-    messages.value.push(diagnosis);
-    question.value = "";
-    await scrollToBottom();
-    const response = await fetch(`${apiBaseUrl}/api/agent/chat/stream`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token.value },
-      body: JSON.stringify({
-        message: query,
-        conversation_id: currentConversationId.value || null,
-        project_id: projectId,
-      }),
-    });
-    if (!response.ok) {
-      const payload = await response.json().catch(() => ({}));
-      throw new Error(payload.detail || `Agent 返回 HTTP ${response.status}`);
-    }
-    await consumeEventStream(response, diagnosis);
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : "未知请求错误";
-    if (diagnosis) diagnosis.error = errorMessage;
-  } finally {
-    sending.value = false;
-    await loadConversations();
-    await scrollToBottom();
-  }
+    const response = await fetch(`${apiBaseUrl}/api/agent/chat/stream`, { method: "POST", headers: authHeaders(true), body: JSON.stringify({ message: text, conversation_id: chat.conversationId || null, project_id: projectId, selected_services: chat.selectedServices }) });
+    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).detail || `HTTP ${response.status}`);
+    await consumeSse(response, (event) => applyChatEvent(event, assistant)); await loadConversations();
+  } catch (error) { assistant.error = error instanceof Error ? error.message : "诊断请求失败"; }
+  finally { chat.sending = false; }
 }
-
-/** 推荐问题和键盘发送都复用统一提交逻辑。 */
-function useSuggestion(text) { if (!sending.value) { question.value = text; sendQuestion(); } }
-function handleKeydown(event) { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendQuestion(); } }
-function confidencePercent(value) { return `${Math.round((Number(value) || 0) * 100)}%`; }
-/** 判断 Source Reference 是否能由浏览器直接打开；内部协议 URI 只展示文本。 */
-function isHttpReference(reference) {
-  return reference?.repository_url?.startsWith("https://");
+async function createConversation() {
+  chat.messages = []; chat.input = ""; chat.error = "";
+  if (uiPreview) { chat.conversationId = `preview-${Date.now()}`; return; }
+  const response = await fetch(`${apiBaseUrl}/api/conversations`, { method: "POST", headers: authHeaders(true), body: JSON.stringify({ title: "新事件诊断" }) });
+  if (!response.ok) { chat.error = "创建会话失败"; return; }
+  const item = await response.json(); chat.conversationId = item.id; await loadConversations();
 }
-
-/** 按 evidence_id 读取完整原文；再次点击同一按钮会折叠已经加载的结果。 */
-async function loadEvidence(report, evidence) {
-  if (evidence.raw) { evidence.raw = null; return; }
-  if (evidence.loading) return;
-  evidence.loading = true;
-  try {
-    const url = apiBaseUrl + "/api/agent/evidence/" + report.run_id + "/" + evidence.evidence_id;
-    const response = await fetch(url, { headers: { "Authorization": "Bearer " + token.value } });
-    if (!response.ok) throw new Error("Evidence Store 返回 HTTP " + response.status);
-    evidence.raw = await response.json();
-  } catch (error) {
-    evidence.rawError = error instanceof Error ? error.message : "原始证据读取失败";
-  } finally {
-    evidence.loading = false;
-  }
+async function openConversation(id) {
+  openEventDiagnosis(); if (uiPreview) return;
+  const response = await fetch(`${apiBaseUrl}/api/conversations/${id}`, { headers: authHeaders() });
+  if (!response.ok) { chat.error = "历史会话读取失败"; return; }
+  const detail = await response.json(); chat.conversationId = id; chat.messages = (detail.messages || []).map(normalizeHistoryMessage).filter(Boolean);
 }
-/** 登录成功后只把随机 Token 放入 localStorage，绝不缓存用户密码。 */
-async function login() {
-  loginForm.error = "";
-  loginForm.submitting = true;
-  try {
-    const response = await fetch(apiBaseUrl + "/api/auth/login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: loginForm.username.trim(), password: loginForm.password }),
-    });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.detail || "登录失败");
-    token.value = payload.access_token;
-    localStorage.setItem("sre_agent_token", token.value);
-    currentUser.value = payload.user;
-    loginForm.password = "";
-    await loadConversations();
-  } catch (error) {
-    loginForm.error = error instanceof Error ? error.message : "登录失败";
-  } finally {
-    loginForm.submitting = false;
-  }
-}
-
-/** 页面刷新时必须调用 /me 重新验证 Token，不能只相信浏览器缓存。 */
-async function restoreSession() {
-  if (!token.value) { authLoading.value = false; return; }
-  try {
-    const response = await fetch(apiBaseUrl + "/api/auth/me", {
-      headers: { "Authorization": "Bearer " + token.value },
-    });
-    if (!response.ok) throw new Error("Token 已失效");
-    currentUser.value = await response.json();
-    await loadConversations();
-  } catch {
-    token.value = "";
-    currentUser.value = null;
-    localStorage.removeItem("sre_agent_token");
-  } finally {
-    authLoading.value = false;
-  }
-}
-
-/** 登录或诊断完成后加载轻量会话摘要，形成当前页面的持久化缓存。 */
 async function loadConversations() {
-  if (!token.value) return;
-  const response = await fetch(apiBaseUrl + "/api/conversations", {
-    headers: { "Authorization": "Bearer " + token.value },
-  });
+  if (!token.value || uiPreview) return;
+  const response = await fetch(`${apiBaseUrl}/api/conversations`, { headers: authHeaders() });
   if (response.status === 401) { await logout(false); return; }
   if (response.ok) conversations.value = await response.json();
 }
-
-/** 从服务端读取一个历史会话，并恢复用户问题与结构化诊断报告。 */
-async function openConversation(conversationId) {
-  if (!conversationId || sending.value) return;
-  const response = await fetch(apiBaseUrl + "/api/conversations/" + conversationId, {
-    headers: { "Authorization": "Bearer " + token.value },
-  });
-  if (!response.ok) return;
-  const detail = await response.json();
-  currentConversationId.value = detail.id;
-  messages.value = detail.messages.flatMap((item) => {
-    if (item.role === "user") {
-      const content = item.content.message || "";
-      return content ? [{ id: item.id, role: "user", content }] : [];
-    }
-    if (item.content.report) {
-      return [{ id: item.id, role: "assistant", content: "", phases: [], tools: [], report: item.content.report, error: "" }];
-    }
-    if (item.message_type === "assistant" && item.content.message) {
-      return [{ id: item.id, role: "assistant", content: item.content.message, intent: item.content.intent || "", phases: [], tools: [], report: null, error: "" }];
-    }
-    // Tool Call/Tool Result 是 Conversation Store 中供上下文恢复和 Evidence
-    // 回查使用的内部记录，不应该各自渲染成一个没有正文的 AI 消息。
-    const error = item.message_type === "assistant" ? (item.content.error || "") : "";
-    return error
-      ? [{ id: item.id, role: "assistant", content: "", phases: [], tools: [], report: null, error }]
-      : [];
-  });
-  await scrollToBottom();
+function applyQuickEvent(event) {
+  if (event.type === "phase" && !quick.phases.includes(event.phase)) quick.phases.push(event.phase);
+  else if (event.type === "tool") quick.tools.push(event.record);
+  else if (event.type === "final") quick.result = event.result;
+  else if (event.type === "error") quick.error = event.message;
 }
-
-/** 新建诊断只清空当前选择；首条问题由服务器自动创建并返回会话 ID。 */
-function newConversation() {
-  if (sending.value) return;
-  currentConversationId.value = "";
-  messages.value = [{ id: Date.now(), role: "assistant", content: "请描述新的故障现象。" }];
-}
-
-/** 注销时撤销服务端 Token，再清理浏览器身份与会话缓存。 */
-async function logout(callServer = true) {
-  if (callServer && token.value) {
-    await fetch(apiBaseUrl + "/api/auth/logout", {
-      method: "POST", headers: { "Authorization": "Bearer " + token.value },
-    }).catch(() => {});
+async function runQuickDiagnosis(type, name) {
+  if (quick.running) return;
+  quick.targetType = type; quick.targetName = name; quick.phases = []; quick.tools = []; quick.result = null; quick.error = ""; quick.running = true;
+  if (uiPreview) {
+    const related = type === "SERVICE" ? [name, ...(currentService.value.dependencies || []).slice(0, 2)] : [name];
+    quick.phases = Object.keys(phaseLabels);
+    quick.result = { affected_services: related, root_cause: { title: `${name} 下游依赖响应异常`, description: `${name} 请求延迟升高 → 下游调用超时 → 错误率上升`, confidence: .86, root_resource: { name: related.at(-1), type: "SERVICE" }, recommendations: ["检查下游连接池与超时配置", "核对最近部署及资源水位"] }, report: { decision_summary: "已完成一次性快速诊断。", root_cause_chain: [`${name} 延迟升高`, "下游调用超时", "错误率上升"], evidence: [] }, graph: catalogGraph.value };
+    quick.running = false; return;
   }
-  localStorage.removeItem("sre_agent_token");
-  token.value = "";
-  currentUser.value = null;
-  conversations.value = [];
-  currentConversationId.value = "";
+  try {
+    const response = await fetch(`${apiBaseUrl}/api/diagnoses/quick/stream`, { method: "POST", headers: authHeaders(true), body: JSON.stringify({ question: `快速诊断 ${type === "POD" ? "Pod" : "服务"} ${name} 的当前异常，并沿依赖链定位根因。`, target: { type, name, namespace: "sre-lab" }, project_id: projectId }) });
+    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).detail || `HTTP ${response.status}`);
+    await consumeSse(response, applyQuickEvent);
+  } catch (error) { quick.error = error instanceof Error ? error.message : "快速诊断失败"; }
+  finally { quick.running = false; }
 }
+async function loadServices() {
+  if (!token.value || uiPreview) return;
+  const response = await fetch(`${apiBaseUrl}/api/services`, { headers: authHeaders() }); if (!response.ok) return;
+  const payload = await response.json(); serviceCatalog.value = (payload.items || []).map((service) => ({ ...service, p95: service.metrics?.p95_ms == null ? "—" : `${service.metrics.p95_ms} ms`, errorRate: service.metrics?.error_rate == null ? "—" : `${service.metrics.error_rate}%`, cpu: service.metrics?.cpu_percent || 0, memory: service.metrics?.memory_percent || 0, updatedAt: service.updated_at || "暂无运行快照", version: service.version || "—", deployedAt: service.deployed_at || "暂无部署记录" }));
+}
+async function loadServicePods(serviceId) {
+  servicePods.value = []; if (!token.value || !serviceId || uiPreview) return; resourceLoading.value = true;
+  try { const response = await fetch(`${apiBaseUrl}/api/services/${serviceId}/pods`, { headers: authHeaders() }); if (response.ok) servicePods.value = (await response.json()).pods || []; }
+  finally { resourceLoading.value = false; }
+}
+async function loadPodDetail(name) {
+  podDetail.value = null; if (!token.value || !name || uiPreview) return; resourceLoading.value = true;
+  try { const response = await fetch(`${apiBaseUrl}/api/pods/${encodeURIComponent(name)}`, { headers: authHeaders() }); if (response.ok) podDetail.value = await response.json(); }
+  finally { resourceLoading.value = false; }
+}
+async function login() {
+  loginForm.error = ""; loginForm.submitting = true;
+  try { const response = await fetch(`${apiBaseUrl}/api/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: loginForm.username.trim(), password: loginForm.password }) }); const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(payload.detail || "登录失败"); token.value = payload.access_token; localStorage.setItem("sre_agent_token", token.value); currentUser.value = payload.user; await Promise.all([loadServices(), loadConversations()]); }
+  catch (error) { loginForm.error = error instanceof Error ? error.message : "登录失败"; }
+  finally { loginForm.submitting = false; }
+}
+async function restoreSession() {
+  if (!token.value) { authLoading.value = false; return; }
+  try { const response = await fetch(`${apiBaseUrl}/api/auth/me`, { headers: authHeaders() }); if (!response.ok) throw new Error("expired"); currentUser.value = await response.json(); await Promise.all([loadServices(), loadConversations()]); }
+  catch { await logout(false); } finally { authLoading.value = false; }
+}
+async function logout(callServer = true) { if (callServer && token.value) await fetch(`${apiBaseUrl}/api/auth/logout`, { method: "POST", headers: authHeaders() }).catch(() => {}); localStorage.removeItem("sre_agent_token"); token.value = ""; currentUser.value = null; conversations.value = []; }
+function confidence(value) { return `${Math.round((Number(value) || 0) * 100)}%`; }
 
-onMounted(restoreSession);
+onMounted(() => { parseRoute(); window.addEventListener("hashchange", parseRoute); if (!uiPreview) restoreSession(); });
+onBeforeUnmount(() => window.removeEventListener("hashchange", parseRoute));
 </script>
 
 <template>
-  <section v-if="authLoading" class="auth-page">
-    <p>正在恢复会话…</p>
-  </section>
-
-  <section v-else-if="!currentUser" class="auth-page">
-    <form class="login-card" @submit.prevent="login">
-      <p class="eyebrow">SRE AGENT</p>
-      <h1>登录</h1>
-      <p>登录后会自动恢复你的诊断会话。</p>
-      <label>
-        <span>用户名</span>
-        <input v-model="loginForm.username" autocomplete="username" maxlength="80" required />
-      </label>
-      <label>
-        <span>密码</span>
-        <input v-model="loginForm.password" type="password" autocomplete="current-password" minlength="6" maxlength="256" required />
-      </label>
-      <button type="submit" :disabled="loginForm.submitting">
-        {{ loginForm.submitting ? "登录中…" : "登录" }}
-      </button>
-      <p v-if="loginForm.error" class="login-error">{{ loginForm.error }}</p>
-    </form>
-  </section>
-
-  <div v-else class="app-shell">
-    <aside class="sidebar">
-      <div class="brand">
-        <span class="brand-mark">S</span>
-        <div><strong>SRE Agent</strong><small>Evidence Lab</small></div>
-      </div>
-
-      <section class="runtime-card">
-        <div class="status-line"><span class="status-dot"></span><span>本地只读诊断链路</span></div>
-        <dl>
-          <div><dt>Frontend</dt><dd>:3000</dd></div>
-          <div><dt>Agent</dt><dd>:8001</dd></div>
-          <div><dt>Gateway</dt><dd>:8000</dd></div>
-          <div><dt>Ollama</dt><dd>:11434</dd></div>
-          <div><dt>Kind</dt><dd>sre-lab</dd></div>
-          <div><dt>Project</dt><dd>{{ projectId }}</dd></div>
-        </dl>
-      </section>
-
-      <section class="tool-list">
-        <p class="eyebrow">READ-ONLY EVIDENCE</p>
-        <div><span class="tool-icon">K</span><span><b>Kubernetes</b><small>Pod · Event · Image · SHA</small></span></div>
-        <div><span class="tool-icon">P</span><span><b>Prometheus</b><small>P95 · Error · Resource</small></span></div>
-        <div><span class="tool-icon">L</span><span><b>Loki / Tempo</b><small>Logs · Trace</small></span></div>
-        <div><span class="tool-icon">D</span><span><b>MySQL / Git</b><small>Slow SQL · Diff · Source</small></span></div>
-      </section>
-      <p class="sidebar-note">Tool 仅提供 GET / READ / SELECT / EXPLAIN。页面只展示调查步骤，不展示隐藏思维链。</p>
-    </aside>
-
-    <main class="chat-panel">
-      <header class="chat-header">
-        <div><p class="eyebrow">SRE AGENT</p><h1>故障诊断</h1></div>
-        <div class="header-actions">
-          <select
-            :value="currentConversationId"
-            aria-label="历史会话"
-            :disabled="sending"
-            @change="openConversation($event.target.value)"
-          >
-            <option value="">当前新会话</option>
-            <option v-for="item in conversations" :key="item.id" :value="item.id">
-              {{ item.title }} · {{ item.message_count }}
-            </option>
-          </select>
-          <button :disabled="sending" @click="newConversation">新建</button>
-          <button @click="logout(true)">退出 {{ currentUser.username }}</button>
-        </div>
-      </header>
-
-      <section ref="conversationRef" class="conversation" aria-live="polite">
-        <article v-for="message in messages" :key="message.id" class="message-row" :class="message.role">
-          <div class="avatar">{{ message.role === "user" ? "你" : message.role === "error" ? "!" : "AI" }}</div>
-          <div class="message-content diagnosis-content">
-            <div v-if="message.content" class="bubble">{{ message.content }}</div>
-            <section v-if="message.phases?.length && !message.report" class="progress-card">
-              <p class="eyebrow">INVESTIGATION PROGRESS</p>
-              <div v-for="phase in message.phases" :key="phase" class="progress-row"><span>✓</span><b>{{ phaseLabels[phase] || phase }}</b></div>
-              <div v-if="sending" class="progress-row active"><span>·</span><b>正在读取下一项证据…</b></div>
-            </section>
-
-            <div v-if="message.report" class="report-grid">
-              <section class="report-card conclusion-card">
-                <div class="card-heading"><span>诊断结论</span><b>{{ confidencePercent(message.report.confidence) }}</b></div>
-                <h2>{{ message.report.conclusion }}</h2>
-                <p class="decision-summary">{{ message.report.decision_summary }}</p>
-                <!-- 运行身份字段来自 K8s Pod 与 Service Catalog，前端不猜测任何版本。 -->
-                <dl class="runtime-identity">
-                  <div><dt>Affected Service</dt><dd>{{ message.report.service }}</dd></div>
-                  <div><dt>Affected Pod</dt><dd>{{ message.report.affected_pod || "未定位到单 Pod" }}</dd></div>
-                  <div><dt>Language</dt><dd>{{ message.report.language }}</dd></div>
-                  <div><dt>Running Version</dt><dd><code>{{ message.report.running_version || "unknown" }}</code></dd></div>
-                  <div><dt>Git SHA</dt><dd><code>{{ message.report.git_sha || "unknown" }}</code></dd></div>
-                  <div><dt>Repository</dt><dd><code>{{ message.report.repository_url || "本地只读镜像" }}</code></dd></div>
-                  <div><dt>Source</dt><dd><code>{{ message.report.source_code_location || "未定位" }}</code></dd></div>
-                </dl>
-                <p>{{ message.report.environment }} · {{ message.report.time_range }} · {{ message.report.context_compaction.strategy }}</p>
-              </section>
-              <section class="report-card chain-card">
-                <div class="card-heading"><span>根因链</span></div>
-                <div class="cause-chain">
-                  <template v-for="(step, index) in message.report.root_cause_chain" :key="step">
-                    <strong>{{ step }}</strong><i v-if="index < message.report.root_cause_chain.length - 1">↓</i>
-                  </template>
-                </div>
-              </section>
-              <section class="report-card evidence-section">
-                <div class="card-heading"><span>证据</span><b>{{ message.report.evidence.length }} items</b></div>
-                <div class="evidence-grid">
-                  <article v-for="(evidence, index) in message.report.evidence" :key="evidence.tool_name + index" class="evidence-card">
-                    <div><span>{{ evidence.source }}</span><code>{{ evidence.evidence_id }}</code></div>
-                    <h3>{{ evidence.title }}</h3><p>{{ evidence.detail }}</p>
-                    <div class="source-references">
-                      <template v-for="reference in evidence.source_references" :key="reference.uri">
-                        <a v-if="isHttpReference(reference)" :href="reference.repository_url" target="_blank" rel="noreferrer">{{ reference.label }}</a>
-                        <code v-else>{{ reference.uri }}</code>
-                      </template>
-                    </div>
-                    <button class="evidence-button" @click="loadEvidence(message.report, evidence)">
-                      {{ evidence.loading ? "读取中…" : evidence.raw ? "收起原始证据" : "查看原始证据" }}
-                    </button>
-                    <pre v-if="evidence.raw" class="raw-evidence">{{ JSON.stringify(evidence.raw.result, null, 2) }}</pre>
-                    <p v-if="evidence.rawError" class="evidence-error">{{ evidence.rawError }}</p>
-                  </article>
-                </div>
-              </section>
-              <section class="report-card fixes-card">
-                <div class="card-heading"><span>修改方案</span></div>
-                <ol><li v-for="fix in message.report.recommended_fix" :key="fix">{{ fix }}</li></ol>
-              </section>
-              <details class="report-card timeline-card">
-                <summary>调查过程 · {{ message.report.investigation_timeline.length }} 次 Tool Call</summary>
-                <div v-for="(record, index) in message.report.investigation_timeline" :key="record.tool_name + index" class="timeline-row">
-                  <div><span>{{ index + 1 }}</span><code>{{ record.tool_name }}</code><b :class="{ failed: record.error }">{{ record.error ? "失败" : record.duration_ms + "ms" }}</b></div>
-                  <pre>参数 {{ JSON.stringify(record.arguments, null, 2) }}
-摘要 {{ record.error || record.result_summary }}</pre>
-                </div>
-              </details>
-            </div>
-            <div v-if="message.error" class="error-banner">诊断失败：{{ message.error }}</div>
-          </div>
-        </article>
-      </section>
-
-      <footer class="composer-area">
-        <div class="suggestions">
-          <button v-for="item in suggestions" :key="item" :disabled="sending" @click="useSuggestion(item)">{{ item }}</button>
-        </div>
-        <form class="composer" @submit.prevent="sendQuestion">
-          <textarea v-model="question" rows="1" maxlength="20000" placeholder="描述故障现象" aria-label="问题" :disabled="sending" @keydown="handleKeydown"></textarea>
-          <button type="submit" :disabled="sending || !question.trim()" aria-label="发送问题"><span>{{ sending ? "处理中" : "发送" }}</span><b>↗</b></button>
-        </form>
-        <p class="composer-hint">Enter 发送 · Shift + Enter 换行</p>
-      </footer>
+  <section v-if="authLoading" class="auth-page"><p>正在连接 SRE Console…</p></section>
+  <section v-else-if="!currentUser" class="auth-page"><form class="login-card" @submit.prevent="login"><div class="login-mark">S</div><p class="eyebrow">SRE OPERATIONS CONSOLE</p><h1>进入服务诊断平台</h1><p>浏览服务健康状态，基于证据链开展跨服务诊断。</p><label><span>用户名</span><input v-model="loginForm.username" autocomplete="username" required /></label><label><span>密码</span><input v-model="loginForm.password" type="password" autocomplete="current-password" required /></label><button type="submit" :disabled="loginForm.submitting">{{ loginForm.submitting ? "正在验证…" : "登录 Console" }}</button><p v-if="loginForm.error" class="login-error">{{ loginForm.error }}</p></form></section>
+  <div v-else class="console-shell monochrome">
+    <aside class="console-sidebar"><button class="brand" @click="navigate('/services')"><span class="brand-mark">S</span><span><strong>SRE Console</strong><small>Service Intelligence</small></span></button><nav class="primary-nav"><button :class="{ active: route.name === 'services' || route.name === 'service-detail' }" @click="navigate('/services')"><span class="nav-icon">□</span><span>服务目录</span><b>{{ displayServices.length }}</b></button><button :class="{ active: route.name === 'event-diagnosis' }" @click="openEventDiagnosis"><span class="nav-icon">◇</span><span>事件诊断</span><b>{{ conversations.length }}</b></button></nav><section class="environment-card"><div><span class="live-dot"></span><b>sre-lab</b><small>CONNECTED</small></div><dl><div><dt>Agent</dt><dd>:8001</dd></div><div><dt>Policy</dt><dd>READ ONLY</dd></div></dl></section><section class="recent-runs"><div class="sidebar-heading"><span>历史对话</span><b>{{ conversations.length }}</b></div><button v-for="item in conversations.slice(0, 6)" :key="item.id" @click="openConversation(item.id)"><span>{{ item.title }}</span><small>{{ item.message_count }} messages · {{ item.updated_at }}</small></button><p v-if="!conversations.length">暂无历史对话</p></section><div class="user-panel"><span>{{ currentUser.username?.slice(0, 1)?.toUpperCase() }}</span><div><b>{{ currentUser.username }}</b><small>Operator</small></div><button title="退出" @click="logout(true)">↗</button></div></aside>
+    <main class="console-main">
+      <header class="topbar"><div><p class="breadcrumb">SRE-LAB / {{ route.name.toUpperCase() }}</p><h1>{{ route.name === 'services' ? '服务目录' : route.name === 'service-detail' ? currentService.name : route.name === 'pod-detail' ? route.podName : '事件诊断' }}</h1></div><div class="topbar-meta"><span class="snapshot-dot"></span><span>READ ONLY</span><b>30s refresh</b></div></header>
+      <section v-if="route.name === 'services'" class="page-content overview-page catalog-only"><div class="health-strip"><button :class="{ selected: statusFilter === 'all' }" @click="statusFilter = 'all'"><small>All Services</small><strong>{{ displayServices.length }}</strong><span>应用服务</span></button><button :class="{ selected: statusFilter === 'healthy' }" @click="statusFilter = 'healthy'"><small>Healthy</small><strong>{{ statusSummary.healthy }}</strong><span>运行正常</span></button><button :class="{ selected: statusFilter === 'warning' }" @click="statusFilter = 'warning'"><small>Warning</small><strong>{{ statusSummary.warning }}</strong><span>需要关注</span></button><button :class="{ selected: statusFilter === 'critical' }" @click="statusFilter = 'critical'"><small>Critical</small><strong>{{ statusSummary.critical }}</strong><span>立即处理</span></button></div><div class="catalog-toolbar"><label><span>⌕</span><input v-model="serviceSearch" placeholder="搜索服务、Owner 或职责" /></label><span>{{ filteredServices.length }} services</span></div><div class="service-grid"><button v-for="service in filteredServices" :key="service.id" class="service-card" @click="openService(service.id)"><div class="service-card-head"><span class="service-glyph">{{ service.name.slice(0, 2).toUpperCase() }}</span><span class="status-badge" :class="service.status"><i></i>{{ statusLabel(service.status) }}</span></div><h3>{{ service.name }}</h3><p>{{ service.description }}</p><div class="metric-grid"><div><small>P95 LATENCY</small><b>{{ service.p95 }}</b></div><div><small>ERROR RATE</small><b>{{ service.errorRate }}</b></div><div><small>CPU</small><b>{{ service.cpu }}%</b><i><span :style="{ width: service.cpu + '%' }"></span></i></div><div><small>MEMORY</small><b>{{ service.memory }}%</b><i><span :style="{ width: service.memory + '%' }"></span></i></div></div><footer><span>更新于 {{ service.updatedAt }}</span><b>查看服务 →</b></footer></button></div></section>
+      <section v-else-if="route.name === 'service-detail'" class="page-content detail-page"><button class="back-button" @click="navigate('/services')">← 返回服务目录</button><div class="service-hero"><div class="service-identity"><span class="service-glyph large">{{ currentService.name.slice(0, 2).toUpperCase() }}</span><div><span class="status-badge" :class="currentService.status"><i></i>{{ statusLabel(currentService.status) }}</span><h2>{{ currentService.name }}</h2><p>{{ currentService.description }}</p></div></div><button class="primary-action" :disabled="quick.running" @click="runQuickDiagnosis('SERVICE', currentService.id)">{{ quick.running ? '诊断中…' : '开始快速诊断' }}</button></div>
+        <section v-if="quick.running || quick.result || quick.error" class="panel quick-diagnosis"><div class="panel-heading"><div><p class="eyebrow">STATELESS QUICK DIAGNOSIS</p><h3>即时因果链</h3></div><span>无对话 · 无记忆</span></div><div v-if="quick.running" class="quick-progress"><b>正在分析 {{ quick.targetName }}</b><span>{{ phaseLabels[quick.phases.at(-1)] || '连接证据源' }}</span><i><span :style="{ width: Math.max(8, quick.phases.length / Object.keys(phaseLabels).length * 100) + '%' }"></span></i></div><div v-if="quick.error" class="incident-error"><b>快速诊断失败</b><span>{{ quick.error }}</span></div><div v-if="quick.result" class="quick-result"><div class="quick-summary"><article><small>SUSPECTED ROOT CAUSE</small><h3>{{ quickRoot?.title }}</h3><p>{{ quickRoot?.description }}</p></article><div><small>CONFIDENCE</small><strong>{{ confidence(quickRoot?.confidence) }}</strong></div></div><div class="cause-chain"><template v-for="(step, index) in quickReport?.root_cause_chain || []" :key="step"><span>{{ step }}</span><i v-if="index < quickReport.root_cause_chain.length - 1">→</i></template></div><div class="quick-grid"><div><p class="eyebrow">SERVICE DEPENDENCY GRAPH</p><ServiceGraph compact :graph="quickGraph" :involved-services="quickServices" :root-cause-service="quickRoot?.root_resource?.name" /></div><div><p class="eyebrow">EXECUTED EVIDENCE STEPS</p><ol class="quick-tools"><li v-for="(tool, index) in quick.tools" :key="index"><b>{{ tool.tool_name }}</b><span>{{ tool.result_summary || tool.error || '证据已采集' }}</span></li></ol><p class="eyebrow">RECOMMENDATIONS</p><ol class="quick-tools"><li v-for="item in quickRoot?.recommendations || []" :key="item"><span>{{ item }}</span></li></ol></div></div></div></section>
+        <div class="detail-layout"><div class="detail-primary"><section class="panel metrics-panel"><div class="panel-heading"><div><p class="eyebrow">HEALTH SUMMARY</p><h3>Metrics 概览</h3></div><span>最近 30 分钟</span></div><div class="large-metrics"><div><small>P95 LATENCY</small><strong>{{ currentService.p95 }}</strong></div><div><small>ERROR RATE</small><strong>{{ currentService.errorRate }}</strong></div><div><small>CPU USAGE</small><strong>{{ currentService.cpu }}%</strong></div><div><small>MEMORY</small><strong>{{ currentService.memory }}%</strong></div></div></section><section class="panel pods-panel"><div class="panel-heading"><div><p class="eyebrow">KUBERNETES</p><h3>Pods</h3></div><span>{{ resourceLoading ? '读取中…' : servicePods.length + ' pods' }}</span></div><div v-if="servicePods.length" class="pod-list"><button v-for="pod in servicePods" :key="pod" @click="openPod(pod)"><span class="live-dot"></span><div><b>{{ pod }}</b><small>sre-lab · 实时发现</small></div><i>→</i></button></div><div v-else class="empty-state">{{ resourceLoading ? '正在读取 Pod…' : '当前未发现 Pod' }}</div></section><section class="panel graph-panel"><div class="panel-heading"><div><p class="eyebrow">SERVICE MAP</p><h3>依赖关系</h3></div></div><ServiceGraph :graph="catalogGraph" :focus-service="currentService.id" /></section></div><aside class="detail-aside"><section class="panel deployment-panel"><div class="panel-heading"><div><p class="eyebrow">DEPLOYMENT</p><h3>最近部署</h3></div></div><dl><div><dt>Version</dt><dd><code>{{ currentService.version }}</code></dd></div><div><dt>Runtime</dt><dd>{{ currentService.runtime }}</dd></div><div><dt>Owner</dt><dd>{{ currentService.owner }}</dd></div><div><dt>Deployed</dt><dd>{{ currentService.deployedAt }}</dd></div></dl></section><section class="panel dependency-list"><div class="panel-heading"><div><p class="eyebrow">DEPENDENCIES</p><h3>上下游服务</h3></div></div><div><small>UPSTREAM</small><button v-for="item in currentService.upstreams" :key="item" @click="openService(item)">{{ item }} →</button></div><div><small>DOWNSTREAM</small><button v-for="item in currentService.dependencies" :key="item" @click="openService(item)">{{ item }} →</button></div></section></aside></div></section>
+      <section v-else-if="route.name === 'pod-detail'" class="page-content detail-page"><button class="back-button" @click="navigate('/services')">← 返回服务目录</button><div class="service-hero"><div class="service-identity"><span class="service-glyph large">PD</span><div><span class="status-badge warning"><i></i>Kubernetes Pod</span><h2>{{ route.podName }}</h2><p>Pod 只是快速诊断起点，证据可沿依赖关系扩展。</p></div></div><button class="primary-action" :disabled="quick.running" @click="runQuickDiagnosis('POD', route.podName)">{{ quick.running ? '诊断中…' : '快速诊断 Pod' }}</button></div><section v-if="quick.running || quick.result || quick.error" class="panel quick-diagnosis"><div class="panel-heading"><div><p class="eyebrow">STATELESS QUICK DIAGNOSIS</p><h3>即时诊断结果</h3></div><span>无对话 · 无记忆</span></div><div v-if="quick.running" class="empty-state">正在生成完整因果链…</div><div v-if="quick.error" class="incident-error">{{ quick.error }}</div><div v-if="quick.result" class="quick-summary"><article><small>ROOT CAUSE</small><h3>{{ quickRoot?.title }}</h3><p>{{ quickRoot?.description }}</p></article><strong>{{ confidence(quickRoot?.confidence) }}</strong></div></section><section class="panel"><div class="panel-heading"><div><p class="eyebrow">POD OVERVIEW</p><h3>运行时详情</h3></div></div><pre v-if="podDetail" class="pod-raw">{{ JSON.stringify(podDetail.data, null, 2) }}</pre><div v-else class="empty-state">Pod 数据暂不可用</div></section></section>
+      <section v-else class="page-content event-page"><div class="event-intro"><div><p class="eyebrow">INCIDENT DIAGNOSIS</p><h2>描述现象，持续诊断</h2><p>可不选服务、选择一个或多个服务作为调查起点；Agent 会保留意图、记忆与压缩上下文，并可沿证据自动扩展范围。</p></div><button class="primary-action" @click="createConversation">＋ 创建新对话</button></div><div class="event-layout"><aside class="conversation-browser panel"><div class="panel-heading"><div><p class="eyebrow">HISTORY</p><h3>历史对话查询</h3></div><span>{{ conversations.length }}</span></div><button v-for="item in conversations" :key="item.id" :class="{ active: chat.conversationId === item.id }" @click="openConversation(item.id)"><b>{{ item.title }}</b><span>{{ item.message_count }} 条消息</span><small>{{ item.updated_at }}</small></button><div v-if="!conversations.length" class="empty-state">暂无历史对话</div></aside><section class="chat-workspace panel"><div class="service-scope"><div><p class="eyebrow">OPTIONAL SERVICE SCOPE</p><h3>选择调查起点</h3><span>{{ chat.selectedServices.length ? `已选择 ${chat.selectedServices.length} 个服务` : '不限制服务，由 Agent 自主识别' }}</span></div><div class="service-choices"><button :class="{ active: !chat.selectedServices.length }" @click="chat.selectedServices = []">不选择服务</button><button v-for="service in displayServices" :key="service.id" :class="{ active: chat.selectedServices.includes(service.id) }" @click="toggleService(service.id)">{{ service.name }}</button></div><div class="capability-row"><span>Intent Router</span><span>Conversation Memory</span><span>Context Compression</span><span>Tool Retrieval</span><span>Dynamic Scope</span></div></div><div ref="chatList" class="message-list"><div v-if="!chat.messages.length" class="chat-empty"><span>◇</span><h3>开始一次事件诊断</h3><p>例如：最近订单创建大量超时，请分析是否与支付服务有关。</p></div><article v-for="message in chat.messages" :key="message.id" class="chat-message" :class="message.role"><header><b>{{ message.role === 'user' ? '你' : 'SRE Agent' }}</b><span v-if="message.intent">{{ message.intent }}</span></header><p v-if="message.text">{{ message.text }}</p><div v-if="message.phases?.length" class="message-phases"><span v-for="phase in message.phases" :key="phase">✓ {{ phaseLabels[phase] || phase }}</span></div><details v-if="message.tools?.length"><summary>查看 {{ message.tools.length }} 个检索 / 工具步骤</summary><ol><li v-for="(tool, index) in message.tools" :key="index"><b>{{ tool.tool_name }}</b> — {{ tool.result_summary || tool.error }}</li></ol></details><div v-if="message.report" class="assistant-report"><div><small>ROOT CAUSE</small><b>{{ message.report.root_cause }}</b></div><div><small>CONFIDENCE</small><b>{{ confidence(message.report.confidence) }}</b></div><div class="cause-chain"><template v-for="(step, index) in message.report.root_cause_chain || []" :key="step"><span>{{ step }}</span><i v-if="index < message.report.root_cause_chain.length - 1">→</i></template></div></div><p v-if="message.error" class="chat-error">{{ message.error }}</p></article></div><form class="chat-composer" @submit.prevent="sendChat"><textarea v-model="chat.input" rows="3" placeholder="描述服务异常、告警、时间范围或希望继续追问的内容…" @keydown.ctrl.enter.prevent="sendChat"></textarea><div><span>{{ chat.conversationId ? '当前对话已启用记忆' : '发送后自动创建会话' }} · Ctrl + Enter</span><button class="primary-action" type="submit" :disabled="!chat.input.trim() || chat.sending">{{ chat.sending ? '诊断中…' : '发送诊断' }}</button></div></form></section></div></section>
     </main>
   </div>
 </template>

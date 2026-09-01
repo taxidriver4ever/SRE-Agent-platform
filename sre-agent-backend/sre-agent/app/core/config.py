@@ -5,6 +5,7 @@
 """
 
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,6 +40,7 @@ class Settings:
     gateway_api_key: str | None
     gateway_model: str
     gateway_timeout_seconds: float
+    gateway_max_tokens: int
     agent_max_iterations: int
     # 以下配置均指向本机 Kind 实验平台；使用环境变量后也能连接到远端只读端点。
     kubernetes_namespace: str
@@ -88,10 +90,13 @@ def get_settings() -> Settings:
     return Settings(
         gateway_base_url=os.getenv("GATEWAY_BASE_URL", "http://127.0.0.1:8000").rstrip("/"),
         gateway_api_key=os.getenv("GATEWAY_API_KEY"),
-        # 本项目默认走本地 Docker Ollama；仍可用环境变量切换到其他 Provider。
-        gateway_model=os.getenv("GATEWAY_MODEL", "ollama/qwen3:4b"),
+        # 本项目默认走本地 Docker vLLM；仍可用环境变量切换到其他 Provider。
+        gateway_model=os.getenv("GATEWAY_MODEL", "vllm/qwen3-4b"),
         # 本地模型首次加载通常比公网 API 慢，默认预留更宽松的超时时间。
         gateway_timeout_seconds=float(os.getenv("GATEWAY_TIMEOUT_SECONDS", "180")),
+        # 诊断链路只生成结构化 JSON 和短摘要。限制输出预算能显著缩短本地
+        # 推理时间，同时仍给证据综合保留足够空间。
+        gateway_max_tokens=max(256, min(1200, int(os.getenv("GATEWAY_MAX_TOKENS", "512")))),
         agent_max_iterations=int(os.getenv("AGENT_MAX_ITERATIONS", "8")),
         kubernetes_namespace=os.getenv("KUBERNETES_NAMESPACE", "sre-lab"),
         prometheus_base_url=os.getenv("PROMETHEUS_BASE_URL", "http://127.0.0.1:19090").rstrip("/"),
@@ -147,7 +152,7 @@ def get_settings() -> Settings:
         loki_bearer_token=os.getenv("LOKI_BEARER_TOKEN") or None,
         sandbox_workspace_root=os.getenv(
             "SRE_SANDBOX_WORKSPACE_ROOT",
-            str(Path(__file__).resolve().parents[2] / ".sandbox-tasks"),
+            str(Path(tempfile.gettempdir()) / "sre-agent-sandbox-tasks"),
         ),
         sandbox_image=os.getenv("SRE_SANDBOX_IMAGE", "python:3.12-alpine"),
         sandbox_cpus=float(os.getenv("SRE_SANDBOX_CPUS", "1.0")),

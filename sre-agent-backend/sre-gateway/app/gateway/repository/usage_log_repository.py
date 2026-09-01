@@ -36,7 +36,7 @@ class UsageLogRepository:
         self.database = database
 
     def create(self, entry: UsageLogEntry) -> None:
-        """把一次调用指标写入 SQLite，不保存 Prompt 或模型输出。"""
+        """把一次调用指标写入 MySQL，不保存 Prompt 或模型输出。"""
         total_tokens = entry.prompt_tokens + entry.completion_tokens
         with self.database.session() as session:
             session.add(

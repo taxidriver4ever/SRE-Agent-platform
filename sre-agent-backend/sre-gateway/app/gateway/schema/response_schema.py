@@ -38,7 +38,7 @@ class ChatCompletionResponse(BaseModel):
     )
     model: str = Field(description="Provider 实际调用并返回结果的模型名称")
     provider: str = Field(
-        description="实际处理请求的模型厂商，例如 openai、claude、deepseek 或 ollama"
+        description="实际处理请求的模型厂商，例如 openai、claude、deepseek、vllm 或 ollama"
     )
     choices: list[ChatChoice] = Field(
         description="模型生成结果列表；当前版本返回一个结果"
@@ -48,4 +48,3 @@ class ChatCompletionResponse(BaseModel):
         ge=0,
         description="Gateway 调用 Provider 并获得结果所花费的时间，单位为毫秒",
     )
-

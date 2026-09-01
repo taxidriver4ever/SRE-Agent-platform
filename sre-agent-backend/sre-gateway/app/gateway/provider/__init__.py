@@ -11,6 +11,7 @@ from .claude_adapter import ClaudeAdapter
 from .deepseek_adapter import DeepSeekAdapter
 from .ollama_adapter import OllamaAdapter
 from .openai_adapter import OpenAIAdapter
+from .vllm_adapter import VllmAdapter
 
 __all__ = [
     "BaseProviderAdapter",
@@ -18,9 +19,9 @@ __all__ = [
     "DeepSeekAdapter",
     "OllamaAdapter",
     "OpenAIAdapter",
+    "VllmAdapter",
     "ProviderConfigurationError",
     "ProviderError",
     "ProviderRequestError",
     "ProviderResult",
 ]
-

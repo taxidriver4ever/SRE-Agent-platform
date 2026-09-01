@@ -36,6 +36,7 @@ class GatewayLLM:
         api_key: str | None,
         model: str,
         timeout: float = 60,
+        max_tokens: int = 512,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         """保存连接配置并准备异步 HTTP 客户端。
@@ -51,6 +52,7 @@ class GatewayLLM:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
+        self.max_tokens = max(256, min(1200, max_tokens))
         # 记录所有权，防止 close() 误关掉由其他组件共享的外部连接池。
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(timeout=timeout)
@@ -81,7 +83,7 @@ class GatewayLLM:
                     # 当前调用均依赖 JSON/短摘要；限制生成长度并降低随机性可减少
                     # 本地模型超时和 Structured Output 重试。
                     "temperature": 0,
-                    "max_tokens": 1200,
+                    "max_tokens": self.max_tokens,
                     # 当前网关明确拒绝流式请求，Agent 循环也按完整 JSON 响应解析。
                     "stream": False,
                 },

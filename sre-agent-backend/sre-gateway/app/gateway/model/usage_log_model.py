@@ -36,7 +36,7 @@ class GatewayUsageLog(Base):
     provider: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
-        comment="实际接收请求的模型厂商，例如 openai、claude、deepseek 或 ollama",
+        comment="实际接收请求的模型厂商，例如 openai、claude、deepseek、vllm 或 ollama",
     )
     model: Mapped[str] = mapped_column(
         String(200),

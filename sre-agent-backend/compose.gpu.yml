@@ -1,4 +1,4 @@
-# NVIDIA GPU 可选覆盖文件。Docker Desktop + WSL2 需要支持 GPU 容器。
+# Ollama 的 NVIDIA GPU 可选覆盖文件。vLLM 主服务已要求 NVIDIA GPU。
 services:
   ollama:
     gpus: all

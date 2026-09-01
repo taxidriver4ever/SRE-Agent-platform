@@ -70,6 +70,7 @@ class DiagnosisWorkflow:
         target: str | None = None,
         symptom: str | None = None,
         system_scan: bool = False,
+        selected_services: list[str] | None = None,
     ) -> DiagnosisReport:
         """从 TRIAGE 走到 REPORT；模型不能跳过基线观测或证据验证。"""
         run_id = uuid4().hex
@@ -82,6 +83,7 @@ class DiagnosisWorkflow:
             service=target or "unknown",
             symptom=symptom or "待确定",
             max_tool_steps=self.max_steps,
+            selected_services=list(dict.fromkeys(selected_services or [])),
         )
         planner = EvidencePlanner(self.llm) if self.llm is not None else None
         if self.conversation_service and state.user_id:
@@ -101,8 +103,8 @@ class DiagnosisWorkflow:
         await self._analyze(state, on_event)
         await self._investigate(state, on_event, planner=planner, system_scan=system_scan)
         await self._phase(state, WorkflowPhase.VERIFY, on_event)
-        # 在生成模型摘要之前先检查阈值，避免把已经足够大的跨轮增量继续原样传递。
-        await self._compact_context_before_summary(state)
+        # Planner 直接消费有界 Evidence，不需要等待会话压缩。压缩在报告落库后
+        # 后台执行，避免把最多 30 秒的增强任务计入同步诊断延迟。
         await self._synthesize_with_gateway(state, planner, on_event)
         report = self._report(state)
         await self._phase(state, WorkflowPhase.REPORT, on_event)
@@ -142,6 +144,37 @@ class DiagnosisWorkflow:
         state.repository = state.service if state.service in self.catalog.services else None
         state.source_code_location = metadata.get("source_path")
         state.repository_url = metadata.get("repository_url")
+        # 展开服务目录中的传递依赖，使“上游 -> 中间服务 -> 实际故障下游”的
+        # 调查可以继续推进，但所有服务名仍来自目录而非模型猜测。
+        direct_dependencies = [str(item) for item in metadata.get("dependencies", [])]
+        # 用户多选服务是起始调查集合，不是硬边界；纳入显式 Context 后仍允许
+        # Trace、日志和目录依赖继续发现其他资源。
+        direct_dependencies = list(dict.fromkeys([
+            *direct_dependencies,
+            *(service for service in state.selected_services if service != state.service),
+        ]))
+        query_lower = analysis_input.lower()
+        retry_query = any(term in query_lower for term in ("重试", "retry", "放大", "storm"))
+        mentioned_dependencies = [
+            dependency for dependency in direct_dependencies
+            if dependency.lower() in query_lower
+            or any(
+                str(alias).lower() in query_lower
+                for alias in self.catalog.services.get(dependency, {}).get("aliases", [])
+            )
+        ]
+        # 重试调查优先沿用户明确提到的那条调用链推进；否则四个并列下游会在
+        # 到达真正末端依赖前耗尽工具预算。
+        dependency_queue = mentioned_dependencies if retry_query and mentioned_dependencies else direct_dependencies
+        expanded_dependencies: list[str] = []
+        while dependency_queue:
+            dependency = dependency_queue.pop(0)
+            if dependency in expanded_dependencies or dependency == state.service:
+                continue
+            expanded_dependencies.append(dependency)
+            dependency_metadata = self.catalog.services.get(dependency, {})
+            dependency_queue.extend(str(item) for item in dependency_metadata.get("dependencies", []))
+        state.dependencies = expanded_dependencies
         text = analysis_input.lower()
         routed_symptom = state.symptom.lower()
         if state.symptom != "待确定" and any(word in routed_symptom for word in ("重试", "retry", "依赖", "dependency", "timeout")):
@@ -292,8 +325,7 @@ class DiagnosisWorkflow:
                 [decision.tool_name, decision.arguments], ensure_ascii=False, sort_keys=True
             )
             repeated = any(
-                item.error is None
-                and json.dumps([item.tool_name, item.arguments], ensure_ascii=False, sort_keys=True) == signature
+                json.dumps([item.tool_name, item.arguments], ensure_ascii=False, sort_keys=True) == signature
                 for item in state.timeline
             )
             if repeated:
@@ -562,24 +594,42 @@ class DiagnosisWorkflow:
         """
         if self.context_service is None or self.conversation_service is None or not state.user_id:
             return
-        report.context_compaction.update({
-            "storage": "mysql",
-            "compaction_ratio": str(self.context_service.compaction_ratio),
-            "active_context_tokens": self.context_service.active_token_count(
-                state.user_id, state.conversation_id
-            ),
-            "compression_count": self.context_service.repository.compaction_count(
-                state.user_id, state.conversation_id
-            ),
-        })
-        self.conversation_service.append(
-            state.user_id,
-            state.conversation_id,
-            "assistant",
-            {"report": report.model_dump(mode="json")},
-            message_type="assistant",
-            run_id=state.run_id,
-        )
+        try:
+            self.conversation_service.append(
+                state.user_id,
+                state.conversation_id,
+                "assistant",
+                {"report": report.model_dump(mode="json")},
+                message_type="assistant",
+                run_id=state.run_id,
+            )
+        except Exception as exc:
+            # 诊断工具证据已经在各步骤尽力落库；最终持久化短暂失败不能把一个
+            # 已完成的只读诊断变成 HTTP 500。
+            logger.warning(
+                "conversation report persistence failed: conversation_id=%s error=%s",
+                state.conversation_id,
+                self._exception_text(exc),
+            )
+            return
+        try:
+            report.context_compaction.update({
+                "storage": "mysql",
+                "compaction_ratio": str(self.context_service.compaction_ratio),
+                "active_context_tokens": self.context_service.active_token_count(
+                    state.user_id, state.conversation_id
+                ),
+                "compression_count": self.context_service.repository.compaction_count(
+                    state.user_id, state.conversation_id
+                ),
+            })
+        except Exception as exc:
+            logger.warning(
+                "conversation context statistics failed: conversation_id=%s error=%s",
+                state.conversation_id,
+                self._exception_text(exc),
+            )
+            return
         # 报告持久化后立即允许 SSE 返回 final。压缩是增强任务，即使本地模型
         # 冷启动或生成缓慢，也不能让已经完成的诊断在页面上继续卡数分钟。
         task = asyncio.create_task(

@@ -63,6 +63,17 @@ def require_project(policy: ToolPolicy, project_id: str) -> None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
 
 
+def require_selected_services(workflow_router: IntentWorkflowRouter, services: list[str]) -> None:
+    """多选服务必须来自后端目录，但它们只是调查起点而不是权限边界。"""
+    known = workflow_router.diagnosis_workflow.catalog.services
+    unknown = [service for service in services if service not in known]
+    if unknown:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"unknown selected services: {', '.join(unknown)}",
+        )
+
+
 @router.post("/run", response_model=AgentResult)
 async def run_agent(
     body: AgentRunRequest,
@@ -109,19 +120,27 @@ async def diagnose(
 ) -> DiagnosisReport:
     """同步返回完整的结构化诊断报告，适合脚本、评测和 API 测试。"""
     require_project(policy, body.project_id)
+    require_selected_services(workflow_router, body.selected_services)
     try:
         conversation_id = conversations.ensure(user["id"], body.conversation_id, body.message)
     except KeyError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="conversation not found") from exc
     task_id = uuid4().hex
-    async with sandbox.task_workspace(task_id) as workspace:
-        with task_security_scope(user["id"], body.project_id, task_id, str(workspace)):
-            with conversation_memory_scope(user["id"], conversation_id):
-                result = await workflow_router.dispatch(
-                    body.message,
-                    conversation_id=conversation_id,
-                    user_id=user["id"],
-                )
+    try:
+        async with sandbox.task_workspace(task_id) as workspace:
+            with task_security_scope(user["id"], body.project_id, task_id, str(workspace)):
+                with conversation_memory_scope(user["id"], conversation_id):
+                    result = await workflow_router.dispatch(
+                        body.message,
+                        conversation_id=conversation_id,
+                        user_id=user["id"],
+                        selected_services=body.selected_services,
+                    )
+    except GatewayConfigurationError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except GatewayRequestError as exc:
+        # 同步聊天接口与旧 /run 端点使用一致的上游失败语义，避免裸 500。
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
     result.conversation_id = conversation_id
     return result
 
@@ -137,6 +156,7 @@ async def diagnose_stream(
 ) -> StreamingResponse:
     """以 SSE 逐步发送 phase、tool、final 事件，供问答页面实时展示。"""
     require_project(policy, body.project_id)
+    require_selected_services(workflow_router, body.selected_services)
     try:
         conversation_id = conversations.ensure(user["id"], body.conversation_id, body.message)
     except KeyError as exc:
@@ -162,6 +182,7 @@ async def diagnose_stream(
                             publish,
                             conversation_id=conversation_id,
                             user_id=user["id"],
+                            selected_services=body.selected_services,
                         )
         except Exception as exc:  # HTTP 流已开始，只能通过事件报告错误。
             detail = str(exc).strip()

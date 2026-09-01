@@ -1,6 +1,6 @@
 """Agent HTTP API 的输入模型。"""
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class AgentRunRequest(BaseModel):
@@ -28,3 +28,14 @@ class DiagnosisChatRequest(BaseModel):
     conversation_id: str | None = Field(default=None, min_length=32, max_length=64)
     # project_id 只选择服务端白名单项目，不能携带 namespace、repo、path 或凭证。
     project_id: str = Field(default="sre-lab", pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$")
+    # 仅作为调查起点提示，可为空、单选或多选；Agent 仍可沿证据扩展到其他服务。
+    selected_services: list[str] = Field(default_factory=list, max_length=20)
+
+    @field_validator("selected_services")
+    @classmethod
+    def normalize_selected_services(cls, value: list[str]) -> list[str]:
+        normalized = list(dict.fromkeys(item.strip() for item in value if item.strip()))
+        for service in normalized:
+            if len(service) > 120 or not service.replace("-", "").replace("_", "").isalnum():
+                raise ValueError("selected service name is invalid")
+        return normalized

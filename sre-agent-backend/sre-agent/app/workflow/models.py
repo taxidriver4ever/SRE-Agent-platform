@@ -102,7 +102,7 @@ class DiagnosisReport(BaseModel):
     time_range: str
     conclusion: str
     status: Literal["confirmed", "insufficient_evidence"] = "insufficient_evidence"
-    # Ollama 经统一 Gateway 生成的简短决策摘要；根因字段仍由证据门槛约束。
+    # 本地模型经统一 Gateway 生成的简短决策摘要；根因字段仍由证据门槛约束。
     decision_summary: str
     root_cause: str
     findings: list[DiagnosisFinding] = Field(default_factory=list)
@@ -137,6 +137,9 @@ class DiagnosisState(BaseModel):
     repository: str | None = None
     repository_url: str | None = None
     source_code_location: str | None = None
+    dependencies: list[str] = Field(default_factory=list)
+    # 事件诊断页可选的一个或多个初始服务，只作为调查起点而不是边界。
+    selected_services: list[str] = Field(default_factory=list)
     pod_versions: dict[str, str] = Field(default_factory=dict)
     mixed_versions: bool = False
     evidence: list[Evidence] = Field(default_factory=list)

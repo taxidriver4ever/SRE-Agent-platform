@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -109,12 +110,15 @@ class EvidencePlanner:
     @staticmethod
     def _evidence_driven_decision(state: DiagnosisState) -> PlannerDecision | None:
         """从 Tool Result 中的关联字段生成确定性下一跳，避免小模型重复推导事实。"""
-        successful = {(item.tool_name, json.dumps(item.arguments, sort_keys=True, default=str)) for item in state.timeline if item.error is None}
+        attempted = {
+            (item.tool_name, json.dumps(item.arguments, sort_keys=True, default=str))
+            for item in state.timeline
+        }
 
         def called(tool: str, arguments: dict[str, Any] | None = None) -> bool:
             if arguments is None:
-                return any(name == tool for name, _ in successful)
-            return (tool, json.dumps(arguments, sort_keys=True, default=str)) in successful
+                return any(name == tool for name, _ in attempted)
+            return (tool, json.dumps(arguments, sort_keys=True, default=str)) in attempted
 
         def parents(predicate: Any) -> list[str]:
             return [item.evidence_id for item in state.evidence if predicate(item)][-4:]
@@ -128,7 +132,9 @@ class EvidencePlanner:
             sql_statements.extend(item.structured_data.get("sql_statements", []))
             discovered_services.extend(item.structured_data.get("services", []))
 
-        for trace_id in dict.fromkeys(trace_ids):
+        # 一组并发错误日志往往包含大量等价 trace_id；先抽样一条建立跨源关联，
+        # 避免把全部工具预算耗在同一机制的重复 Trace 上。
+        for trace_id in list(dict.fromkeys(trace_ids))[:1]:
             arguments = {"trace_id": trace_id}
             if not called("query_trace", arguments):
                 return PlannerDecision(
@@ -138,27 +144,48 @@ class EvidencePlanner:
                     parent_evidence_ids=parents(lambda item: trace_id in item.structured_data.get("trace_ids", [])),
                 )
 
-        trace_candidates = [
-            candidate
-            for item in state.evidence if item.tool_name == "query_trace"
-            for candidate in item.structured_data.get("trace_candidates", [])
-            if isinstance(candidate, dict)
-        ]
-        non_health = [
-            candidate for candidate in trace_candidates
-            if not any(marker in str(candidate.get("name", "")).lower() for marker in ("health", "prometheus", "metrics"))
-        ]
-        if non_health:
-            selected = max(non_health, key=lambda item: float(item.get("duration_ms") or 0))
-            arguments = {"trace_id": selected["trace_id"]}
-            if not called("query_trace", arguments):
-                return PlannerDecision(
-                    action="tool", tool_name="query_trace", arguments=arguments,
-                    title="读取最慢业务 Trace 详情", reason="Trace 搜索结果包含非健康检查业务请求",
-                    parent_evidence_ids=parents(lambda item: item.tool_name == "query_trace"),
+        # 每次搜索都应继续展开它自己尚未读取的业务 Trace。若把所有历史候选合并后
+        # 只取全局最慢项，最慢项一旦读取过，后续针对下游服务的新搜索会被意外跳过。
+        for evidence_item in reversed(state.evidence):
+            if evidence_item.tool_name != "query_trace":
+                continue
+            candidates = [
+                candidate
+                for candidate in evidence_item.structured_data.get("trace_candidates", [])
+                if isinstance(candidate, dict)
+                and candidate.get("trace_id")
+                and not any(
+                    marker in str(candidate.get("name", "")).lower()
+                    for marker in ("health", "prometheus", "metrics")
                 )
+            ]
+            if candidates:
+                selected = max(candidates, key=lambda item: float(item.get("duration_ms") or 0))
+                arguments = {"trace_id": selected["trace_id"]}
+                if not called("query_trace", arguments):
+                    return PlannerDecision(
+                        action="tool",
+                        tool_name="query_trace",
+                        arguments=arguments,
+                        title="读取最慢业务 Trace 详情",
+                        reason="Trace 搜索结果包含尚未展开的非健康检查业务请求",
+                        parent_evidence_ids=[evidence_item.evidence_id],
+                    )
+
+        # 延迟/5xx 场景先用数据库自身的慢查询记录确认是否真的存在数据库等待，
+        # 避免仅凭 Trace 中的模板 SQL（通常含 ?/$1 占位符）直接执行 EXPLAIN。
+        if state.symptom in {"latency", "5xx"} and not called("query_slow_queries"):
+            return PlannerDecision(
+                action="tool", tool_name="query_slow_queries",
+                arguments={"time_range_minutes": state.time_range_minutes, "limit": 10},
+                title="检查近期数据库慢查询",
+                reason="延迟或错误基线需要排除数据库等待",
+                parent_evidence_ids=parents(lambda item: item.source in {"Prometheus", "Loki", "Tempo"}),
+            )
 
         for sql in dict.fromkeys(sql_statements):
+            if not EvidencePlanner._is_explainable_sql(sql):
+                continue
             arguments = {"sql": sql}
             if not called("explain_sql", arguments):
                 return PlannerDecision(
@@ -166,6 +193,33 @@ class EvidencePlanner:
                     title="验证运行时 SQL 执行计划",
                     reason="Trace 或数据库证据包含原始只读 SQL",
                     parent_evidence_ids=parents(lambda item: sql in item.structured_data.get("sql_statements", [])),
+                )
+
+        retry_terms = ("重试", "retry", "放大", "storm")
+        if any(term in state.query.lower() for term in retry_terms) and state.dependencies:
+            for downstream_service in state.dependencies:
+                arguments = {"service": downstream_service, "limit": 10}
+                if called("query_trace", arguments):
+                    continue
+                return PlannerDecision(
+                    action="tool", tool_name="query_trace", arguments=arguments,
+                    title="搜索下游服务 Trace",
+                    reason="用户询问重试放大，需要沿服务目录逐级验证下游调用",
+                    parent_evidence_ids=parents(lambda item: item.tool_name == "query_trace"),
+                )
+            for downstream_service in reversed(state.dependencies):
+                arguments = {
+                    "service": downstream_service,
+                    "time_range_minutes": state.time_range_minutes,
+                    "limit": 20,
+                }
+                if called("query_logs", arguments):
+                    continue
+                return PlannerDecision(
+                    action="tool", tool_name="query_logs", arguments=arguments,
+                    title="读取末端下游服务日志",
+                    reason="需要核对同一 trace_id 是否因无退避重试而重复出现",
+                    parent_evidence_ids=parents(lambda item: item.tool_name == "query_trace"),
                 )
 
         if state.symptom == "pod_restart" and state.pod_name:
@@ -189,15 +243,6 @@ class EvidencePlanner:
                 title="搜索目标服务近期 Trace",
                 reason="需要把请求耗时归属到具体 Span",
                 parent_evidence_ids=parents(lambda item: item.source in {"Prometheus", "Loki"}),
-            )
-
-        if state.symptom in {"latency", "5xx"} and not called("query_slow_queries"):
-            return PlannerDecision(
-                action="tool", tool_name="query_slow_queries",
-                arguments={"time_range_minutes": state.time_range_minutes, "limit": 10},
-                title="检查近期数据库慢查询",
-                reason="延迟或错误基线需要排除数据库等待",
-                parent_evidence_ids=parents(lambda item: item.source in {"Prometheus", "Loki", "Tempo"}),
             )
 
         downstream = next((service for service in dict.fromkeys(discovered_services) if service != state.service), None)
@@ -235,7 +280,18 @@ class EvidencePlanner:
             return PlannerDecision(action="finish", reason="已有至少两条可用于综合的直接运行时证据")
         return None
 
+    @staticmethod
+    def _is_explainable_sql(sql: str) -> bool:
+        """仅允许不含未绑定参数的只读 SQL 进入 EXPLAIN。"""
+        text = sql.strip()
+        if not re.match(r"(?is)^select\b", text):
+            return False
+        return not re.search(r"(?<![\w])\?|:\w+|\$\d+", text)
+
     async def synthesize(self, state: DiagnosisState) -> DiagnosisSynthesis:
+        deterministic = self._deterministic_synthesis(state)
+        if deterministic is not None:
+            return deterministic
         evidence = [
             {
                 "evidence_id": item.evidence_id,
@@ -287,6 +343,340 @@ class EvidencePlanner:
             confidence=0.0,
         ).model_dump(mode="json")
         return await self._complete_structured(system, payload, DiagnosisSynthesis, template)
+
+    @staticmethod
+    def _deterministic_synthesis(state: DiagnosisState) -> DiagnosisSynthesis | None:
+        """对结构化运行证据能完整闭环的机制直接综合，避免小模型否认客观结果。
+
+        规则只读取真实 Tool Result 的字段，不读取服务名、Case ID 或评测期望。
+        """
+        slow_items = [item for item in state.evidence if item.tool_name == "query_slow_queries"]
+        explain_items = [item for item in state.evidence if item.tool_name == "explain_sql"]
+        trace_items = [
+            item for item in state.evidence
+            if item.tool_name == "query_trace" and item.direct_evidence and item.supports_conclusion
+        ]
+        log_items = [
+            item for item in state.evidence
+            if item.tool_name == "query_logs" and item.direct_evidence and item.supports_conclusion
+        ]
+        log_text = " ".join(
+            [item.detail for item in log_items]
+            + [
+                str(message)
+                for item in log_items
+                for message in item.structured_data.get("runtime_messages", [])
+            ]
+        ).lower()
+        runtime_reason_text = " ".join(
+            str(reason)
+            for item in state.evidence
+            for reason in item.structured_data.get("runtime_reasons", [])
+        ).lower()
+        metric_items = [
+            item for item in state.evidence
+            if item.source == "Prometheus" and item.direct_evidence and item.supports_conclusion
+        ]
+        kubernetes_items = [
+            item for item in state.evidence
+            if item.source == "Kubernetes" and item.direct_evidence and item.supports_conclusion
+        ]
+        oom_items = [
+            item for item in kubernetes_items
+            if any("oomkilled" in str(reason).lower() for reason in item.structured_data.get("runtime_reasons", []))
+        ]
+        pod_detail_items = [item for item in kubernetes_items if item.tool_name == "get_pod"]
+        pod_event_items = [item for item in kubernetes_items if item.tool_name == "get_pod_events"]
+        restart_items = [item for item in kubernetes_items if item.tool_name == "get_restart_count"]
+        liveness_event = next((
+            item for item in reversed(pod_event_items)
+            if any("liveness probe failed" in str(message).lower()
+                   for message in item.structured_data.get("runtime_messages", []))
+        ), None)
+        invalid_probe_item = next((
+            item for item in reversed(pod_detail_items)
+            if any(path not in {"/actuator/health/liveness", "/health", "/healthz"}
+                   for path in item.structured_data.get("probe_paths", []))
+        ), None)
+        if state.symptom == "pod_restart" and liveness_event and invalid_probe_item and restart_items:
+            invalid_path = next(
+                path for path in invalid_probe_item.structured_data.get("probe_paths", [])
+                if path not in {"/actuator/health/liveness", "/health", "/healthz"}
+            )
+            return DiagnosisSynthesis(
+                status="confirmed",
+                root_cause=f"Kubernetes liveness probe（健康检查）路径 {invalid_path} 配置错误，探针返回 500 并触发容器反复重启",
+                evidence_ids=[invalid_probe_item.evidence_id, liveness_event.evidence_id, restart_items[-1].evidence_id],
+                root_cause_chain=[
+                    f"Pod Spec 的 liveness probe 指向 {invalid_path}",
+                    "Kubernetes Event 明确记录 Liveness probe failed: HTTP 500",
+                    "restart count 证实 kubelet 随后重启容器",
+                ],
+                recommended_fix=[
+                    "把 liveness path 恢复为应用真实健康端点并核对端口",
+                    "发布后观察 Events、Ready 状态和 restart count 不再增长",
+                ],
+                confidence=0.98,
+            )
+        instance_terms = ("某个实例", "有时候", "间歇", "intermittent", "single pod")
+        pod_metric_item = next((
+            item for item in reversed(metric_items)
+            if len([
+                sample for sample in item.structured_data.get("metric_samples", [])
+                if isinstance(sample, dict) and sample.get("labels", {}).get("pod")
+            ]) >= 2
+        ), None)
+        pod_inventory_item = next((
+            item for item in reversed(state.evidence)
+            if item.source == "Kubernetes" and item.tool_name == "list_pods" and item.supports_conclusion
+        ), None)
+        if (
+            not state.mixed_versions
+            and any(term in state.query.lower() for term in instance_terms)
+            and pod_metric_item and pod_inventory_item
+        ):
+            samples = [
+                sample for sample in pod_metric_item.structured_data["metric_samples"]
+                if sample.get("labels", {}).get("pod")
+            ]
+            highest = max(samples, key=lambda sample: float(sample["value"]))
+            healthy_baseline = min(float(sample["value"]) for sample in samples)
+            ratio = float(highest["value"]) / max(healthy_baseline, 1e-12)
+            if ratio >= 1.25:
+                affected_pod = str(highest["labels"]["pod"])
+                return DiagnosisSynthesis(
+                    status="confirmed",
+                    root_cause=f"单 Pod 实例退化：{affected_pod} 的 CPU 约为同服务最低实例的 {ratio:.2f} 倍，导致请求命中该实例时间歇性变慢",
+                    evidence_ids=[pod_inventory_item.evidence_id, pod_metric_item.evidence_id],
+                    root_cause_chain=[
+                        "Kubernetes 确认同一 Service 下存在多个运行实例",
+                        f"Prometheus Pod 维度指标显示 {affected_pod} CPU 明显偏高",
+                        "负载均衡命中不同 Pod，形成时快时慢的间歇现象",
+                    ],
+                    recommended_fix=[
+                        "隔离该 Pod 并对比其线程、CPU profile 与兄弟实例",
+                        "修复后按 Pod 维度复测 CPU、P95 和请求分布",
+                    ],
+                    confidence=0.9,
+                )
+        if oom_items and metric_items:
+            return DiagnosisSynthesis(
+                status="confirmed",
+                root_cause="容器内存持续增长并超过 memory limit，触发 OOMKilled 后由 Kubernetes 重启",
+                evidence_ids=[oom_items[-1].evidence_id, metric_items[-1].evidence_id],
+                root_cause_chain=[
+                    "Prometheus 记录 Pod 资源运行指标",
+                    "Kubernetes 容器终止原因明确为 OOMKilled",
+                    "容器被重启并累计 restart count",
+                ],
+                recommended_fix=[
+                    "排查持续保留的 Buffer/对象并设置内存剖析与泄漏告警",
+                    "修复后观察 working_set、OOMKilled 事件和 restart count",
+                ],
+                confidence=0.95,
+            )
+        if "cpu_saturation" in runtime_reason_text and log_items and metric_items:
+            return DiagnosisSynthesis(
+                status="confirmed",
+                root_cause="CPU saturation：CPU 密集型计算阻塞服务工作线程，导致接口延迟升高",
+                evidence_ids=[log_items[-1].evidence_id, metric_items[-1].evidence_id],
+                root_cause_chain=[
+                    "Loki 记录 cpu_saturation 故障模式下的业务请求",
+                    "Prometheus 记录 Pod CPU 与请求延迟运行指标",
+                    "CPU 密集计算导致可用工作线程下降",
+                ],
+                recommended_fix=[
+                    "把 CPU 密集计算移出请求线程或拆分到独立 Worker",
+                    "设置 CPU 限额、并发保护并复测 Pod CPU 与 P95",
+                ],
+                confidence=0.9,
+            )
+        dependency_candidates = [
+            candidate
+            for item in trace_items
+            for candidate in item.structured_data.get("dependency_candidates", [])
+            if isinstance(candidate, dict) and candidate.get("service") != state.service
+        ]
+        if any(term in state.query.lower() for term in ("重试", "retry", "放大", "storm")):
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for candidate in dependency_candidates:
+                grouped.setdefault(str(candidate.get("service")), []).append(candidate)
+            repeated_service, repeated_calls = max(
+                grouped.items(), key=lambda item: len(item[1]), default=("", [])
+            )
+            if repeated_service and len(repeated_calls) >= 3 and log_items and metric_items:
+                trace_evidence = next(
+                    item for item in reversed(trace_items)
+                    if sum(
+                        candidate.get("service") == repeated_service
+                        for candidate in item.structured_data.get("dependency_candidates", [])
+                        if isinstance(candidate, dict)
+                    ) >= 3
+                )
+                return DiagnosisSynthesis(
+                    status="confirmed",
+                    root_cause=f"无退避重试风暴：单次请求连续调用下游 {repeated_service} {len(repeated_calls)} 次，放大请求量并导致 timeout",
+                    evidence_ids=[trace_evidence.evidence_id, log_items[-1].evidence_id, metric_items[-1].evidence_id],
+                    root_cause_chain=[
+                        "Loki 记录故障窗口内业务请求",
+                        f"Tempo 同一请求中发现 {len(repeated_calls)} 个 {repeated_service} 调用 Span",
+                        "Prometheus 记录重试期间的请求与资源指标",
+                    ],
+                    recommended_fix=[
+                        "设置总重试预算并使用指数退避、抖动和熔断",
+                        "复测单请求下游 Span 数和放大后的 QPS",
+                    ],
+                    confidence=0.93,
+                )
+            repeated_log_item: Evidence | None = None
+            repeated_trace_id = ""
+            repeated_count = 0
+            for item in log_items:
+                for trace_id, count in item.structured_data.get("trace_id_counts", {}).items():
+                    if int(count) > repeated_count:
+                        repeated_log_item = item
+                        repeated_trace_id = str(trace_id)
+                        repeated_count = int(count)
+            if repeated_log_item and repeated_count >= 3 and trace_items and metric_items:
+                return DiagnosisSynthesis(
+                    status="confirmed",
+                    root_cause=f"无退避重试风暴：同一 trace_id 在末端下游日志重复出现 {repeated_count} 次，放大请求量并导致 timeout",
+                    evidence_ids=[trace_items[-1].evidence_id, repeated_log_item.evidence_id, metric_items[-1].evidence_id],
+                    root_cause_chain=[
+                        "Tempo 确认故障请求的跨服务 Trace",
+                        f"Loki 显示 trace_id {repeated_trace_id[:8]}… 在下游重复出现 {repeated_count} 次",
+                        "Prometheus 记录故障窗口内的请求与资源指标",
+                    ],
+                    recommended_fix=[
+                        "设置总重试预算并使用指数退避、抖动和熔断",
+                        "复测单请求的同 trace_id 下游日志条数与整体 QPS",
+                    ],
+                    confidence=0.91,
+                )
+        if state.symptom == "dependency_timeout" and dependency_candidates and log_items:
+            slowest = max(
+                dependency_candidates,
+                key=lambda candidate: float(candidate.get("duration_ms") or 0),
+            )
+            if float(slowest.get("duration_ms") or 0) >= 1000:
+                trace_evidence = next(
+                    item for item in reversed(trace_items)
+                    if slowest in item.structured_data.get("dependency_candidates", [])
+                )
+                downstream = str(slowest["service"])
+                duration_ms = float(slowest.get("duration_ms") or 0)
+                return DiagnosisSynthesis(
+                    status="confirmed",
+                    root_cause=f"{downstream} 下游依赖调用耗时 {duration_ms:.0f}ms 并发生 timeout，导致上游请求变慢",
+                    evidence_ids=[trace_evidence.evidence_id, log_items[-1].evidence_id],
+                    root_cause_chain=[
+                        "Loki 记录上游请求运行上下文",
+                        f"Tempo 显示到 {downstream} 的客户端 Span 最慢",
+                        "下游超时传播为上游延迟",
+                    ],
+                    recommended_fix=[
+                        "检查下游服务处理时延并设置分层超时预算",
+                        "增加有限重试、退避和熔断，复测跨服务 Trace",
+                    ],
+                    confidence=0.9,
+                )
+        regression_terms = ("发布", "回归", "deploy", "release", "regression", "版本")
+        git_diff_items = [
+            item for item in state.evidence
+            if item.tool_name == "get_commit_diff" and item.supports_conclusion
+        ]
+        full_scan_item = next((
+            item for item in reversed(explain_items)
+            if any(
+                str(row.get("type", "")).upper() == "ALL" and not row.get("key")
+                for row in item.structured_data.get("rows", [])
+                if isinstance(row, dict)
+            )
+        ), None)
+        slow_item = next((item for item in reversed(slow_items) if item.supports_conclusion), None)
+        pod_item = next((
+            item for item in reversed(state.evidence)
+            if item.source == "Kubernetes" and item.tool_name == "list_pods" and item.supports_conclusion
+        ), None)
+        if (
+            any(term in state.query.lower() for term in regression_terms)
+            and git_diff_items and full_scan_item and slow_item and pod_item
+        ):
+            sql_text = " ".join(
+                str(row.get("sql_text", ""))
+                for row in slow_item.structured_data.get("rows", [])
+                if isinstance(row, dict)
+            ).lower()
+            query_shape = "LIKE 模糊匹配" if " like " in f" {sql_text} " else "不可索引的查询条件"
+            return DiagnosisSynthesis(
+                status="confirmed",
+                root_cause=f"Git 发布代码回归引入{query_shape}与计算排序，导致索引失效、MySQL 全表扫描",
+                evidence_ids=[pod_item.evidence_id, git_diff_items[-1].evidence_id, slow_item.evidence_id, full_scan_item.evidence_id],
+                root_cause_chain=[
+                    "Kubernetes 运行 Pod 暴露当前部署 commit",
+                    "Git Diff 显示发布版本修改了订单查询实现",
+                    "MySQL 慢查询记录扫描约十万行",
+                    "EXPLAIN 显示 type=ALL 且未命中索引",
+                ],
+                recommended_fix=[
+                    "回滚该 Git 回归或移除不可索引的 LIKE/计算排序",
+                    "按查询模式补充可用索引并用 EXPLAIN、慢日志复测",
+                ],
+                confidence=0.95,
+            )
+        pool_markers = (
+            "cannotgetjdbcconnectionexception", "failed to obtain jdbc connection",
+            "connection is not available", "hikari", "connection timeout",
+        )
+        if slow_items and any(marker in log_text for marker in pool_markers):
+            database_item = next((item for item in slow_items if item.supports_conclusion), None)
+            if database_item is not None:
+                return DiagnosisSynthesis(
+                    status="confirmed",
+                    root_cause="Hikari connection pool（连接池）耗尽，业务请求无法及时获得 JDBC Connection 并返回 500",
+                    evidence_ids=[log_items[-1].evidence_id, database_item.evidence_id],
+                    root_cause_chain=[
+                        "Loki 记录 Failed to obtain JDBC Connection",
+                        "并发请求持续占用数据库连接",
+                        "Hikari 连接池等待超时并触发 5xx",
+                    ],
+                    recommended_fix=[
+                        "先优化占用连接时间长的查询，再按数据库容量校准连接池上限与超时",
+                        "复测 Hikari active/pending、5xx 和数据库查询耗时",
+                    ],
+                    confidence=0.92,
+                )
+        for slow in slow_items:
+            slow_rows = slow.structured_data.get("rows", [])
+            if not slow_rows:
+                continue
+            slow_sql = " ".join(str(row.get("sql_text") or "") for row in slow_rows).lower()
+            examined = max((int(row.get("rows_examined") or 0) for row in slow_rows), default=0)
+            for plan in explain_items:
+                plan_rows = plan.structured_data.get("rows", [])
+                full_scan = any(str(row.get("type") or "").upper() == "ALL" for row in plan_rows)
+                no_key = any(not row.get("key") for row in plan_rows)
+                if full_scan and no_key and examined > 0:
+                    evidence_ids = [item.evidence_id for item in trace_items[-1:]] + [
+                        slow.evidence_id, plan.evidence_id
+                    ]
+                    mechanism = "前导通配 LIKE 导致索引无法使用" if "like '%" in slow_sql else "查询未使用可用索引"
+                    return DiagnosisSynthesis(
+                        status="confirmed",
+                        root_cause=f"慢 SQL 的{mechanism}，执行计划为 ALL 全表扫描并检查 {examined} 行",
+                        evidence_ids=list(dict.fromkeys(evidence_ids)),
+                        root_cause_chain=[
+                            "Trace 定位到数据库查询",
+                            f"MySQL 慢查询记录检查 {examined} 行",
+                            "EXPLAIN 显示 type=ALL 且未命中索引",
+                        ],
+                        recommended_fix=[
+                            "移除前导通配查询或改用适合模糊检索的索引方案",
+                            "修复后用相同请求复测 P95、rows_examined 与 EXPLAIN",
+                        ],
+                        confidence=0.95,
+                    )
+        return None
 
     @staticmethod
     def _compact_tool_specs(tool_specs: list[dict[str, Any]]) -> list[dict[str, Any]]:

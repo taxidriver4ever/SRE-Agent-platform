@@ -27,8 +27,13 @@ class IntentWorkflowRouter:
         *,
         conversation_id: str | None = None,
         user_id: str | None = None,
+        selected_services: list[str] | None = None,
     ) -> DiagnosisReport | IntentReply:
-        decision = await self.intent_router.classify(message)
+        selected = list(dict.fromkeys(selected_services or []))
+        classification_message = message
+        if selected:
+            classification_message = f"{message}\n用户选择的初始服务范围：{', '.join(selected)}"
+        decision = await self.intent_router.classify(classification_message)
         if on_event:
             await on_event({"type": "intent", **decision.model_dump(mode="json")})
 
@@ -38,9 +43,10 @@ class IntentWorkflowRouter:
                 on_event,
                 conversation_id=conversation_id,
                 user_id=user_id,
-                target=decision.target,
+                target=decision.target or (selected[0] if selected else None),
                 symptom=decision.symptom,
                 system_scan=decision.intent is SREIntent.GENERAL_DIAGNOSIS,
+                selected_services=selected,
             )
 
         reply = self._reply(decision, conversation_id)

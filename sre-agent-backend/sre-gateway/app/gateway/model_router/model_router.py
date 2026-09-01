@@ -14,7 +14,7 @@ class ModelRoute:
 class ModelRouter:
     """使用显式前缀和安全默认规则选择模型厂商。"""
 
-    PREFIXES = {"openai", "claude", "deepseek", "ollama"}
+    PREFIXES = {"openai", "claude", "deepseek", "vllm", "ollama"}
 
     def route(self, requested_model: str) -> ModelRoute:
         """解析 ``provider/model``，无前缀时根据模型名推断厂商。"""
@@ -29,7 +29,6 @@ class ModelRouter:
         if lowered.startswith("deepseek"):
             return ModelRoute(provider="deepseek", model=requested_model)
 
-        # 未显式指定时默认 OpenAI；Ollama 必须使用 ollama/ 前缀，避免把未知
-        # 公网模型意外路由到本机服务。
+        # 未显式指定时默认 OpenAI；本地 Provider 必须使用显式前缀，避免把
+        # 未知公网模型意外路由到本机服务。
         return ModelRoute(provider="openai", model=requested_model)
-

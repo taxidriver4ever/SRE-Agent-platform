@@ -1,8 +1,7 @@
 """Gateway 完整调用链、模型路由和 Usage/Logs 测试。"""
 
-import sqlite3
-
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
 from app.gateway.model_router import ModelRouter
 from app.gateway.protocol import ProtocolParser
@@ -51,13 +50,22 @@ class RecordingOllamaAdapter(FakeProviderAdapter):
         return await super().complete(request, model)
 
 
-def test_model_router_supports_four_providers():
-    """显式前缀和模型名称可以路由到四个目标厂商。"""
+class RecordingVllmAdapter(RecordingOllamaAdapter):
+    """记录网关传给 vLLM 的 served model name。"""
+
+    provider_name = "vllm"
+
+
+def test_model_router_supports_local_and_cloud_providers():
+    """显式前缀和模型名称可以路由到本地与云端目标厂商。"""
     router = ModelRouter()
 
     assert router.route("openai/gpt-4o-mini").provider == "openai"
     assert router.route("claude/claude-sonnet-4").provider == "claude"
     assert router.route("deepseek/deepseek-chat").provider == "deepseek"
+    vllm_route = router.route("vllm/qwen3-4b")
+    assert vllm_route.provider == "vllm"
+    assert vllm_route.model == "qwen3-4b"
     assert router.route("ollama/qwen3:8b").provider == "ollama"
     assert router.route("claude-sonnet-4").provider == "claude"
     assert router.route("deepseek-chat").provider == "deepseek"
@@ -77,10 +85,9 @@ def test_protocol_parser_returns_an_independent_normalized_request():
     assert parsed.messages[0] is not original.messages[0]
 
 
-def test_gateway_endpoint_calls_provider_and_records_usage(tmp_path):
+def test_gateway_endpoint_calls_provider_and_records_usage(gateway_database):
     """受鉴权保护的 Gateway 接口返回统一响应并记录成功 Usage。"""
-    database_path = tmp_path / "gateway.db"
-    app = create_app(database_path)
+    app = create_app(gateway_database)
     with TestClient(app) as client:
         # 替换真实 Adapter，确保测试不依赖外部厂商或 API Key。
         real_service = app.state.gateway_service
@@ -112,27 +119,23 @@ def test_gateway_endpoint_calls_provider_and_records_usage(tmp_path):
         "total_tokens": 17,
     }
 
-    with sqlite3.connect(database_path) as connection:
-        log = connection.execute(
-            """
+    with gateway_database.engine.connect() as connection:
+        log = connection.execute(text("""
             SELECT provider, model, total_tokens, success, status_code
             FROM gateway_usage_logs
-            """
-        ).fetchone()
-        operation = connection.execute(
-            """
+            """)).fetchone()
+        operation = connection.execute(text("""
             SELECT operation, token_id, success, status_code
             FROM gateway_operation_logs
             WHERE operation = 'gateway.chat.completion'
-            """
-        ).fetchone()
+            """)).fetchone()
     assert log == ("openai", "gpt-4o-mini", 17, 1, 200)
     assert operation == ("gateway.chat.completion", 1, 1, 200)
 
 
-def test_gateway_selects_ollama_model_from_each_request(tmp_path):
+def test_gateway_selects_ollama_model_from_each_request(gateway_database):
     """Ollama 模型由每次请求的 model 数据决定，不绑定为 qwen3。"""
-    app = create_app(tmp_path / "ollama-model-selection.db")
+    app = create_app(gateway_database)
     adapter = RecordingOllamaAdapter()
     with TestClient(app) as client:
         real_service = app.state.gateway_service
@@ -160,10 +163,37 @@ def test_gateway_selects_ollama_model_from_each_request(tmp_path):
     assert adapter.models == ["llama3.2:3b", "deepseek-r1:7b"]
 
 
-def test_gateway_failure_returns_502_and_records_failure(tmp_path):
-    """厂商失败时客户端收到 502，SQLite 同时保留失败指标。"""
-    database_path = tmp_path / "gateway-failure.db"
-    app = create_app(database_path)
+def test_gateway_selects_vllm_served_model_name(gateway_database):
+    """vLLM 路由只传递前缀后的稳定 served model name。"""
+    app = create_app(gateway_database)
+    adapter = RecordingVllmAdapter()
+    with TestClient(app) as client:
+        real_service = app.state.gateway_service
+        app.state.gateway_service = GatewayService(
+            ProtocolParser(),
+            ModelRouter(),
+            {"vllm": adapter},
+            real_service.usage_repository,
+            real_service.operation_repository,
+        )
+        token = client.post("/v1/auth/tokens").json()["token"]
+        response = client.post(
+            "/v1/gateway/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "model": "vllm/qwen3-4b",
+                "messages": [{"role": "user", "content": "你好"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["provider"] == "vllm"
+    assert adapter.models == ["qwen3-4b"]
+
+
+def test_gateway_failure_returns_502_and_records_failure(gateway_database):
+    """厂商失败时客户端收到 502，MySQL 同时保留失败指标。"""
+    app = create_app(gateway_database)
     with TestClient(app) as client:
         real_service = app.state.gateway_service
         app.state.gateway_service = GatewayService(
@@ -184,16 +214,16 @@ def test_gateway_failure_returns_502_and_records_failure(tmp_path):
         )
 
     assert response.status_code == 502
-    with sqlite3.connect(database_path) as connection:
-        log = connection.execute(
+    with gateway_database.engine.connect() as connection:
+        log = connection.execute(text(
             "SELECT success, status_code, error_message FROM gateway_usage_logs"
-        ).fetchone()
+        )).fetchone()
     assert log == (0, 500, "provider unavailable")
 
 
-def test_gateway_requires_valid_api_token(tmp_path):
+def test_gateway_requires_valid_api_token(gateway_database):
     """Gateway 模型调用接口必须复用 Auth 模块的 Bearer Token 鉴权。"""
-    app = create_app(tmp_path / "unauthorized.db")
+    app = create_app(gateway_database)
     with TestClient(app) as client:
         response = client.post(
             "/v1/gateway/chat/completions",

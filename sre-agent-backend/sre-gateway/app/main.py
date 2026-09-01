@@ -21,7 +21,7 @@ from app.auth.repository import TokenRepository, initialize_auth_tables
 from app.auth.router import router as auth_router
 from app.auth.service import TokenService
 from app.core.config import (
-    database_path as configured_database_path,
+    mysql_settings,
     provider_settings,
 )
 from app.core.database import Database
@@ -32,6 +32,7 @@ from app.gateway.provider import (
     DeepSeekAdapter,
     OllamaAdapter,
     OpenAIAdapter,
+    VllmAdapter,
 )
 from app.gateway.repository import UsageLogRepository, initialize_gateway_tables
 from app.gateway.router import router as gateway_router
@@ -39,17 +40,21 @@ from app.gateway.service import GatewayService
 from app.operation_log import OperationLogRepository, initialize_operation_log_tables
 
 
-def create_app(database_path: str | Path | None = None) -> FastAPI:
+def create_app(database: Database | None = None) -> FastAPI:
     """创建并配置 FastAPI 应用。
 
     Args:
-        database_path: 可选的 SQLite 路径。生产环境默认读取配置，测试可传入
-            临时数据库，从而避免污染真实数据。
+        database: 可选的 MySQL 数据库对象，测试可注入独立测试库。
 
     Returns:
         已注册生命周期、CORS、Auth 路由和健康检查的 FastAPI 实例。
     """
-    database = Database(database_path or configured_database_path())
+    if database is None:
+        settings = mysql_settings()
+        database = Database(
+            settings.host, settings.port, settings.user,
+            settings.password, settings.database,
+        )
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -83,6 +88,11 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
                 settings.deepseek_base_url,
                 settings.timeout_seconds,
             ),
+            "vllm": VllmAdapter(
+                settings.vllm_api_key,
+                settings.vllm_base_url,
+                settings.timeout_seconds,
+            ),
             "ollama": OllamaAdapter(
                 settings.ollama_base_url,
                 settings.timeout_seconds,
@@ -96,7 +106,7 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
             operation_repository,
         )
         yield
-        # 应用关闭时释放 SQLite 连接，避免测试或热重载残留文件句柄。
+        # 应用关闭时释放 MySQL 连接池。
         database.dispose()
 
     application = FastAPI(title="SRE Agent Backend", lifespan=lifespan)

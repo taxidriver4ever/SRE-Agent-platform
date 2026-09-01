@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
+from pathlib import Path
 from typing import Any
 
 import yaml
@@ -58,7 +60,21 @@ class KubernetesMCPAdapter:
             args.extend(["--kubeconfig", kubeconfig])
         # FastMCP 官方 Client 直接消费 MCP 配置。多 Server 配置会为工具名添加
         # ``kubernetes_`` 前缀，本类在首次连接后也兼容未加前缀的实现。
-        self._client = Client({"mcpServers": {"kubernetes": {"command": command, "args": args}}})
+        child_env = {
+            # 某些 Windows 用户目录由其他账户创建，默认 npm-cache 会直接 EPERM。
+            # 使用系统临时目录既可写又不污染仓库；版本仍固定，因此缓存可复用。
+            "NPM_CONFIG_CACHE": os.getenv(
+                "SRE_NPM_CACHE", str(Path(tempfile.gettempdir()) / "sre-agent-npm-cache")
+            ),
+        }
+        inherited_kubeconfig = kubeconfig or os.getenv("KUBECONFIG")
+        if inherited_kubeconfig:
+            child_env["KUBECONFIG"] = inherited_kubeconfig
+        self._client = Client({
+            "mcpServers": {
+                "kubernetes": {"command": command, "args": args, "env": child_env}
+            }
+        })
         self._entered = False
         self._available_names: set[str] = set()
 

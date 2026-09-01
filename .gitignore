@@ -244,34 +244,18 @@ Desktop.ini
 sre-broken-system/.legacy-monorepo-git/
 
 # -----------------------------------------------------------------------------
-# SRE Agent monorepo local/runtime files
+# Project-local generated artifacts
 # -----------------------------------------------------------------------------
 
-# Local secrets and environment overrides. Keep example templates tracked.
-.env.*
-!.env.example
-!.env.*.example
+# Ad-hoc test environments, reports, rendered documents and scratch scripts.
+.test-runtime/
+.test-venv/
+.runtime/
+output/
+tmp/
 
-# SQLite runtime databases and their journal/WAL sidecar files.
-*.db
-*.db-journal
-*.db-shm
-*.db-wal
-*.sqlite
-*.sqlite3
-*.sqlite-journal
-*.sqlite-shm
-*.sqlite-wal
-
-# Common operating-system and editor files.
-.DS_Store
-Thumbs.db
-Desktop.ini
-*.swp
-*.swo
-*~
-.idea/
-.vscode/
+# Pytest caches created with a custom cache directory name.
+.pytest-cache-*/
 
 # Marimo
 marimo/_static/

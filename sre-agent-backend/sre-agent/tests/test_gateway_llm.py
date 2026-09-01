@@ -18,6 +18,7 @@ def test_gateway_llm_uses_expected_endpoint_and_token():
         assert request.headers["Authorization"] == "Bearer gw_sk_test"
         payload = json.loads(request.content)
         assert payload["model"] == "openai/test-model"
+        assert payload["max_tokens"] == 384
         return httpx.Response(200, json={
             "model": "test-model",
             "provider": "openai",
@@ -29,7 +30,9 @@ def test_gateway_llm_uses_expected_endpoint_and_token():
         """在单一事件循环内创建、使用并关闭异步客户端。"""
         # MockTransport 完全拦截 HTTP，因此测试不会依赖已启动的网关服务。
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        llm = GatewayLLM("http://gateway", "gw_sk_test", "openai/test-model", client=client)
+        llm = GatewayLLM(
+            "http://gateway", "gw_sk_test", "openai/test-model", max_tokens=384, client=client
+        )
         response = await llm.complete([LLMMessage("user", "hello")])
         await client.aclose()
         return response
