@@ -25,6 +25,19 @@ $tempoConfig = Join-Path $infraRoot "observability\tempo.yaml"
 $otelConfig = Join-Path $infraRoot "observability\otel-collector.yaml"
 $alloyConfig = Join-Path $infraRoot "observability\alloy.alloy"
 kubectl -n sre-lab create configmap mysql-init "--from-file=001-schema.sql=$mysqlSql" --dry-run=client -o yaml | kubectl apply -f -
+# MySQL 清单只引用 Secret，不在 Git 中保存密码。全新 Kind 集群没有该对象时，
+# 优先使用显式环境变量；本地未配置时生成随机值。已有 Secret 必须复用，否则
+# 重部署持久卷时会让容器密码与数据目录中的既有 root 密码不一致。
+$mysqlSecret = kubectl -n sre-lab get secret mysql-credentials --ignore-not-found -o name
+if (-not $mysqlSecret) {
+    $mysqlRootPassword = $env:SRE_LAB_MYSQL_ROOT_PASSWORD
+    if (-not $mysqlRootPassword) {
+        $passwordBytes = [byte[]]::new(32)
+        [Security.Cryptography.RandomNumberGenerator]::Fill($passwordBytes)
+        $mysqlRootPassword = [Convert]::ToBase64String($passwordBytes)
+    }
+    kubectl -n sre-lab create secret generic mysql-credentials "--from-literal=root-password=$mysqlRootPassword"
+}
 kubectl apply -f (Join-Path $k8s "database\mysql.yaml")
 kubectl -n sre-lab rollout status deployment/mysql --timeout=240s
 

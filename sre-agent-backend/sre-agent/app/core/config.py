@@ -57,6 +57,7 @@ class Settings:
     repository_cache_path: str
     repository_allowed_hosts: tuple[str, ...]
     tool_timeout_seconds: float
+    diagnosis_deadline_seconds: float
     tool_output_limit: int
     model_context_window: int
     context_compaction_ratio: float
@@ -125,6 +126,8 @@ def get_settings() -> Settings:
         ),
         # 所有外部诊断操作都有统一超时和输出上限，避免卡死或把海量日志灌入模型。
         tool_timeout_seconds=float(os.getenv("TOOL_TIMEOUT_SECONDS", "15")),
+        # 整轮诊断的独立截止时间；它高于单 Tool/LLM 超时，但不会无限等待。
+        diagnosis_deadline_seconds=float(os.getenv("DIAGNOSIS_DEADLINE_SECONDS", "240")),
         tool_output_limit=int(os.getenv("TOOL_OUTPUT_LIMIT", "12000")),
         model_context_window=max(4096, int(os.getenv("MODEL_CONTEXT_WINDOW", "32768"))),
         context_compaction_ratio=min(

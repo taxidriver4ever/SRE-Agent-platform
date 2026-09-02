@@ -111,6 +111,7 @@ class DiagnosisReport(BaseModel):
     recommended_fix: list[str]
     confidence: float = Field(ge=0, le=1)
     token_usage: int = Field(default=0, ge=0)
+    structured_output_retry_count: int = Field(default=0, ge=0)
     candidates: list[CandidateCause]
     investigation_timeline: list[ToolCallRecord]
     workflow_phases: list[WorkflowPhase]
@@ -150,3 +151,4 @@ class DiagnosisState(BaseModel):
     synthesis: DiagnosisSynthesis | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    structured_output_retry_count: int = 0

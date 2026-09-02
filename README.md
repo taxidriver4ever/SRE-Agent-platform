@@ -7,7 +7,9 @@
 ## 目录
 
 - [核心能力](#核心能力)
+- [当前可验证基线](#当前可验证基线)
 - [系统架构](#系统架构)
+- [诊断工作流内部实现](#诊断工作流内部实现)
 - [两种诊断模式](#两种诊断模式)
 - [前端页面与领域模型](#前端页面与领域模型)
 - [意图识别与工作流分流](#意图识别与工作流分流)
@@ -15,12 +17,14 @@
 - [本地端口](#本地端口)
 - [快速开始](#快速开始)
 - [详细配置](#详细配置)
+- [启动后完整健康检查](#启动后完整健康检查)
 - [API 使用说明](#api-使用说明)
 - [MySQL 数据与模块化 SQL](#mysql-数据与模块化-sql)
 - [故障场景](#故障场景)
 - [会话记忆与代码导航](#会话记忆与代码导航)
 - [安全边界](#安全边界)
 - [测试与验收](#测试与验收)
+- [停止与环境复原](#停止与环境复原)
 - [常见问题](#常见问题)
 
 ## 核心能力
@@ -35,6 +39,33 @@
 - Code State 只保存模块、symbol、路径、行号和 commit SHA 等导航信息；源码始终按 Git 版本精确读取。
 - 10 个可重复的真实故障场景，覆盖慢 SQL、连接池耗尽、依赖超时、CPU、OOM、重试风暴和发布异常。
 - 所有诊断工具默认只读，并在用户、会话、仓库、数据库表和 Kubernetes 权限层面限制访问范围。
+
+## 当前可验证基线
+
+以下数据来自 2026-09-02 在本地真实 Kind、Prometheus、Loki、Tempo、MySQL、Git、Gateway 和 Agent 链路上的实测，不是 README 中手工填写的预期值。原始逐次结果保存在 [latest.json](sre-agent-backend/sre-agent/evals/results/latest.json)，每一个失败、工具错误、耗时和 Evidence 状态都会被保留。
+
+| 验证项 | 当前结果 | 说明 |
+| --- | ---: | --- |
+| 固定场景 | 10 个 | `SRE-001`～`SRE-010` |
+| 每场景重复次数 | 3 次 | 共 30 次真实诊断 |
+| 通过次数 | 30 / 30 | `overall_pass_rate = 1.0` |
+| Service Accuracy | 100% | 根因服务定位与 Evaluator 契约一致 |
+| Root Cause Accuracy | 100% | 根因关键词与机制匹配 |
+| Evidence Completion | 100% | Required Evidence 均被真实工具证据覆盖 |
+| 平均 Tool Calls | 9.67 | 不包含 `llm_*` 内部记录 |
+| 平均诊断耗时 | 5.145 秒 | 30 次端到端 API 调用平均值 |
+| P95 诊断耗时 | 9.528 秒 | 按全部 30 次运行统计 |
+| Infrastructure Failure | 0 | 基础设施失败与 Agent 失败分开统计 |
+| Timeout / Insufficient Evidence | 0 / 0 | 本轮固定场景评测结果 |
+| Tool Failure Rate | 1.03% | SRE-004 的非关键数据源失败被隔离，报告仍由完整证据确认 |
+| Structured Output Retry | 0 | 本轮确定性证据规则无需格式重试 |
+| Agent 测试 | 101 passed | 包含并发、deadline、Evidence Gate、策略与数据库测试 |
+| Gateway 测试 | 27 passed | 包含路由、鉴权、MySQL SQL 与 vLLM/Ollama Adapter |
+| Frontend 构建 | passed | Vite 生产构建成功 |
+
+`average_token_usage = 0` 并不表示评测器漏记 Token。本轮十个固定场景都由结构化运行时证据和确定性 Synthesis Rule 完成，没有为了得到答案额外调用生成式模型；如果某次诊断进入 LLM Planner/Synthesis，Gateway 返回的 Token 会正常进入报告。
+
+SRE-008 和 SRE-009 还有额外的 Pod 级严格契约：`affected_pod` 必须非空；SRE-009 必须返回少数 BAD canary Pod 的完整 40 位 Git SHA，并把源码位置定位到 `OrderRepository.java`。只返回 Deployment 多数版本或缩写 SHA 会被 Evaluator 判定为失败。
 
 ## 系统架构
 
@@ -64,6 +95,88 @@ flowchart LR
 ```
 
 一次诊断遵循：确定范围 → 建立通用基线 → Planner 根据当前 Evidence 选择下一步 → 保存父子 Evidence Chain → Evidence Gate 校验引用与直接证据 → 输出报告。Workflow 不包含固定服务、SQL、Trace ID 或 Case 答案；证据不足时明确返回 `insufficient_evidence`。
+
+## 诊断工作流内部实现
+
+### 阶段与状态迁移
+
+一次 Investigation 的公开阶段按以下顺序推进：
+
+```text
+START
+  └─ SYSTEM_SCAN（仅整体巡检）
+       └─ TRIAGE
+            └─ BASELINE
+                 └─ ANALYZE
+                      └─ INVESTIGATE
+                           └─ VERIFY
+                                └─ REPORT
+                                     └─ END
+```
+
+- `TRIAGE`：从可信 Service Catalog 解析服务、语言、仓库、依赖、时间窗口和问题类型。
+- `BASELINE`：先发现 Pod 和运行版本，再读取 Health、P95、5xx、CPU/Memory 与日志基线。
+- `ANALYZE`：把 Tool Result 统一归一化成有界、可引用的 Evidence。
+- `INVESTIGATE`：Planner 只依据当前 Evidence 选择下一步，不读取 Evaluator Expected Answer。
+- `VERIFY`：检查引用、直接证据、空结果和矛盾；Evidence Gate 是 `confirmed` 的唯一入口。
+- `REPORT`：输出服务、Pod、版本、源码位置、因果链、置信度、Evidence 和建议。
+
+### 依赖感知并发
+
+并发不是把所有 Tool 一次性扔进事件循环。工作流先建立数据依赖，再只并发彼此独立的只读操作：
+
+```mermaid
+flowchart LR
+    LP["list_pods\n发现 Pod / SHA"] --> H["get_service_health"]
+    LP --> P95["query_metrics: P95"]
+    LP --> ERR["query_metrics: 5xx"]
+    LP --> RES["query_metrics: CPU / Memory"]
+    LP --> LOG["query_logs"]
+    H --> E["Evidence Store"]
+    P95 --> E
+    ERR --> E
+    RES --> E
+    LOG --> E
+```
+
+| 操作组 | 调度方式 | 原因 |
+| --- | --- | --- |
+| System Scan 的 Deployment 与 Pod 清单 | 并发 | 二者都是独立只读发现操作 |
+| Pod Discovery | 串行前置 | 后续操作需要 Pod、镜像和 Git SHA 运行态事实 |
+| Health、P95、5xx、Resource、Logs | 并发 | 参数已确定，数据源相互独立 |
+| Trace ID → Trace Detail | 串行 | 后一步依赖前一步发现的真实 Trace ID |
+| Slow Query → EXPLAIN | 串行 | EXPLAIN 必须使用实际日志/Trace 中发现且可安全解释的 SQL |
+| Pod Version → Git Diff / Source | 串行 | Git 读取必须绑定 Pod 正在运行的完整 commit |
+
+`max_steps` 在任务调度前预留预算，因此并发扇出不会竞态突破工具步数。每个 Tool 都独立写 Timeline：其中一个数据源异常只产生带 `error` 的 Tool Record，不会取消同组其他请求或丢弃已经收集的 Evidence。
+
+### 整轮截止时间与安全降级
+
+`TOOL_TIMEOUT_SECONDS` 限制单个 Tool，`DIAGNOSIS_DEADLINE_SECONDS` 限制整轮 Workflow。二者用途不同：
+
+- 单工具超时：记录该 Tool 失败并继续其他证据源；
+- 整轮 deadline：停止继续调查，保留已有 Evidence，追加 `workflow_deadline` Timeline；
+- 截止时间触发后仍会发送合法 `final` SSE；
+- 没有通过 Evidence Gate 时只能返回 `insufficient_evidence`，不会伪造 `confirmed`；
+- 会话报告持久化完成后，上下文压缩在后台执行，不把本地模型冷启动时间算入同步诊断耗时；
+- 单轮快速诊断不触发 Conversation Compaction，第二个用户回合以后才具备压缩资格。
+
+### Planner 代码边界
+
+Planner 已拆分成可独立测试的模块，同时保留 `app.workflow.planner.EvidencePlanner` 兼容导入：
+
+| 文件 | 职责 |
+| --- | --- |
+| `app/workflow/planning/models.py` | Planner 内部结构和类型 |
+| `app/workflow/planning/decision_rules.py` | 下一工具选择、Trace/SQL/Pod/Git 决策 |
+| `app/workflow/planning/synthesis_rules.py` | OOM、慢 SQL、连接池、探针、发布回归等证据规则 |
+| `app/workflow/planning/structured.py` | Structured Output 解析、Repair 与有限重试 |
+| `app/workflow/planning/planner.py` | 对外 Planner 编排入口 |
+| `app/workflow/runtime_extractor.py` | 从 Tool Result 提取 Pod、SHA、Trace 和运行版本 |
+| `app/workflow/evidence_gate.py` | confirmed 门槛和最终 DiagnosisReport 构建 |
+| `app/workflow/planner.py` | 旧导入路径兼容 Facade |
+
+业务工作流、Synthesis Rule 和评测器是三层边界。Case ID 与 Expected Answer 只允许出现在 `evals/`，不能进入 Planner、Workflow、Prompt、Service Catalog 或 Tool 参数。
 
 ## 两种诊断模式
 
@@ -208,6 +321,43 @@ JSON 格式错误先进行有限 Repair；字段或类型错误会携带安全�
 
 ## 仓库结构
 
+```text
+SRE-Agent-platform/
+├── README.md
+├── sre-agent-frontend/                 # Vue 3 + Vite 黑白 SRE Console
+│   ├── src/
+│   ├── package.json
+│   └── .env.example
+├── sre-agent-backend/
+│   ├── compose.yml                     # MySQL、vLLM、Ollama 统一基础设施
+│   ├── compose.gpu.yml                 # Ollama GPU 覆盖配置
+│   ├── data/mysql/                     # 应用 MySQL 持久数据，不提交 Git
+│   ├── sre-gateway/
+│   │   ├── app/auth/                   # Gateway Token
+│   │   ├── app/gateway/                # Provider 路由和 Usage
+│   │   ├── app/operation_log/          # 操作审计
+│   │   └── tests/
+│   └── sre-agent/
+│       ├── app/auth/                   # 用户登录与 Token
+│       ├── app/conversation/           # 会话与消息
+│       ├── app/conversation_memory/    # 压缩状态与 Evidence Reference
+│       ├── app/diagnosis/              # Incident / Diagnosis Session
+│       ├── app/workflow/               # Evidence Workflow 与 Planner
+│       ├── app/resources/              # Service / Pod 查询接口
+│       ├── app/audit/                  # Tool Audit
+│       ├── config/                     # Service/Tool 安全策略
+│       ├── evals/                      # SRE-001～010 与结果
+│       └── tests/
+└── sre-broken-system/
+    ├── order-service/                  # Java
+    ├── inventory-service/              # Go
+    ├── payment-service/                # Python
+    ├── user-service/                   # TypeScript
+    ├── recommendation-service/         # Python
+    ├── notification-service/           # Go
+    └── sre-lab-infra/                  # Kind、Observability、场景脚本
+```
+
 | 目录 | 作用 | 文档 |
 | --- | --- | --- |
 | `sre-agent-backend/sre-agent` | FastAPI Agent、工作流、MCP、会话记忆和 Code State | [Agent README](sre-agent-backend/sre-agent/README.md) |
@@ -232,6 +382,24 @@ JSON 格式错误先进行有限 Repair；字段或类型错误会携带安全�
 | Lab MySQL / Agent MySQL | `13307` / `13308` |
 
 ## 快速开始
+
+平台不是单进程应用，推荐严格按依赖顺序启动：
+
+```text
+Docker Desktop
+├── Application MySQL :13308
+├── vLLM :18000 或 Ollama :11434
+└── Kind SRE Lab
+    ├── 六个 Broken Services
+    ├── Lab MySQL :13307
+    └── Prometheus / Loki / Tempo
+
+Gateway :8000
+└── Agent :8001
+    └── Frontend :3000
+```
+
+先启动 MySQL 和推理 Provider，再启动 Gateway；Agent 依赖 Gateway、应用 MySQL和可观测性数据源；前端最后启动。若顺序颠倒，进程不一定立即退出，但登录、模型请求或诊断会返回连接错误。
 
 ### 1. 环境要求
 
@@ -450,7 +618,29 @@ npm run dev
 | `CONTEXT_COMPACTION_RATIO` | `0.80` | 触发会话压缩的预算比例 |
 | `CONTEXT_RESERVED_OUTPUT_TOKENS` | `4096` | 为下一次输出预留的 Token |
 | `TOOL_TIMEOUT_SECONDS` | `15` | 单工具调用超时 |
+| `DIAGNOSIS_DEADLINE_SECONDS` | `240` | 整轮诊断硬截止时间；范围限制为 0.01～3600 秒 |
 | `TOOL_OUTPUT_LIMIT` | `12000` | 单工具结果最大字符数 |
+| `SRE_DEFAULT_PROJECT_ID` | `sre-lab` | 服务端默认项目策略 ID |
+| `SRE_REPOSITORY_PATH` | `D:\SRE-Agent-platform\sre-broken-system` | 本地只读业务仓库根目录 |
+| `SRE_REPOSITORY_CACHE_PATH` | `.repository-cache` | 远程只读仓库缓存目录 |
+| `PROMETHEUS_BEARER_TOKEN` | 空 | 可选，只由服务端注入 Metrics 请求头 |
+| `LOKI_BEARER_TOKEN` | 空 | 可选，只由服务端注入 Logs 请求头 |
+
+### Gateway 关键环境变量
+
+| 变量 | 默认值/示例 | 说明 |
+| --- | --- | --- |
+| `GATEWAY_MYSQL_HOST` / `PORT` | `127.0.0.1:13308` | Gateway 应用数据库地址 |
+| `GATEWAY_MYSQL_USER` | `sre_agent` | 应用 MySQL 用户 |
+| `GATEWAY_MYSQL_PASSWORD` | 无默认值 | 必填，不能提交到 Git |
+| `GATEWAY_MYSQL_DATABASE` | `sre_agent` | Gateway Schema 所在数据库 |
+| `VLLM_BASE_URL` | `http://127.0.0.1:18000/v1` | OpenAI-compatible vLLM 地址 |
+| `VLLM_API_KEY` | `EMPTY` | 本地占位默认值；正式环境必须替换 |
+| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama 地址 |
+| `OPENAI_API_KEY` | 空 | 使用 `openai/*` 路由时必填 |
+| `CLAUDE_API_KEY` | 空 | 使用 `claude/*` 路由时必填，兼容 `ANTHROPIC_API_KEY` |
+| `DEEPSEEK_API_KEY` | 空 | 使用 `deepseek/*` 路由时必填 |
+| `PROVIDER_TIMEOUT_SECONDS` | `180` | Gateway 等待模型 Provider 的超时 |
 
 ### Gateway 模型路由
 
@@ -472,6 +662,56 @@ npm run dev
 | `VITE_UI_PREVIEW` | `false` | 仅用于无后端 UI 评审，正式运行必须为 `false` |
 
 修改 `.env.local` 后必须重启 Vite。浏览器不应直接访问 Gateway、vLLM、Ollama、MySQL 或 Kubernetes。
+
+## 启动后完整健康检查
+
+不要只看到前端页面就认为全链路已经可用。建议依次执行以下检查：
+
+```powershell
+# 1. Docker 基础设施
+Set-Location D:\SRE-Agent-platform\sre-agent-backend
+docker compose -f compose.yml ps
+
+# 2. Gateway / Agent
+Invoke-RestMethod http://127.0.0.1:8000/health
+Invoke-RestMethod http://127.0.0.1:8001/health
+
+# 3. 推理 Provider，按实际启用项检查
+Invoke-RestMethod http://127.0.0.1:18000/health
+Invoke-RestMethod http://127.0.0.1:11434/api/tags
+
+# 4. SRE Lab 与可观测性
+kubectl --context kind-sre-lab -n sre-lab get pods
+Invoke-RestMethod http://127.0.0.1:19090/-/healthy
+Invoke-RestMethod http://127.0.0.1:13100/ready
+Invoke-RestMethod http://127.0.0.1:13200/ready
+```
+
+Kubernetes 输出中业务服务、MySQL、Alloy、Prometheus、Loki、Tempo 和 OTel Collector 应为 `Running` 且 `READY` 列为 `1/1`。刚执行故障场景时，某些 Pod Restart 或短暂 NotReady 是预期现象；执行 `reset-lab.ps1` 后应重新恢复。
+
+随后验证认证与模型链路：
+
+```powershell
+# Gateway Token 是否有效
+Invoke-RestMethod http://127.0.0.1:8000/v1/auth/check `
+  -Headers @{ Authorization = "Bearer gw_sk_你的Token" }
+
+# Agent 登录；账号从 Agent .env 读取，不要把密码直接写进脚本仓库
+$loginBody = @{
+  username = "你的用户名"
+  password = "你的密码"
+} | ConvertTo-Json
+
+$login = Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8001/api/auth/login `
+  -ContentType application/json `
+  -Body $loginBody
+
+Invoke-RestMethod http://127.0.0.1:8001/api/auth/me `
+  -Headers @{ Authorization = "Bearer $($login.access_token)" }
+```
+
+最终打开 `http://127.0.0.1:3000`，确认服务目录不是 Preview Mock 数据，并执行一次 Service Detail 快速诊断和一次 Event Diagnosis。这样才能同时覆盖前端、Agent 鉴权、Gateway、Provider、Tool Runtime 和可观测性数据源。
 
 ## API 使用说明
 
@@ -742,16 +982,31 @@ docker compose -f compose.yml up -d mysql
 
 # Agent
 Set-Location .\sre-agent
-.\.venv\Scripts\python.exe -B -m pytest -q -p no:cacheprovider
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -B -m pytest -q
 
 # Gateway
 Set-Location ..\sre-gateway
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install "pytest>=8,<10"
 .\.venv\Scripts\python.exe -B -m pytest -q -p no:cacheprovider
 
 # Frontend
 Set-Location ..\..\sre-agent-frontend
 npm run build
 ```
+
+Agent 的 `pytest.ini` 已关闭 `cacheprovider`。这是因为部分受限 Windows 工作区不允许 pytest 原子创建 `.pytest_cache`，关闭缓存只会失去 `lastfailed` 等本地便利功能，不改变测试收集、Fixture、断言或退出码；Agent 命令中无需再次手动传 `-p no:cacheprovider`。Gateway 尚未设置项目级 pytest 配置，因此上面的 Gateway 命令显式关闭缓存。
+
+当前完整验证结果：
+
+```text
+Agent:   101 passed, 1 Starlette/httpx deprecation warning
+Gateway:  27 passed
+Frontend: vite production build passed
+```
+
+弃用警告来自 FastAPI TestClient 的上游兼容层，不影响当前运行和测试结论；升级 Starlette/httpx 时应单独处理，不能通过屏蔽失败或降低断言规避。
 
 如果只验证不需要 MySQL 的领域逻辑，可跳过项目级 `conftest.py`：
 
@@ -780,16 +1035,123 @@ Set-Location D:\SRE-Agent-platform\sre-agent-backend\sre-agent
 
 ### 端到端评测
 
-端到端评测可在 Agent 目录运行：
+评测器本身不会注入故障。必须先激活一个场景，再只运行对应 Case，避免把一个场景的证据错误地用于另一个 Case。单项调试：
 
 ```powershell
-# 单项调试
-python evals/run_evals.py --case SRE-001
-# 固定全量 SRE-001～SRE-010，并写入 evals/results/latest.json
-python evals/run_evals.py
+Set-Location D:\SRE-Agent-platform\sre-broken-system\sre-lab-infra
+.\scripts\run-scenario.ps1 -Scenario SRE-001
+
+Set-Location D:\SRE-Agent-platform\sre-agent-backend\sre-agent
+.\.venv\Scripts\python.exe evals\run_evals.py --case SRE-001 --runs 3
+
+# 结束后恢复 GOOD 基线
+Set-Location D:\SRE-Agent-platform\sre-broken-system\sre-lab-infra
+.\scripts\reset-lab.ps1
 ```
 
-Runner 只把 Case 的 `symptom` 发送给 Agent；Expected Answer、Required Evidence 与 Forbidden Shortcuts 只存在于 Evaluator。报告保留所有失败 Case，并统计 Service Accuracy、Root Cause Accuracy、Evidence Completion、平均 Tool Calls、平均耗时和平均 Token Usage。README 只展示成功完成的真实全量结果，不填造 100% 数据。
+严格全量复现需要逐场景注入、逐场景运行三次，再合并十个批次：
+
+```powershell
+$projectRoot = 'D:\SRE-Agent-platform'
+$agentRoot = Join-Path $projectRoot 'sre-agent-backend\sre-agent'
+$infraRoot = Join-Path $projectRoot 'sre-broken-system\sre-lab-infra'
+$batchRoot = Join-Path $agentRoot 'evals\results\batches'
+New-Item -ItemType Directory -Path $batchRoot -Force | Out-Null
+
+foreach ($index in 1..10) {
+  $caseId = 'SRE-{0:D3}' -f $index
+  & (Join-Path $infraRoot 'scripts\run-scenario.ps1') -Scenario $caseId
+  if ($LASTEXITCODE -ne 0) { throw "$caseId 场景注入失败" }
+
+  & (Join-Path $agentRoot '.venv\Scripts\python.exe') `
+    (Join-Path $agentRoot 'evals\run_evals.py') `
+    --case $caseId `
+    --runs 3 `
+    --output (Join-Path $batchRoot "eval-$caseId.json")
+  if ($LASTEXITCODE -ne 0) { throw "$caseId 评测失败" }
+}
+
+& (Join-Path $agentRoot '.venv\Scripts\python.exe') `
+  (Join-Path $agentRoot 'evals\merge_results.py') `
+  --input-directory $batchRoot `
+  --output (Join-Path $agentRoot 'evals\results\latest.json')
+
+& (Join-Path $infraRoot 'scripts\reset-lab.ps1')
+```
+
+Runner 只把 Case 的 `symptom + project_id` 发送给 Agent；Case ID、Expected Root Cause、Required Evidence 与 Forbidden Shortcuts 只存在于 Evaluator。基础设施连接失败会被分类为 `infrastructure`，证据、根因或状态不符合契约则分类为 `agent`，二者不会混成一个模糊失败率。
+
+本轮每 Case 结果如下；时间单位均为毫秒：
+
+| Case | 通过 | 平均 Tool Calls | 平均耗时 | P95 | Tool Failure Rate |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| SRE-001 | 3/3 | 9.00 | 6253.00 | 9528 | 0% |
+| SRE-002 | 3/3 | 10.00 | 7449.00 | 11088 | 0% |
+| SRE-003 | 3/3 | 8.00 | 4621.33 | 4681 | 0% |
+| SRE-004 | 3/3 | 8.00 | 4637.00 | 4832 | 12.5% |
+| SRE-005 | 3/3 | 9.00 | 5094.00 | 5287 | 0% |
+| SRE-006 | 3/3 | 12.00 | 6566.00 | 6631 | 0% |
+| SRE-007 | 3/3 | 11.00 | 3734.00 | 3835 | 0% |
+| SRE-008 | 3/3 | 8.00 | 3383.00 | 3454 | 0% |
+| SRE-009 | 3/3 | 12.00 | 4502.33 | 4648 | 0% |
+| SRE-010 | 3/3 | 9.67 | 5209.33 | 5521 | 0% |
+
+SRE-004 的 12.5% 是该 Case 内 `tool_failures / tool_calls`，不是 Case 失败率。失败的非关键 Tool 已写入 Timeline，其他来源仍满足 Required Evidence 和 Evidence Gate，所以三次 Diagnosis 均为 `confirmed`。Evaluator 不会为追求 100% 把这类工具失败从结果中删除。
+
+### 并发与失败隔离专项验收
+
+`tests/test_baseline_concurrency.py` 专门验证以下契约：
+
+- Pod Discovery 一定早于依赖它的 Baseline 扇出；
+- 五个模拟 80ms 的独立查询不再串行累计约 400ms；
+- 同组一个 Tool 抛错时，其他 Evidence 仍可完成；
+- 并发任务在调度前受 `max_steps` 限制；
+- 整轮 deadline 后仍返回 `final + insufficient_evidence`；
+- Planner Gateway 失败会进入 Timeline，不会逃逸成未处理异常。
+
+本地隔离基准中，串行 Baseline 约 572.0ms，并发后约 182.6ms，约为 3.13 倍加速。该数字用于说明调度优化，不代替上面的 30 次真实端到端诊断耗时。
+
+## 停止与环境复原
+
+### 恢复故障实验环境
+
+测试完成后先恢复 GOOD 镜像、正常副本数、探针和 Pod Fault Mode：
+
+```powershell
+Set-Location D:\SRE-Agent-platform\sre-broken-system\sre-lab-infra
+.\scripts\reset-lab.ps1
+kubectl --context kind-sre-lab -n sre-lab get pods
+```
+
+### 停止前端、Agent 与 Gateway
+
+在各自 PowerShell 窗口按 `Ctrl+C`。如果是 PyCharm 启动，使用对应 Run Configuration 的 Stop。不要通过删除虚拟环境或强制结束 Docker Desktop 代替正常停止。
+
+### 停止模型与应用 MySQL
+
+```powershell
+Set-Location D:\SRE-Agent-platform\sre-agent-backend
+
+# 停止但保留容器、MySQL 数据和模型缓存
+docker compose -f compose.yml stop
+
+# 删除 Compose 容器和网络，但保留命名模型 Volume 与 data/mysql
+docker compose -f compose.yml down
+```
+
+### 停止或删除 Kind Lab
+
+仅停止 Docker Desktop 会保留 Kind 容器状态。若明确要删除整个实验集群：
+
+```powershell
+kind delete cluster --name sre-lab
+```
+
+该命令会删除 Lab 集群内的 Pod、临时场景和集群数据库；不能通过 `reset-lab.ps1` 恢复，只能重新运行 `start-lab.ps1`。应用 MySQL 数据仍保存在 `sre-agent-backend/data/mysql`，不会被 `kind delete` 删除。
+
+### 清空应用 MySQL 数据的风险
+
+`sre-agent-backend/data/mysql` 包含登录账号、Token、会话、Evidence、Diagnosis、Code State 和 Gateway 审计。只有在 MySQL 容器停止、目标绝对路径已确认且明确不再需要历史数据时才能删除。删除后不可恢复，下一次启动只会重新建空表；模型缓存和 Lab 数据不受影响。
 
 ## 常见问题
 

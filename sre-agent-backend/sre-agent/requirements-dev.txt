@@ -1,0 +1,4 @@
+# 复用生产依赖，并补齐仅测试环境需要的组件。
+-r requirements.txt
+pytest>=8.0,<10.0
+pytest-asyncio>=0.24,<2.0

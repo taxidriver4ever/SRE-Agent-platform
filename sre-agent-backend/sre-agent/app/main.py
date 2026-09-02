@@ -141,6 +141,7 @@ def create_app() -> FastAPI:
         conversation_service=conversation_service,
         code_state_service=code_state_service,
         kubernetes_namespace=settings.kubernetes_namespace,
+        deadline_seconds=settings.diagnosis_deadline_seconds,
     )
     diagnosis_repository = DiagnosisRepository(application_database)
     diagnosis_service = DiagnosisService(diagnosis_repository, conversation_service)

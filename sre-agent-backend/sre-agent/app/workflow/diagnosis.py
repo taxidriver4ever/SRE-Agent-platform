@@ -12,6 +12,9 @@ from app.conversation import ConversationService
 from app.conversation_memory import ConversationCompactionService
 from app.code_state import CodeStateService
 from app.evidence import build_source_references, normalize_tool_result
+from app.workflow.evidence_gate import (
+    build_report, is_direct_evidence, source_for_tool, supports_conclusion,
+)
 from app.llm.base import LLM
 from app.llm.gateway import GatewayError
 from app.mcp_clients import FastMCPToolClient
@@ -20,7 +23,6 @@ from app.workflow.catalog import ServiceCatalog
 from app.workflow.models import (
     CandidateCause,
     DiagnosisReport,
-    DiagnosisFinding,
     DiagnosisSynthesis,
     DiagnosisState,
     Evidence,
@@ -28,6 +30,9 @@ from app.workflow.models import (
     WorkflowPhase,
 )
 from app.workflow.planner import EvidencePlanner
+from app.workflow.runtime_extractor import (
+    extract_git_sha, extract_pod_runtime, extract_trace_id, find_pod_name,
+)
 
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 logger = logging.getLogger(__name__)
@@ -47,6 +52,7 @@ class DiagnosisWorkflow:
         conversation_service: ConversationService | None = None,
         code_state_service: CodeStateService | None = None,
         kubernetes_namespace: str = "sre-lab",
+        deadline_seconds: float = 240,
     ) -> None:
         self.tools = tools
         self.catalog = ServiceCatalog(catalog_path)
@@ -58,6 +64,7 @@ class DiagnosisWorkflow:
         self.conversation_service = conversation_service
         self.code_state_service = code_state_service
         self.kubernetes_namespace = kubernetes_namespace
+        self.deadline_seconds = max(0.01, min(float(deadline_seconds), 3600.0))
         self._background_tasks: set[asyncio.Task[None]] = set()
 
     async def run(
@@ -95,6 +102,48 @@ class DiagnosisWorkflow:
                 message_type="user",
                 run_id=state.run_id,
             )
+        try:
+            report = await asyncio.wait_for(
+                self._execute_diagnosis(state, planner, on_event, system_scan=system_scan),
+                timeout=self.deadline_seconds,
+            )
+        except TimeoutError:
+            record = ToolCallRecord(
+                tool_name="workflow_deadline",
+                arguments={"deadline_seconds": self.deadline_seconds},
+                result_summary="整轮诊断达到截止时间，保留已收集证据并安全结束",
+                timestamp=datetime.now(timezone.utc),
+                duration_ms=int(self.deadline_seconds * 1000),
+                error=f"diagnosis exceeded {self.deadline_seconds:g} seconds",
+            )
+            state.timeline.append(record)
+            if on_event:
+                await on_event({"type": "tool", "record": record.model_dump(mode="json")})
+            state.synthesis = DiagnosisSynthesis(
+                status="insufficient_evidence",
+                root_cause="诊断达到截止时间，现有证据不足以确认根因",
+                confidence=0.0,
+            )
+            if WorkflowPhase.VERIFY not in state.phases:
+                await self._phase(state, WorkflowPhase.VERIFY, on_event)
+            report = self._report(state)
+            await self._phase(state, WorkflowPhase.REPORT, on_event)
+            await self._phase(state, WorkflowPhase.END, on_event)
+            report.workflow_phases = state.phases
+        await self._update_conversation_context(state, report)
+        if on_event:
+            await on_event({"type": "final", "report": report.model_dump(mode="json")})
+        return report
+
+    async def _execute_diagnosis(
+        self,
+        state: DiagnosisState,
+        planner: EvidencePlanner | None,
+        on_event: EventCallback | None,
+        *,
+        system_scan: bool,
+    ) -> DiagnosisReport:
+        """执行受整轮 deadline 约束的诊断阶段；报告持久化在截止时间之外完成。"""
         await self._phase(state, WorkflowPhase.START, on_event)
         if system_scan:
             await self._system_scan(state, on_event)
@@ -110,9 +159,6 @@ class DiagnosisWorkflow:
         await self._phase(state, WorkflowPhase.REPORT, on_event)
         await self._phase(state, WorkflowPhase.END, on_event)
         report.workflow_phases = state.phases
-        await self._update_conversation_context(state, report)
-        if on_event:
-            await on_event({"type": "final", "report": report.model_dump(mode="json")})
         return report
 
     async def _phase(self, state: DiagnosisState, phase: WorkflowPhase, callback: EventCallback | None) -> None:
@@ -124,8 +170,12 @@ class DiagnosisWorkflow:
     async def _system_scan(self, state: DiagnosisState, callback: EventCallback | None) -> None:
         """整体巡检先建立全局服务、Pod 和错误率视图，不预设故障服务。"""
         await self._phase(state, WorkflowPhase.SYSTEM_SCAN, callback)
-        await self._call(state, "list_deployments", {}, "系统 Deployment 清单", callback)
-        await self._call(state, "list_pods", {}, "系统 Pod、版本与运行状态", callback)
+        # Deployment 与 Pod 清单都是独立的只读发现操作。它们需要先于全局
+        # Baseline 完成，但彼此没有数据依赖，可以安全并发。
+        await self._call_concurrently(state, callback, [
+            ("list_deployments", {}, "系统 Deployment 清单"),
+            ("list_pods", {}, "系统 Pod、版本与运行状态"),
+        ])
 
     async def _triage(
         self,
@@ -211,59 +261,51 @@ class DiagnosisWorkflow:
         """硬性采集健康、延迟、错误率、CPU/内存与异常日志。"""
         await self._phase(state, WorkflowPhase.BASELINE_OBSERVATION, callback)
         if system_scan and state.service == "unknown":
-            await self._call(
-                state,
-                "query_metrics",
-                {"query": "sum by (service) (up)", "time_range_minutes": state.time_range_minutes},
-                "全服务健康基线",
-                callback,
-            )
-            await self._call(
-                state,
-                "query_metrics",
-                {
-                    "query": 'sum by (service) (rate(http_server_requests_seconds_count{status=~"5.."}[5m]))',
-                    "time_range_minutes": state.time_range_minutes,
-                },
-                "全服务 HTTP 5xx 速率",
-                callback,
-            )
-            await self._call(
-                state,
-                "query_metrics",
-                {
-                    "query": (
-                        f'sum by (pod) (rate(container_cpu_usage_seconds_total{{namespace="{self.kubernetes_namespace}"}}[5m])) '
-                        f'or sum by (pod) (container_memory_working_set_bytes{{namespace="{self.kubernetes_namespace}"}})'
-                    ),
-                    "time_range_minutes": state.time_range_minutes,
-                },
-                "全局 Pod CPU/内存",
-                callback,
-            )
-            await self._call(
-                state,
-                "query_logs",
-                {"time_range_minutes": state.time_range_minutes, "level": "error", "limit": 50},
-                "全局异常日志",
-                callback,
-            )
+            await self._call_concurrently(state, callback, [
+                (
+                    "query_metrics",
+                    {"query": "sum by (service) (up)", "time_range_minutes": state.time_range_minutes},
+                    "全服务健康基线",
+                ),
+                (
+                    "query_metrics",
+                    {
+                        "query": 'sum by (service) (rate(http_server_requests_seconds_count{status=~"5.."}[5m]))',
+                        "time_range_minutes": state.time_range_minutes,
+                    },
+                    "全服务 HTTP 5xx 速率",
+                ),
+                (
+                    "query_metrics",
+                    {
+                        "query": (
+                            f'sum by (pod) (rate(container_cpu_usage_seconds_total{{namespace="{self.kubernetes_namespace}"}}[5m])) '
+                            f'or sum by (pod) (container_memory_working_set_bytes{{namespace="{self.kubernetes_namespace}"}})'
+                        ),
+                        "time_range_minutes": state.time_range_minutes,
+                    },
+                    "全局 Pod CPU/内存",
+                ),
+                (
+                    "query_logs",
+                    {"time_range_minutes": state.time_range_minutes, "level": "error", "limit": 50},
+                    "全局异常日志",
+                ),
+            ])
             return
         if state.service == "unknown":
-            await self._call(
-                state,
-                "query_metrics",
-                {"query": "sum by (service) (up)", "time_range_minutes": state.time_range_minutes},
-                "全服务健康基线",
-                callback,
-            )
-            await self._call(
-                state,
-                "query_logs",
-                {"time_range_minutes": state.time_range_minutes, "limit": 50},
-                "跨服务近期日志",
-                callback,
-            )
+            await self._call_concurrently(state, callback, [
+                (
+                    "query_metrics",
+                    {"query": "sum by (service) (up)", "time_range_minutes": state.time_range_minutes},
+                    "全服务健康基线",
+                ),
+                (
+                    "query_logs",
+                    {"time_range_minutes": state.time_range_minutes, "limit": 50},
+                    "跨服务近期日志",
+                ),
+            ])
             return
         service = state.service
         common = {"service": service, "time_range_minutes": state.time_range_minutes}
@@ -271,21 +313,25 @@ class DiagnosisWorkflow:
         pods = await self._call(state, "list_pods", {"label_selector": f"app={service}"}, "服务 Pod 与运行版本", callback)
         self._extract_pod_runtime(state, pods)
         state.pod_name = state.pod_name or self._find_pod_name(pods, service)
-        await self._call(state, "get_service_health", {"service": service}, "服务健康", callback)
         # 优先查询 P95 直方图；服务未开启 histogram 时 INVESTIGATE 仍可依赖日志、Trace 和数据库证据。
         latency = (
             f'histogram_quantile(0.95, sum(rate(http_server_requests_seconds_bucket'
             f'{{service="{service}"}}[5m])) by (le))'
         )
-        await self._call(state, "query_metrics", {"query": latency, "time_range_minutes": state.time_range_minutes}, "HTTP P95", callback)
         errors = f'sum(rate(http_server_requests_seconds_count{{service="{service}",status=~"5.."}}[5m]))'
-        await self._call(state, "query_metrics", {"query": errors, "time_range_minutes": state.time_range_minutes}, "HTTP 5xx 速率", callback)
         resources = (
             f'sum by (pod) (rate(container_cpu_usage_seconds_total{{namespace="{self.kubernetes_namespace}",pod=~"{service}.*"}}[5m])) '
             f'or sum by (pod) (container_memory_working_set_bytes{{namespace="{self.kubernetes_namespace}",pod=~"{service}.*"}})'
         )
-        await self._call(state, "query_metrics", {"query": resources, "time_range_minutes": state.time_range_minutes}, "Pod 级 CPU/内存", callback)
-        await self._call(state, "query_logs", {**common, "limit": 20}, "近期服务日志", callback)
+        # Pod Discovery 与运行版本提取必须先完成；以下五个查询只依赖已经确定
+        # 的 service/time range/runtime context，彼此无依赖，按真实完成时间入库。
+        await self._call_concurrently(state, callback, [
+            ("get_service_health", {"service": service}, "服务健康"),
+            ("query_metrics", {"query": latency, "time_range_minutes": state.time_range_minutes}, "HTTP P95"),
+            ("query_metrics", {"query": errors, "time_range_minutes": state.time_range_minutes}, "HTTP 5xx 速率"),
+            ("query_metrics", {"query": resources, "time_range_minutes": state.time_range_minutes}, "Pod 级 CPU/内存"),
+            ("query_logs", {**common, "limit": 20}, "近期服务日志"),
+        ])
 
     async def _analyze(self, state: DiagnosisState, callback: EventCallback | None) -> None:
         """候选原因由后续 Planner 从 Evidence 生成，Workflow 不预置故障答案。"""
@@ -318,7 +364,23 @@ class DiagnosisWorkflow:
             if item.get("name") in investigation_tools
         ]
         while len(state.timeline) < self.max_steps:
-            decision = await planner.decide(state, tool_specs)
+            planner_started_at = datetime.now(timezone.utc)
+            planner_started = time.perf_counter()
+            try:
+                decision = await planner.decide(state, tool_specs)
+            except GatewayError as exc:
+                record = ToolCallRecord(
+                    tool_name="llm_planner",
+                    arguments={"evidence_count": len(state.evidence)},
+                    result_summary="Planner 请求失败，停止扩展并交由 Evidence Gate 判定",
+                    timestamp=planner_started_at,
+                    duration_ms=int((time.perf_counter() - planner_started) * 1000),
+                    error=self._exception_text(exc),
+                )
+                state.timeline.append(record)
+                if callback:
+                    await callback({"type": "tool", "record": record.model_dump(mode="json")})
+                break
             if decision.action != "tool":
                 break
             signature = json.dumps(
@@ -452,6 +514,39 @@ class DiagnosisWorkflow:
             await callback({"type": "tool", "record": record.model_dump(mode="json")})
         return result
 
+    async def _call_concurrently(
+        self,
+        state: DiagnosisState,
+        callback: EventCallback | None,
+        calls: list[tuple[str, dict[str, Any], str]],
+    ) -> list[Any]:
+        """并发执行一组互不依赖的只读调用，并在调度前统一预留预算。
+
+        ``_call`` 会把工具异常转换为失败 ToolCall，因此单个数据源失败不会
+        取消其他任务。这里使用 ``return_exceptions`` 额外隔离 callback 或持久化
+        层的意外异常；时间线与 Evidence 的 append 都发生在事件循环单线程内，
+        每条记录在发送 SSE 前已经完整写入。
+        """
+        available = max(0, self.max_steps - len(state.timeline))
+        selected = calls[:available]
+        if not selected:
+            return []
+        results = await asyncio.gather(
+            *(
+                self._call(state, tool_name, arguments, title, callback)
+                for tool_name, arguments, title in selected
+            ),
+            return_exceptions=True,
+        )
+        normalized: list[Any] = []
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.warning("concurrent baseline task failed outside tool boundary: %s", self._exception_text(result))
+                normalized.append(None)
+            else:
+                normalized.append(result)
+        return normalized
+
     @staticmethod
     def _exception_text(exc: BaseException) -> str:
         detail = str(exc).strip()
@@ -463,123 +558,16 @@ class DiagnosisWorkflow:
         text = json.dumps(value, ensure_ascii=False, default=str, sort_keys=True)
         return text if len(text) <= limit else f"{text[:limit]}…（完整结果见 Conversation Store）"
 
-    @staticmethod
-    def _source(tool_name: str) -> str:
-        """把 Tool 名归类为独立证据源，供 VERIFY 计算置信度。"""
-        if tool_name.startswith("query_metric") or tool_name == "get_service_health":
-            return "Prometheus"
-        if tool_name == "query_logs":
-            return "Loki"
-        if tool_name == "query_trace":
-            return "Tempo"
-        if tool_name in {"query_slow_queries", "query_sql_digest", "explain_sql"}:
-            return "MySQL"
-        if tool_name in {"get_repository", "get_current_commit", "get_commit_diff", "list_changed_files"} or tool_name.startswith("get_commit") or tool_name.startswith("read_file") or tool_name.startswith("search_code"):
-            return "Git"
-        return "Kubernetes"
-
-    @staticmethod
-    def _find_pod_name(payload: Any, service: str) -> str | None:
-        """从 list_pods 的 bounded 结果中安全提取目标 Pod 名。"""
-        try:
-            items = payload["data"]["items"]
-            return next(item["metadata"]["name"] for item in items if item["metadata"]["name"].startswith(service))
-        except (KeyError, TypeError, StopIteration):
-            return None
-
-    @staticmethod
-    def _extract_git_sha(payload: Any) -> str | None:
-        """从 get_container_image 的结构化注解中提取完整运行 SHA。"""
-        try:
-            annotations = payload["data"]["annotations"]
-            value = str(annotations.get("sre.agent/git-sha", ""))
-            return value if len(value) == 40 else None
-        except (KeyError, TypeError):
-            return None
+    # 兼容现有测试与扩展；实现已移动到职责单一的辅助模块。
+    _source = staticmethod(source_for_tool)
+    _find_pod_name = staticmethod(find_pod_name)
+    _extract_git_sha = staticmethod(extract_git_sha)
+    _extract_trace_id = staticmethod(extract_trace_id)
+    _supports_conclusion = staticmethod(supports_conclusion)
+    _is_direct_evidence = staticmethod(is_direct_evidence)
 
     def _extract_pod_runtime(self, state: DiagnosisState, payload: Any) -> None:
-        """比较同一 Service 的 Pod 镜像，优先选择少数版本作为疑似异常实例。"""
-        try:
-            candidates: list[tuple[str, str]] = []
-            for pod in payload["data"]["items"]:
-                pod_name = str(pod["metadata"]["name"])
-                annotations = pod.get("metadata", {}).get("annotations", {})
-                repository = str(annotations.get("sre.agent/repository") or "")
-                repository_url = str(annotations.get("sre.agent/repository-url") or "")
-                if repository:
-                    state.repository = repository
-                if annotations.get("sre.agent/source-path"):
-                    state.source_code_location = str(annotations["sre.agent/source-path"])
-                if annotations.get("sre.agent/language"):
-                    state.language = str(annotations["sre.agent/language"])
-                if repository_url and state.repository and self.repository_registry:
-                    # K8s 运行对象是模块→仓库的事实源；Registry 再执行 URL/主机
-                    # 白名单校验，校验通过后 Git MCP 才允许抓取该远程仓库。
-                    state.repository_url = self.repository_registry.bind(state.repository, repository_url)
-                image = str(pod["spec"]["containers"][0]["image"])
-                version = image.rsplit(":", 1)[-1]
-                if len(version) == 40:
-                    candidates.append((pod_name, version))
-            if not candidates:
-                return
-            state.pod_versions = dict(candidates)
-            counts: dict[str, int] = {}
-            for _, version in candidates:
-                counts[version] = counts.get(version, 0) + 1
-            state.mixed_versions = len(counts) > 1
-            selected_version = min(counts, key=counts.get) if state.mixed_versions else candidates[0][1]
-            state.pod_name = next(pod for pod, version in candidates if version == selected_version)
-            state.runtime_commit = selected_version
-        except (IndexError, KeyError, TypeError):
-            # Pod 尚未 Ready 或返回被截断时保留空状态，后续回退到 Deployment 注解。
-            return
-
-    @staticmethod
-    def _extract_trace_id(payload: Any) -> str | None:
-        """从 Loki 的结构化查询结果中提取最近一条合法 trace_id。
-
-        Loki 返回的日志正文位于 ``data.result[].values[][1]``，正文自身是 JSON
-        字符串。这里逐条解析而不使用字符串切片，避免普通消息文本里偶然出现
-        ``trace_id`` 字样时被误认为真正的链路标识。
-        """
-        try:
-            # ``bounded`` 在外层增加 data，工具本身又使用 result 包装 Loki 的
-            # data，因此真实 streams 位于 data.result.result。显式逐层取值也能
-            # 在上游协议变化时快速降级，而不会让整个诊断接口返回 500。
-            streams = payload["data"]["result"]["result"]
-            for stream in streams:
-                for value in reversed(stream.get("values", [])):
-                    if not isinstance(value, list) or len(value) < 2:
-                        continue
-                    log_record = json.loads(value[1])
-                    trace_id = str(log_record.get("trace_id", ""))
-                    if len(trace_id) in {16, 32} and all(char in "0123456789abcdefABCDEF" for char in trace_id):
-                        return trace_id
-        except (AttributeError, KeyError, TypeError, json.JSONDecodeError):
-            # 日志结构不完整时返回 None，由调用方安全降级为按 service 搜索 Trace。
-            return None
-        return None
-
-    @staticmethod
-    def _supports_conclusion(tool_name: str, summary: str) -> bool:
-        """防止空查询或零行结果被计入双证据门槛。"""
-        if tool_name.startswith("query_") or tool_name == "get_service_health":
-            empty_markers = ('"result": []', '"traces": []', '"row_count": 0')
-            return not any(marker in summary for marker in empty_markers)
-        return True
-
-    @staticmethod
-    def _is_direct_evidence(tool_name: str, arguments: dict[str, Any], summary: str) -> bool:
-        """标记能够直接观测故障机制的数据，代码和服务清单仅作旁证。"""
-        if not DiagnosisWorkflow._supports_conclusion(tool_name, summary):
-            return False
-        if tool_name == "query_trace":
-            return bool(arguments.get("trace_id"))
-        return tool_name in {
-            "query_metrics", "get_service_health", "query_logs", "query_slow_queries",
-            "query_sql_digest", "explain_sql", "get_pod", "get_pod_events",
-            "get_restart_count", "get_deployment", "get_container_image",
-        }
+        extract_pod_runtime(state, payload, self.repository_registry)
 
     async def _update_conversation_context(
         self,
@@ -640,6 +628,8 @@ class DiagnosisWorkflow:
         task.add_done_callback(self._background_tasks.discard)
 
     async def _compact_after_report(self, user_id: str, conversation_id: str) -> None:
+        if not self._has_multiple_user_turns(user_id, conversation_id):
+            return
         try:
             await self.context_service.maybe_compact(user_id, conversation_id)
         except (GatewayError, ValueError, TimeoutError) as exc:
@@ -660,7 +650,11 @@ class DiagnosisWorkflow:
         压缩失败不推进 MySQL 边界，也不阻断诊断。后续摘要继续使用未压缩原文，
         报告阶段还会再次尝试压缩，因此不会静默丢失调查信息。
         """
-        if self.context_service is None or not state.user_id:
+        if (
+            self.context_service is None
+            or not state.user_id
+            or not self._has_multiple_user_turns(state.user_id, state.conversation_id)
+        ):
             return
         try:
             await asyncio.wait_for(
@@ -669,6 +663,16 @@ class DiagnosisWorkflow:
             )
         except (GatewayError, ValueError, TimeoutError):
             return
+
+    def _has_multiple_user_turns(self, user_id: str, conversation_id: str) -> bool:
+        """单轮诊断保留原始证据；从第二个用户回合起才需要压缩上下文。"""
+        if self.context_service is None:
+            return False
+        try:
+            snapshot = self.context_service.repository.active_snapshot(user_id, conversation_id)
+        except Exception:
+            return False
+        return sum(message.get("role") == "user" for message in snapshot.pending_messages) >= 2
 
     async def _synthesize_with_gateway(
         self,
@@ -698,6 +702,7 @@ class DiagnosisWorkflow:
                 )
             state.prompt_tokens = planner.prompt_tokens
             state.completion_tokens = planner.completion_tokens
+            state.structured_output_retry_count = planner.structured_output_retry_count
         summary = state.synthesis.root_cause if state.synthesis else ""
         record = ToolCallRecord(
             tool_name="llm_evidence_synthesis",
@@ -710,50 +715,6 @@ class DiagnosisWorkflow:
         state.timeline.append(record)
         if callback:
             await callback({"type": "tool", "record": record.model_dump(mode="json")})
-
     def _report(self, state: DiagnosisState) -> DiagnosisReport:
-        """Evidence Gate 验证引用、直接证据和矛盾后才允许 confirmed。"""
-        synthesis = state.synthesis or DiagnosisSynthesis(
-            status="insufficient_evidence",
-            root_cause="证据不足，无法确认根因",
-            confidence=0.0,
-        )
-        evidence_by_id = {item.evidence_id: item for item in state.evidence}
-        cited_ids = list(dict.fromkeys(
-            evidence_id for evidence_id in synthesis.evidence_ids if evidence_id in evidence_by_id
-        ))
-        cited = [evidence_by_id[evidence_id] for evidence_id in cited_ids]
-        gate_passed = (
-            synthesis.status == "confirmed"
-            and len(cited) >= 2
-            and any(item.direct_evidence and item.supports_conclusion for item in cited)
-            and all(item.supports_conclusion for item in cited)
-            and not synthesis.contradictions
-        )
-        status = "confirmed" if gate_passed else "insufficient_evidence"
-        root = synthesis.root_cause.strip() or "证据不足，无法确认根因"
-        confidence = synthesis.confidence if gate_passed else min(synthesis.confidence, 0.49)
-        conclusion = f"已确认：{root}" if gate_passed else f"证据不足：{root}"
-        findings = [DiagnosisFinding(finding=root, evidence_ids=cited_ids)] if gate_passed else []
-        chain = synthesis.root_cause_chain or ["当前观测证据", "尚不足以形成可验证根因"]
-        fixes = synthesis.recommended_fix or ["补充与候选机制直接相关的 Metrics、Logs、Trace 或运行时状态后重新诊断"]
-        return DiagnosisReport(
-            query=state.query, run_id=state.run_id, service=state.service, affected_pod=state.pod_name,
-            language=state.language, running_version=state.runtime_commit, git_sha=state.runtime_commit,
-            source_code_location=state.source_code_location, repository_url=state.repository_url,
-            symptom=state.symptom,
-            environment=state.environment, time_range=f"最近 {state.time_range_minutes} 分钟",
-            conclusion=conclusion,
-            status=status,
-            decision_summary=conclusion,
-            root_cause=root, findings=findings, evidence=state.evidence,
-            root_cause_chain=chain, recommended_fix=fixes, confidence=confidence,
-            token_usage=state.prompt_tokens + state.completion_tokens,
-            candidates=state.candidates, investigation_timeline=state.timeline,
-            workflow_phases=state.phases,
-            context_compaction={
-                "strategy": "mysql-conversation-compaction-v1",
-                "storage": "mysql",
-                "stored_evidence": len(state.evidence),
-            },
-        )
+        """兼容旧扩展点；Evidence Gate 与报告构建位于独立模块。"""
+        return build_report(state)

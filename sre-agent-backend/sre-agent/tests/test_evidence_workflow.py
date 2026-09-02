@@ -3,20 +3,22 @@
 from datetime import datetime, timezone
 from pathlib import Path
 import json
+from types import SimpleNamespace
 
 from app.evidence import normalize_tool_result
 from app.workflow.diagnosis import DiagnosisWorkflow
 from app.workflow.planner import EvidencePlanner
 from app.workflow.models import DiagnosisState, DiagnosisSynthesis, Evidence, ToolCallRecord
-from evals.run_evals import aggregate, validate_case
+from evals.run_evals import aggregate, report_contract_failures, validate_case
 
 
 def test_workflow_contains_no_eval_or_fault_answer_shortcuts():
     root = Path(__file__).resolve().parents[1]
-    source = "\n".join(
-        (root / relative).read_text(encoding="utf-8")
-        for relative in ("app/workflow/diagnosis.py", "app/workflow/planner.py")
-    ).lower()
+    planner_sources = sorted((root / "app" / "workflow" / "planning").glob("*.py"))
+    source = "\n".join([
+        (root / "app/workflow/diagnosis.py").read_text(encoding="utf-8"),
+        *(path.read_text(encoding="utf-8") for path in planner_sources),
+    ]).lower()
     forbidden = (
         "slow.example.com",
         "mode=slow_sql",
@@ -227,6 +229,16 @@ def test_fixed_ten_eval_cases_have_non_leaking_contract():
         assert "required_evidence" not in serialized
 
 
+def test_lab_deployment_creates_mysql_secret_without_committed_password():
+    root = Path(__file__).resolve().parents[3]
+    script = (root / "sre-broken-system/sre-lab-infra/scripts/deploy-lab.ps1").read_text(encoding="utf-8")
+
+    assert "get secret mysql-credentials --ignore-not-found" in script
+    assert "create secret generic mysql-credentials" in script
+    assert "$env:SRE_LAB_MYSQL_ROOT_PASSWORD" in script
+    assert "RandomNumberGenerator" in script
+
+
 def test_eval_aggregate_keeps_failures_visible():
     metrics = aggregate([
         {"passed": True, "service_correct": True, "root_cause_correct": True, "evidence_status": "COMPLETE", "tool_calls": 4, "diagnosis_time_ms": 100, "token_usage": 20},
@@ -236,6 +248,89 @@ def test_eval_aggregate_keeps_failures_visible():
     assert metrics["passed"] == 1
     assert metrics["root_cause_accuracy"] == 0.5
     assert metrics["evidence_completion_rate"] == 0.5
+    assert metrics["overall_pass_rate"] == 0.5
+    assert metrics["p95_diagnosis_time_ms"] == 300
+
+
+def test_eval_aggregate_separates_infrastructure_and_agent_failures():
+    metrics = aggregate([
+        {"passed": False, "failure_category": "infrastructure", "service_correct": False,
+         "root_cause_correct": False, "evidence_status": "MISSING", "tool_calls": 0,
+         "tool_failures": 0, "diagnosis_time_ms": 100, "token_usage": 0,
+         "final_status": "error", "failure_reason": "API timed out",
+         "structured_output_retry_count": 0},
+        {"passed": True, "failure_category": None, "service_correct": True,
+         "root_cause_correct": True, "evidence_status": "COMPLETE", "tool_calls": 4,
+         "tool_failures": 1, "diagnosis_time_ms": 200, "token_usage": 20,
+         "final_status": "confirmed", "failure_reason": None,
+         "structured_output_retry_count": 2},
+    ])
+
+    assert metrics["agent_pass_rate"] == 1.0
+    assert metrics["infrastructure_failure_rate"] == 0.5
+    assert metrics["timeout_rate"] == 0.5
+    assert metrics["tool_failure_rate"] == 0.25
+    assert metrics["structured_output_retry_count"] == 2
+
+
+def test_eval_requires_affected_pod_for_pod_level_cases():
+    failures = report_contract_failures(
+        {"case_id": "SRE-008"},
+        {"affected_pod": None},
+    )
+    assert failures == ["affected_pod is required"]
+
+
+def test_eval_requires_exact_bad_canary_commit_and_source_location():
+    bad_commit = "a" * 40
+    failures = report_contract_failures(
+        {"case_id": "SRE-009"},
+        {
+            "affected_pod": "order-service-canary-123",
+            "git_sha": "b" * 40,
+            "source_code_location": "src/main/java/OrderController.java",
+        },
+        bad_canary_commit=bad_commit,
+    )
+    assert any("expected BAD canary" in failure for failure in failures)
+    assert "source_code_location must contain OrderRepository.java" in failures
+
+
+def test_eval_accepts_complete_sre_009_runtime_identity_contract():
+    bad_commit = "a" * 40
+    assert report_contract_failures(
+        {"case_id": "SRE-009"},
+        {
+            "affected_pod": "order-service-canary-123",
+            "git_sha": bad_commit,
+            "source_code_location": "src/main/java/com/example/OrderRepository.java",
+        },
+        bad_canary_commit=bad_commit,
+    ) == []
+
+
+def test_single_turn_diagnosis_does_not_trigger_context_compaction():
+    workflow = object.__new__(DiagnosisWorkflow)
+    workflow.context_service = SimpleNamespace(
+        repository=SimpleNamespace(
+            active_snapshot=lambda _user_id, _conversation_id: SimpleNamespace(
+                pending_messages=[{"role": "user"}, {"role": "assistant"}],
+            )
+        )
+    )
+    assert workflow._has_multiple_user_turns("user-1", "conversation-1") is False
+
+
+def test_multi_turn_conversation_remains_eligible_for_context_compaction():
+    workflow = object.__new__(DiagnosisWorkflow)
+    workflow.context_service = SimpleNamespace(
+        repository=SimpleNamespace(
+            active_snapshot=lambda _user_id, _conversation_id: SimpleNamespace(
+                pending_messages=[{"role": "user"}, {"role": "assistant"}, {"role": "user"}],
+            )
+        )
+    )
+    assert workflow._has_multiple_user_turns("user-1", "conversation-1") is True
 
 
 def test_planner_never_explains_unbound_parameterized_sql():

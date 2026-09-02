@@ -250,6 +250,7 @@ sre-broken-system/.legacy-monorepo-git/
 # Ad-hoc test environments, reports, rendered documents and scratch scripts.
 .test-runtime/
 .test-venv/
+.gateway-venv/
 .runtime/
 output/
 tmp/

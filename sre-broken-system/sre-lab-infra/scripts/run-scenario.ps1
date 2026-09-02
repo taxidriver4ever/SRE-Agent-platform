@@ -46,10 +46,11 @@ function Invoke-ServiceLoad {
         [string]$Path,
         [int]$Count = 8,
         [ValidateSet('GET','POST')][string]$Method = 'GET',
-        [object]$Body = $null
+        [object]$Body = $null,
+        [ValidateSet('service','pod')][string]$ResourceKind = 'service'
     )
     $localPort = Get-FreeTcpPort
-    $forward = Start-Process -FilePath kubectl -ArgumentList '-n','sre-lab','port-forward',"service/$Service","${localPort}:$RemotePort" -WindowStyle Hidden -PassThru
+    $forward = Start-Process -FilePath kubectl -ArgumentList '-n','sre-lab','port-forward',"$ResourceKind/$Service","${localPort}:$RemotePort" -WindowStyle Hidden -PassThru
     try {
         foreach ($attempt in 1..20) {
             if (Test-LocalTcpPort $localPort) { break }
@@ -59,9 +60,9 @@ function Invoke-ServiceLoad {
         foreach ($index in 1..$Count) {
             try {
                 if ($Method -eq 'POST') {
-                    Invoke-RestMethod -Method Post "http://127.0.0.1:$localPort$Path" -ContentType 'application/json' -Body ($Body | ConvertTo-Json -Depth 5) -TimeoutSec 15 | Out-Null
+                    Invoke-RestMethod -Method Post "http://127.0.0.1:$localPort$Path" -Headers @{Connection='close'} -ContentType 'application/json' -Body ($Body | ConvertTo-Json -Depth 5) -TimeoutSec 15 | Out-Null
                 } else {
-                    Invoke-RestMethod "http://127.0.0.1:$localPort$Path" -TimeoutSec 30 | Out-Null
+                    Invoke-RestMethod "http://127.0.0.1:$localPort$Path" -Headers @{Connection='close'} -TimeoutSec 30 | Out-Null
                 }
             } catch {
                 # 故障场景预期可能返回 5xx/timeout；请求本身已经形成所需观测数据。
@@ -125,13 +126,13 @@ function Deploy-InventoryBad {
 }
 
 switch($Scenario){
-    'SRE-001'{Deploy-OrderBad;Set-AllPodFaults order-service 8080 '/debug/fault/slow_sql';1..12|ForEach-Object{Invoke-RestMethod 'http://127.0.0.1:18080/orders/search?email=slow.example.com&limit=20' -TimeoutSec 30|Out-Null}}
+    'SRE-001'{Deploy-OrderBad;Set-AllPodFaults order-service 8080 '/debug/fault/slow_sql';Invoke-ServiceLoad order-service 8080 '/orders/search?email=slow.example.com&limit=20' 12}
     'SRE-002'{Deploy-OrderBad;Set-AllPodFaults order-service 8080 '/debug/fault/pool_exhaustion';$jobs=1..18|ForEach-Object{Start-Job{Invoke-RestMethod 'http://127.0.0.1:18080/orders/search?email=slow.example.com&limit=20' -TimeoutSec 30}};$jobs|Wait-Job|Receive-Job -ErrorAction SilentlyContinue|Out-Null;$jobs|Remove-Job}
     'SRE-003'{Deploy-InventoryBad;Set-AllPodFaults inventory-service 8081 '/debug/fault?mode=dependency_timeout';Invoke-OrderCreationLoad 8;Invoke-ServiceLoad inventory-service 8081 '/inventory/SKU-1' 4;Start-Sleep -Seconds 5;Write-Host 'Inventory reservations now exceed the order-service downstream timeout.'}
     'SRE-004'{Set-AllPodFaults user-service 8082 '/debug/fault?mode=cpu_saturation';Invoke-ServiceLoad user-service 8082 '/users/1' 10;Write-Host 'Both user-service replicas now execute genuine CPU-heavy work.'}
     'SRE-005'{Set-AllPodFaults payment-service 8083 '/debug/fault?mode=memory_leak';Start-Sleep -Seconds 22;Write-Host 'Payment Pods retained memory long enough to produce first-cycle limit/restart evidence.'}
     'SRE-006'{Deploy-InventoryBad;Set-AllPodFaults recommendation-service 8085 '/debug/fault?mode=quadratic_ranking';Invoke-OrderCreationLoad 4;Invoke-ServiceLoad inventory-service 8081 '/inventory/SKU-1' 2;Start-Sleep -Seconds 3;Write-Host 'BAD inventory replicas retry the CPU-heavy recommendation dependency without backoff.'}
-    'SRE-007'{Deploy-OrderBad;1..6|ForEach-Object{Invoke-RestMethod 'http://127.0.0.1:18080/orders/search?email=slow.example.com&limit=20' -TimeoutSec 30|Out-Null};Write-Host "All order replicas now run BAD SHA $orderBad."}
+    'SRE-007'{Deploy-OrderBad;Invoke-ServiceLoad order-service 8080 '/orders/search?email=slow.example.com&limit=20' 6;Write-Host "All order replicas now run BAD SHA $orderBad."}
     'SRE-008'{
         $podList=kubectl -n sre-lab get pods -l 'app=order-service,track=stable' -o json|ConvertFrom-Json
         $pod=($podList.items|Where-Object{-not $_.metadata.deletionTimestamp -and $_.status.phase -eq 'Running'}|Select-Object -First 1).metadata.name
@@ -145,10 +146,20 @@ switch($Scenario){
             }
             if(-not $activated){throw "fault endpoint not ready for order-service/$pod after 10 seconds"}
         }finally{if(-not $forward.HasExited){Stop-Process -Id $forward.Id}}
-        1..12|ForEach-Object{Invoke-RestMethod 'http://127.0.0.1:18080/orders/search?email=customer-10@slow.example.com&limit=5' -TimeoutSec 30|Out-Null}
+        Invoke-ServiceLoad order-service 8080 '/orders/search?email=customer-10@slow.example.com&limit=5' 12
         Write-Host "Only $pod is degraded; two sibling Pods remain normal."
     }
-    'SRE-009'{kubectl apply -f (Join-Path $infraRoot 'k8s\scenarios\order-canary-bad.yaml')|Out-Null;kubectl -n sre-lab scale deployment/order-service --replicas=2|Out-Null;kubectl -n sre-lab scale deployment/order-service-canary --replicas=1|Out-Null;kubectl -n sre-lab rollout status deployment/order-service-canary --timeout=240s|Out-Null;1..12|ForEach-Object{Invoke-RestMethod 'http://127.0.0.1:18080/orders/search?email=slow.example.com&limit=5' -TimeoutSec 30|Out-Null};Write-Host 'Service now balances across two GOOD Pods and one BAD canary Pod.'}
+    'SRE-009'{
+        kubectl apply -f (Join-Path $infraRoot 'k8s\scenarios\order-canary-bad.yaml')|Out-Null
+        kubectl -n sre-lab scale deployment/order-service --replicas=2|Out-Null
+        kubectl -n sre-lab scale deployment/order-service-canary --replicas=1|Out-Null
+        kubectl -n sre-lab rollout status deployment/order-service-canary --timeout=240s|Out-Null
+        Invoke-ServiceLoad order-service 8080 '/orders/search?email=slow.example.com&limit=5' 12
+        $canaryPod = (kubectl -n sre-lab get pods -l 'app=order-service,track=canary' -o jsonpath='{.items[0].metadata.name}').Trim()
+        if (-not $canaryPod) { throw 'no ready order-service canary Pod found' }
+        Invoke-ServiceLoad $canaryPod 8080 '/orders/search?email=slow.example.com&limit=5' 6 'GET' $null 'pod'
+        Write-Host 'Service now balances across two GOOD Pods and one BAD canary Pod.'
+    }
     'SRE-010'{kubectl -n sre-lab patch deployment order-service --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/httpGet/path","value":"/broken-health"}]'|Out-Null;Start-Sleep -Seconds 45;Write-Host 'Invalid liveness path produced restart/CrashLoop evidence; reset-lab.ps1 restores it.'}
 }
 Write-Host "$Scenario activated. Definition and expected evidence: scenarios/catalog.yaml"
