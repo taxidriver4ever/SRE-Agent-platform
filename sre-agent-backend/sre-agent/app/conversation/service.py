@@ -105,14 +105,15 @@ class ConversationService:
         message_type: str | None = None,
         run_id: str | None = None,
         tool_name: str | None = None,
+        message_id: str | None = None,
     ) -> str:
-        """在同一事务中验证所有权、写入消息并推进会话更新时间。"""
+        """写入消息；durable Tool 可传稳定 ID，从而在 Recovery 时逻辑幂等。"""
         if role not in {"user", "assistant"}:
             raise ValueError("role must be user or assistant")
         normalized_type = message_type or role
         if normalized_type not in {"user", "assistant", "tool_call", "tool_result"}:
             raise ValueError("unsupported conversation message type")
-        message_id = uuid4().hex
+        resolved_message_id = message_id or uuid4().hex
         now = self._now()
         serialized = json.dumps(content, ensure_ascii=False, default=str)
         with closing(self.database.connect()) as connection:
@@ -129,9 +130,14 @@ class ConversationService:
                     estimated_tokens, run_id, tool_name, created_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE
+                    content_json = VALUES(content_json),
+                    estimated_tokens = VALUES(estimated_tokens),
+                    run_id = VALUES(run_id),
+                    tool_name = VALUES(tool_name)
                 """,
                 (
-                    message_id, conversation_id, role, normalized_type, serialized,
+                    resolved_message_id, conversation_id, role, normalized_type, serialized,
                     self.estimate_tokens(serialized), run_id, tool_name, now,
                 ),
             )
@@ -139,7 +145,7 @@ class ConversationService:
                 "UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id)
             )
             connection.commit()
-        return message_id
+        return resolved_message_id
 
     def get_tool_result(
         self,

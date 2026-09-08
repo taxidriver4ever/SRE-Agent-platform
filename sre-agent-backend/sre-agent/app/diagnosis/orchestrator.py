@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
-from uuid import uuid4
 
 from app.diagnosis.models import (
     DiagnosisEvidence, DiagnosisRootCause, DiagnosisStatus, DiagnosisTargetType,
@@ -13,6 +13,8 @@ from app.diagnosis.repository import DiagnosisRepository
 from app.diagnosis.schemas import DiagnosisCreateRequest
 from app.diagnosis.service import DiagnosisService
 from app.workflow import DiagnosisReport, DiagnosisWorkflow
+from app.workflow.models import DiagnosisState
+from app.workflow.runtime import WorkflowRuntime
 
 
 class DiagnosisOrchestrator:
@@ -28,29 +30,35 @@ class DiagnosisOrchestrator:
         self.service = service
         self.repository = repository
 
-    async def run(self, user_id: str, diagnosis_id: str, request: DiagnosisCreateRequest) -> DiagnosisReport:
+    async def run(
+        self,
+        user_id: str,
+        diagnosis_id: str,
+        request: DiagnosisCreateRequest,
+        *,
+        resume_state: DiagnosisState | None = None,
+        runtime: WorkflowRuntime,
+    ) -> DiagnosisReport:
         session = self.service.transition(user_id, diagnosis_id, DiagnosisStatus.INVESTIGATING)
         target, system_scan = self._resolve_target(request)
         target_type = request.initial_target.type.value if request.initial_target else None
         target_id = request.initial_target.name if request.initial_target else (target if target != "unknown" else None)
-        self.repository.append_step(
-            diagnosis_id, step_type="TARGET_RESOLUTION", status="COMPLETED",
-            target_type=target_type or ("SERVICE" if target_id else None), target_id=target_id,
-            summary=self._target_summary(request, target),
-        )
+        if self.repository.get_step_by_key(diagnosis_id, "target-resolution") is None:
+            self.repository.append_step(
+                diagnosis_id, step_type="TARGET_RESOLUTION", status="COMPLETED",
+                target_type=target_type or ("SERVICE" if target_id else None), target_id=target_id,
+                summary=self._target_summary(request, target), idempotency_key="target-resolution",
+            )
         self.repository.append_event(diagnosis_id, "diagnosis.started", {
             "diagnosis_id": diagnosis_id, "status": DiagnosisStatus.INVESTIGATING.value,
             "resolved_target": target_id, "system_scan": system_scan,
-        })
+        }, event_key="diagnosis.started")
 
         async def publish(event: dict[str, Any]) -> None:
             event_type = str(event.get("type", ""))
-            if event_type == "phase":
-                self.repository.append_event(diagnosis_id, "phase.changed", {
-                    "phase": event.get("phase"),
-                })
-            elif event_type == "tool" and isinstance(event.get("record"), dict):
-                self._persist_tool_step(diagnosis_id, event["record"], target_id)
+            # DurableWorkflowRuntime 已在逻辑事务边界保存 phase/tool/event。
+            # Callback 仅保留 Workflow 的公开事件接口，避免第二套持久化路径。
+            del event_type, event
 
         report = await self.workflow.run(
             request.question,
@@ -60,8 +68,14 @@ class DiagnosisOrchestrator:
             target=target if target != "unknown" else None,
             symptom=request.question,
             system_scan=system_scan,
+            resume_state=resume_state,
+            runtime=runtime,
         )
-        self._persist_report(diagnosis_id, report, request)
+        affected = self._persist_report(diagnosis_id, report, request)
+        await runtime.finalize_session(
+            run_id=report.run_id, summary=report.decision_summary,
+            affected_services=affected,
+        )
         return report
 
     def resolve_target(self, request: DiagnosisCreateRequest) -> tuple[str, bool]:
@@ -122,9 +136,10 @@ class DiagnosisOrchestrator:
         diagnosis_id: str,
         report: DiagnosisReport,
         request: DiagnosisCreateRequest,
-    ) -> None:
+    ) -> list[str]:
         for item in report.evidence:
             references = [reference.model_dump(mode="json") for reference in item.source_references]
+            logical_step = self.repository.get_step_by_evidence_id(diagnosis_id, item.evidence_id)
             evidence = DiagnosisEvidence(
                 id=item.evidence_id, diagnosis_id=diagnosis_id,
                 source_type=(item.source_type or item.source or "TOOL").upper(),
@@ -142,6 +157,7 @@ class DiagnosisOrchestrator:
                     "parent_evidence_ids": item.parent_evidence_ids,
                     "next_hints": item.next_hints,
                     "direct_evidence": item.direct_evidence,
+                    "logical_step_key": logical_step.idempotency_key if logical_step else None,
                     "raw_result_url": f"/api/agent/evidence/{report.run_id}/{item.evidence_id}",
                 },
                 supports_conclusion=item.supports_conclusion,
@@ -151,32 +167,33 @@ class DiagnosisOrchestrator:
             self.repository.append_event(diagnosis_id, "evidence.created", {
                 "evidence_id": evidence.id, "source_type": evidence.source_type,
                 "resource_id": evidence.resource_id, "title": evidence.title,
-            })
+            }, event_key=f"evidence.created:{evidence.id}")
 
         graph, affected = self._build_graph(report, request)
         root = self._build_root_cause(report, graph)
         self.repository.replace_graph(diagnosis_id, graph)
         self.repository.upsert_root_cause(diagnosis_id, root)
-        self.repository.append_step(
-            diagnosis_id, step_type="REPORT", status="COMPLETED",
-            target_type=root.root_resource.type if root.root_resource else None,
-            target_id=root.root_resource.name if root.root_resource else None,
-            summary=report.decision_summary, evidence_ids=root.evidence_ids,
+        if self.repository.get_step_by_key(diagnosis_id, "final-report") is None:
+            self.repository.append_step(
+                diagnosis_id, step_type="REPORT", status="COMPLETED",
+                target_type=root.root_resource.type if root.root_resource else None,
+                target_id=root.root_resource.name if root.root_resource else None,
+                summary=report.decision_summary, evidence_ids=root.evidence_ids,
+                idempotency_key="final-report",
+            )
+        self.repository.append_event(
+            diagnosis_id, "graph.updated", graph.model_dump(mode="json"),
+            event_key="graph.updated",
         )
-        self.repository.update_session(
-            diagnosis_id, status=DiagnosisStatus.COMPLETED, run_id=report.run_id,
-            summary=report.decision_summary, affected_services=affected, finished=True,
-        )
-        self.repository.append_event(diagnosis_id, "graph.updated", graph.model_dump(mode="json"))
         for node in graph.nodes:
             self.repository.append_event(diagnosis_id, "resource.discovered", {
                 "resource": node.model_dump(mode="json"),
-            })
-        self.repository.append_event(diagnosis_id, "root_cause.generated", root.model_dump(mode="json"))
-        self.repository.append_event(diagnosis_id, "diagnosis.completed", {
-            "diagnosis_id": diagnosis_id, "status": DiagnosisStatus.COMPLETED.value,
-            "summary": report.decision_summary, "affected_services": affected,
-        })
+            }, event_key=f"resource.discovered:{node.id}")
+        self.repository.append_event(
+            diagnosis_id, "root_cause.generated", root.model_dump(mode="json"),
+            event_key="root_cause.generated",
+        )
+        return affected
 
     def _build_graph(
         self,
@@ -243,7 +260,8 @@ class DiagnosisOrchestrator:
             if source:
                 evidence_ids = [evidence.evidence_id for evidence in database_evidence]
                 edges.append(IncidentGraphEdge(
-                    id=uuid4().hex, source=f"service:{source}", target=f"database:{database_name}",
+                    id=self._edge_id(f"service:{source}", f"database:{database_name}", "SQL"),
+                    source=f"service:{source}", target=f"database:{database_name}",
                     relation="SQL", status="AFFECTED", evidence_ids=evidence_ids,
                 ))
 
@@ -257,7 +275,7 @@ class DiagnosisOrchestrator:
             ))
             owner = report.service if report.service in services else None
             if owner:
-                edge_id = uuid4().hex
+                edge_id = self._edge_id(f"service:{owner}", f"pod:{pod}", "RUNS_ON")
                 edges.append(IncidentGraphEdge(
                     id=edge_id, source=f"service:{owner}", target=f"pod:{pod}",
                     relation="RUNS_ON", status="AFFECTED",
@@ -307,10 +325,16 @@ class DiagnosisOrchestrator:
             return
         keys.add(key)
         edges.append(IncidentGraphEdge(
-            id=uuid4().hex, source=f"service:{source}", target=f"service:{target}",
+            id=DiagnosisOrchestrator._edge_id(
+                f"service:{source}", f"service:{target}", relation,
+            ), source=f"service:{source}", target=f"service:{target}",
             relation=relation, latency_ms=latency_ms, status="AFFECTED",
             evidence_ids=evidence_ids or [],
         ))
+
+    @staticmethod
+    def _edge_id(source: str, target: str, relation: str) -> str:
+        return hashlib.sha256(f"{source}|{target}|{relation}".encode("utf-8")).hexdigest()[:32]
 
     @staticmethod
     def _target_summary(request: DiagnosisCreateRequest, target: str) -> str:

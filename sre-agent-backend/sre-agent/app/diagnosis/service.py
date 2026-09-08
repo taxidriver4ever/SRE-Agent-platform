@@ -27,14 +27,14 @@ class DiagnosisService:
         conversation = self.conversations.create(user_id, f"Incident · {request.question[:80]}")
         session = self.repository.create(
             user_id, str(conversation["id"]), request.question,
-            request.trigger_type.value, request.initial_target,
+            request.trigger_type.value, request.initial_target, request.project_id,
         )
         self.repository.append_event(session.id, "diagnosis.created", {
             "diagnosis_id": session.id,
             "trigger_type": session.trigger_type.value,
             "initial_target": session.initial_target.model_dump(mode="json") if session.initial_target else None,
             "status": session.status.value,
-        })
+        }, event_key="diagnosis.created")
         return session
 
     def get_detail(self, user_id: str, diagnosis_id: str) -> DiagnosisSession | None:
@@ -74,7 +74,7 @@ class DiagnosisService:
             "diagnosis_id": diagnosis_id,
             "status": DiagnosisStatus.FAILED.value,
             "message": self._error_text(error),
-        })
+        }, event_key="diagnosis.failed")
 
     @staticmethod
     def _error_text(error: Exception) -> str:

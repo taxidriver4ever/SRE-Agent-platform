@@ -33,6 +33,7 @@ from app.workflow.planner import EvidencePlanner
 from app.workflow.runtime_extractor import (
     extract_git_sha, extract_pod_runtime, extract_trace_id, find_pod_name,
 )
+from app.workflow.runtime import NoopWorkflowRuntime, ToolExecutionClaim, WorkflowRuntime
 
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 logger = logging.getLogger(__name__)
@@ -78,22 +79,31 @@ class DiagnosisWorkflow:
         symptom: str | None = None,
         system_scan: bool = False,
         selected_services: list[str] | None = None,
+        resume_state: DiagnosisState | None = None,
+        runtime: WorkflowRuntime | None = None,
     ) -> DiagnosisReport:
         """从 TRIAGE 走到 REPORT；模型不能跳过基线观测或证据验证。"""
-        run_id = uuid4().hex
-        # 没有持久会话的脚本调用使用 run_id 作为独立内存会话，不共享上下文。
-        state = DiagnosisState(
-            query=query,
-            run_id=run_id,
-            conversation_id=conversation_id or run_id,
-            user_id=user_id,
-            service=target or "unknown",
-            symptom=symptom or "待确定",
-            max_tool_steps=self.max_steps,
-            selected_services=list(dict.fromkeys(selected_services or [])),
-        )
+        runtime = runtime or NoopWorkflowRuntime()
+        if resume_state is None:
+            run_id = uuid4().hex
+            # 没有持久会话的脚本调用使用 run_id 作为独立内存会话，不共享上下文。
+            state = DiagnosisState(
+                query=query,
+                run_id=run_id,
+                conversation_id=conversation_id or run_id,
+                user_id=user_id,
+                service=target or "unknown",
+                symptom=symptom or "待确定",
+                max_tool_steps=self.max_steps,
+                selected_services=list(dict.fromkeys(selected_services or [])),
+            )
+        else:
+            # Crash Recovery 保留 logical run_id、Evidence、Timeline 与 Runtime Identity。
+            state = resume_state
+            state.max_tool_steps = self.max_steps
+        await runtime.initialize(state)
         planner = EvidencePlanner(self.llm) if self.llm is not None else None
-        if self.conversation_service and state.user_id:
+        if resume_state is None and self.conversation_service and state.user_id:
             self.conversation_service.append(
                 state.user_id,
                 state.conversation_id,
@@ -101,10 +111,13 @@ class DiagnosisWorkflow:
                 {"message": query},
                 message_type="user",
                 run_id=state.run_id,
+                message_id=self._conversation_operation_id(state.run_id, "user"),
             )
         try:
             report = await asyncio.wait_for(
-                self._execute_diagnosis(state, planner, on_event, system_scan=system_scan),
+                self._execute_diagnosis(
+                    state, planner, on_event, system_scan=system_scan, runtime=runtime,
+                ),
                 timeout=self.deadline_seconds,
             )
         except TimeoutError:
@@ -125,10 +138,13 @@ class DiagnosisWorkflow:
                 confidence=0.0,
             )
             if WorkflowPhase.VERIFY not in state.phases:
-                await self._phase(state, WorkflowPhase.VERIFY, on_event)
+                await self._phase(state, WorkflowPhase.VERIFY, on_event, runtime)
             report = self._report(state)
-            await self._phase(state, WorkflowPhase.REPORT, on_event)
-            await self._phase(state, WorkflowPhase.END, on_event)
+            await runtime.phase_completed(state, WorkflowPhase.VERIFY)
+            await self._phase(state, WorkflowPhase.REPORT, on_event, runtime)
+            await runtime.phase_completed(state, WorkflowPhase.REPORT)
+            await self._phase(state, WorkflowPhase.END, on_event, runtime)
+            await runtime.phase_completed(state, WorkflowPhase.END)
             report.workflow_phases = state.phases
         await self._update_conversation_context(state, report)
         if on_event:
@@ -142,40 +158,69 @@ class DiagnosisWorkflow:
         on_event: EventCallback | None,
         *,
         system_scan: bool,
+        runtime: WorkflowRuntime,
     ) -> DiagnosisReport:
         """执行受整轮 deadline 约束的诊断阶段；报告持久化在截止时间之外完成。"""
-        await self._phase(state, WorkflowPhase.START, on_event)
-        if system_scan:
-            await self._system_scan(state, on_event)
-        await self._triage(state, on_event, system_scan=system_scan)
-        await self._baseline(state, on_event, system_scan=system_scan)
-        await self._analyze(state, on_event)
-        await self._investigate(state, on_event, planner=planner, system_scan=system_scan)
-        await self._phase(state, WorkflowPhase.VERIFY, on_event)
-        # Planner 直接消费有界 Evidence，不需要等待会话压缩。压缩在报告落库后
-        # 后台执行，避免把最多 30 秒的增强任务计入同步诊断延迟。
-        await self._synthesize_with_gateway(state, planner, on_event)
+        if not runtime.should_skip_phase(WorkflowPhase.START):
+            await self._phase(state, WorkflowPhase.START, on_event, runtime)
+            await runtime.phase_completed(state, WorkflowPhase.START)
+        if system_scan and not runtime.should_skip_phase(WorkflowPhase.SYSTEM_SCAN):
+            await self._system_scan(state, on_event, runtime=runtime)
+            await runtime.phase_completed(state, WorkflowPhase.SYSTEM_SCAN)
+        if not runtime.should_skip_phase(WorkflowPhase.TRIAGE):
+            await self._triage(state, on_event, system_scan=system_scan, runtime=runtime)
+            await runtime.phase_completed(state, WorkflowPhase.TRIAGE)
+        if not runtime.should_skip_phase(WorkflowPhase.BASELINE_OBSERVATION):
+            await self._baseline(state, on_event, system_scan=system_scan, runtime=runtime)
+            await runtime.phase_completed(state, WorkflowPhase.BASELINE_OBSERVATION)
+        if not runtime.should_skip_phase(WorkflowPhase.ANALYZE):
+            await self._analyze(state, on_event, runtime=runtime)
+            await runtime.phase_completed(state, WorkflowPhase.ANALYZE)
+        if not runtime.should_skip_phase(WorkflowPhase.INVESTIGATE):
+            await self._investigate(
+                state, on_event, planner=planner, system_scan=system_scan, runtime=runtime,
+            )
+            await runtime.phase_completed(state, WorkflowPhase.INVESTIGATE)
+        if not runtime.should_skip_phase(WorkflowPhase.VERIFY):
+            await self._phase(state, WorkflowPhase.VERIFY, on_event, runtime)
+            # Planner 直接消费有界 Evidence，不需要等待会话压缩。压缩在报告落库后
+            # 后台执行，避免把最多 30 秒的增强任务计入同步诊断延迟。
+            await self._synthesize_with_gateway(state, planner, on_event)
+            await runtime.phase_completed(state, WorkflowPhase.VERIFY)
         report = self._report(state)
-        await self._phase(state, WorkflowPhase.REPORT, on_event)
-        await self._phase(state, WorkflowPhase.END, on_event)
+        if not runtime.should_skip_phase(WorkflowPhase.REPORT):
+            await self._phase(state, WorkflowPhase.REPORT, on_event, runtime)
+            await runtime.phase_completed(state, WorkflowPhase.REPORT)
+        if not runtime.should_skip_phase(WorkflowPhase.END):
+            await self._phase(state, WorkflowPhase.END, on_event, runtime)
+            await runtime.phase_completed(state, WorkflowPhase.END)
         report.workflow_phases = state.phases
         return report
 
-    async def _phase(self, state: DiagnosisState, phase: WorkflowPhase, callback: EventCallback | None) -> None:
+    async def _phase(
+        self, state: DiagnosisState, phase: WorkflowPhase, callback: EventCallback | None,
+        runtime: WorkflowRuntime | None = None,
+    ) -> None:
         """记录状态迁移并向 SSE 客户端发送进度事件。"""
-        state.phases.append(phase)
+        if phase not in state.phases:
+            state.phases.append(phase)
+        if runtime is not None:
+            await runtime.phase_started(state, phase)
         if callback:
             await callback({"type": "phase", "phase": phase.value})
 
-    async def _system_scan(self, state: DiagnosisState, callback: EventCallback | None) -> None:
+    async def _system_scan(
+        self, state: DiagnosisState, callback: EventCallback | None,
+        *, runtime: WorkflowRuntime | None = None,
+    ) -> None:
         """整体巡检先建立全局服务、Pod 和错误率视图，不预设故障服务。"""
-        await self._phase(state, WorkflowPhase.SYSTEM_SCAN, callback)
+        await self._phase(state, WorkflowPhase.SYSTEM_SCAN, callback, runtime)
         # Deployment 与 Pod 清单都是独立的只读发现操作。它们需要先于全局
         # Baseline 完成，但彼此没有数据依赖，可以安全并发。
         await self._call_concurrently(state, callback, [
             ("list_deployments", {}, "系统 Deployment 清单"),
             ("list_pods", {}, "系统 Pod、版本与运行状态"),
-        ])
+        ], runtime=runtime, phase=WorkflowPhase.SYSTEM_SCAN)
 
     async def _triage(
         self,
@@ -183,9 +228,10 @@ class DiagnosisWorkflow:
         callback: EventCallback | None,
         *,
         system_scan: bool = False,
+        runtime: WorkflowRuntime | None = None,
     ) -> None:
         """确定 service、symptom、environment 与默认最近 30 分钟窗口。"""
-        await self._phase(state, WorkflowPhase.TRIAGE, callback)
+        await self._phase(state, WorkflowPhase.TRIAGE, callback, runtime)
         analysis_input = state.query
         if state.service not in self.catalog.services:
             state.service = self.catalog.resolve(f"{state.service} {analysis_input}")
@@ -249,7 +295,10 @@ class DiagnosisWorkflow:
             state.symptom = "general_incident"
         # 即使用户没有明确服务，也先列出只读 Service/Deployment，避免凭空选定根因。
         if state.service == "unknown" and not system_scan:
-            await self._call(state, "list_deployments", {}, "K8s 服务发现", callback)
+            await self._call(
+                state, "list_deployments", {}, "K8s 服务发现", callback,
+                runtime=runtime, phase=WorkflowPhase.TRIAGE,
+            )
 
     async def _baseline(
         self,
@@ -257,9 +306,10 @@ class DiagnosisWorkflow:
         callback: EventCallback | None,
         *,
         system_scan: bool = False,
+        runtime: WorkflowRuntime | None = None,
     ) -> None:
         """硬性采集健康、延迟、错误率、CPU/内存与异常日志。"""
-        await self._phase(state, WorkflowPhase.BASELINE_OBSERVATION, callback)
+        await self._phase(state, WorkflowPhase.BASELINE_OBSERVATION, callback, runtime)
         if system_scan and state.service == "unknown":
             await self._call_concurrently(state, callback, [
                 (
@@ -291,7 +341,7 @@ class DiagnosisWorkflow:
                     {"time_range_minutes": state.time_range_minutes, "level": "error", "limit": 50},
                     "全局异常日志",
                 ),
-            ])
+            ], runtime=runtime, phase=WorkflowPhase.BASELINE_OBSERVATION)
             return
         if state.service == "unknown":
             await self._call_concurrently(state, callback, [
@@ -305,14 +355,22 @@ class DiagnosisWorkflow:
                     {"time_range_minutes": state.time_range_minutes, "limit": 50},
                     "跨服务近期日志",
                 ),
-            ])
+            ], runtime=runtime, phase=WorkflowPhase.BASELINE_OBSERVATION)
             return
         service = state.service
         common = {"service": service, "time_range_minutes": state.time_range_minutes}
         # Pod 清单必须先于聚合指标采集，以便识别单实例异常与混合镜像版本。
-        pods = await self._call(state, "list_pods", {"label_selector": f"app={service}"}, "服务 Pod 与运行版本", callback)
+        pods = await self._call(
+            state, "list_pods", {"label_selector": f"app={service}"}, "服务 Pod 与运行版本", callback,
+            runtime=runtime, phase=WorkflowPhase.BASELINE_OBSERVATION,
+        )
         self._extract_pod_runtime(state, pods)
         state.pod_name = state.pod_name or self._find_pod_name(pods, service)
+        if runtime is not None:
+            await runtime.checkpoint(
+                state, WorkflowPhase.BASELINE_OBSERVATION,
+                f"pod-runtime:{len(state.timeline)}",
+            )
         # 优先查询 P95 直方图；服务未开启 histogram 时 INVESTIGATE 仍可依赖日志、Trace 和数据库证据。
         latency = (
             f'histogram_quantile(0.95, sum(rate(http_server_requests_seconds_bucket'
@@ -331,11 +389,14 @@ class DiagnosisWorkflow:
             ("query_metrics", {"query": errors, "time_range_minutes": state.time_range_minutes}, "HTTP 5xx 速率"),
             ("query_metrics", {"query": resources, "time_range_minutes": state.time_range_minutes}, "Pod 级 CPU/内存"),
             ("query_logs", {**common, "limit": 20}, "近期服务日志"),
-        ])
+        ], runtime=runtime, phase=WorkflowPhase.BASELINE_OBSERVATION)
 
-    async def _analyze(self, state: DiagnosisState, callback: EventCallback | None) -> None:
+    async def _analyze(
+        self, state: DiagnosisState, callback: EventCallback | None,
+        *, runtime: WorkflowRuntime | None = None,
+    ) -> None:
         """候选原因由后续 Planner 从 Evidence 生成，Workflow 不预置故障答案。"""
-        await self._phase(state, WorkflowPhase.ANALYZE, callback)
+        await self._phase(state, WorkflowPhase.ANALYZE, callback, runtime)
         state.candidates = []
 
     async def _investigate(
@@ -345,12 +406,25 @@ class DiagnosisWorkflow:
         *,
         planner: EvidencePlanner | None,
         system_scan: bool = False,
+        runtime: WorkflowRuntime | None = None,
     ) -> None:
         """由 Planner 根据当前 Evidence 逐步选择工具，不按 Service/Case 分支。"""
-        await self._phase(state, WorkflowPhase.INVESTIGATE, callback)
+        await self._phase(state, WorkflowPhase.INVESTIGATE, callback, runtime)
         del system_scan
         if planner is None or state.service == "unknown":
             return
+        # INVESTIGATE 中断在 Tool commit 之前时，优先恢复数据库中的 RUNNING
+        # logical step。真实 Tool 是只读的，允许 crash window 内 at-least-once；
+        # Runtime 会强制复用原 idempotency_key、Evidence ID 和 Step 行。
+        pending_calls = runtime.pending_tool_calls(WorkflowPhase.INVESTIGATE) if runtime else []
+        for pending in pending_calls:
+            if len(state.timeline) >= self.max_steps:
+                break
+            await self._call(
+                state, pending.tool_name, pending.arguments, pending.title, callback,
+                parent_evidence_ids=pending.parent_evidence_ids,
+                runtime=runtime, phase=WorkflowPhase.INVESTIGATE,
+            )
         investigation_tools = {
             "query_metrics", "query_logs", "query_trace", "query_slow_queries",
             "query_sql_digest", "explain_sql", "get_pod", "get_pod_events",
@@ -403,11 +477,18 @@ class DiagnosisWorkflow:
                 decision.title,
                 callback,
                 parent_evidence_ids=decision.parent_evidence_ids,
+                runtime=runtime,
+                phase=WorkflowPhase.INVESTIGATE,
             )
             if decision.tool_name in {"list_pods", "get_pod"}:
                 self._extract_pod_runtime(state, result)
             elif decision.tool_name == "get_container_image":
                 state.runtime_commit = self._extract_git_sha(result) or state.runtime_commit
+            if runtime is not None:
+                await runtime.checkpoint(
+                    state, WorkflowPhase.INVESTIGATE,
+                    f"planner-round:{len(state.timeline)}",
+                )
 
     async def _call(
         self,
@@ -417,14 +498,32 @@ class DiagnosisWorkflow:
         title: str,
         callback: EventCallback | None,
         parent_evidence_ids: list[str] | None = None,
+        runtime: WorkflowRuntime | None = None,
+        phase: WorkflowPhase = WorkflowPhase.INVESTIGATE,
     ) -> Any:
         """执行工具并记录 timestamp/duration/error；到达 max_steps 后拒绝继续。"""
         if len(state.timeline) >= self.max_steps:
             return None
         started_at = datetime.now(timezone.utc)
         started = time.perf_counter()
+        active_runtime = runtime or NoopWorkflowRuntime()
+        claim = await active_runtime.begin_tool(
+            state, phase, tool_name, arguments, title, parent_evidence_ids or [],
+        )
+        if claim.completed:
+            if claim.evidence is not None and all(
+                item.evidence_id != claim.evidence.evidence_id for item in state.evidence
+            ):
+                state.evidence.append(claim.evidence)
+            if claim.record is not None and not any(
+                item.tool_name == claim.record.tool_name and item.arguments == claim.record.arguments
+                for item in state.timeline
+            ):
+                state.timeline.append(claim.record)
+            return claim.result
         error: str | None = None
-        evidence_id: str | None = None
+        evidence_id: str | None = claim.evidence_id
+        evidence: Evidence | None = None
         result: Any = None
         if self.conversation_service and state.user_id:
             self.conversation_service.append(
@@ -435,6 +534,7 @@ class DiagnosisWorkflow:
                 message_type="tool_call",
                 run_id=state.run_id,
                 tool_name=tool_name,
+                message_id=self._conversation_operation_id(claim.idempotency_key, "call"),
             )
         try:
             result = await self.tools.execute(tool_name, arguments)
@@ -462,11 +562,12 @@ class DiagnosisWorkflow:
                     message_type="tool_result",
                     run_id=state.run_id,
                     tool_name=tool_name,
+                    message_id=evidence_id,
                 )
             else:
                 evidence_id = f"ev_{uuid4().hex[:16]}"
             summary = normalized.summary
-            state.evidence.append(Evidence(
+            evidence = Evidence(
                 source=self._source(tool_name), source_type=self._source(tool_name),
                 tool_name=tool_name, title=title, detail=summary, summary=summary,
                 timestamp=started_at, evidence_id=evidence_id,
@@ -476,7 +577,8 @@ class DiagnosisWorkflow:
                 next_hints=normalized.next_hints,
                 supports_conclusion=self._supports_conclusion(tool_name, summary),
                 direct_evidence=self._is_direct_evidence(tool_name, arguments, summary),
-            ))
+            )
+            state.evidence.append(evidence)
         except Exception as exc:
             error = self._exception_text(exc)
             summary = ""
@@ -503,6 +605,7 @@ class DiagnosisWorkflow:
                     message_type="tool_result",
                     run_id=state.run_id,
                     tool_name=tool_name,
+                    message_id=evidence_id,
                 )
         record = ToolCallRecord(
             tool_name=tool_name, arguments=arguments, result_summary=summary,
@@ -510,6 +613,9 @@ class DiagnosisWorkflow:
             evidence_id=evidence_id,
         )
         state.timeline.append(record)
+        await active_runtime.complete_tool(
+            state, phase, claim, record, evidence, result,
+        )
         if callback:
             await callback({"type": "tool", "record": record.model_dump(mode="json")})
         return result
@@ -519,6 +625,9 @@ class DiagnosisWorkflow:
         state: DiagnosisState,
         callback: EventCallback | None,
         calls: list[tuple[str, dict[str, Any], str]],
+        *,
+        runtime: WorkflowRuntime | None = None,
+        phase: WorkflowPhase = WorkflowPhase.BASELINE_OBSERVATION,
     ) -> list[Any]:
         """并发执行一组互不依赖的只读调用，并在调度前统一预留预算。
 
@@ -533,7 +642,10 @@ class DiagnosisWorkflow:
             return []
         results = await asyncio.gather(
             *(
-                self._call(state, tool_name, arguments, title, callback)
+                self._call(
+                    state, tool_name, arguments, title, callback,
+                    runtime=runtime, phase=phase,
+                )
                 for tool_name, arguments, title in selected
             ),
             return_exceptions=True,
@@ -546,6 +658,13 @@ class DiagnosisWorkflow:
             else:
                 normalized.append(result)
         return normalized
+
+    @staticmethod
+    def _conversation_operation_id(idempotency_key: str | None, suffix: str) -> str | None:
+        if not idempotency_key:
+            return None
+        import hashlib
+        return hashlib.sha256(f"{idempotency_key}:{suffix}".encode("utf-8")).hexdigest()[:32]
 
     @staticmethod
     def _exception_text(exc: BaseException) -> str:
@@ -590,6 +709,7 @@ class DiagnosisWorkflow:
                 {"report": report.model_dump(mode="json")},
                 message_type="assistant",
                 run_id=state.run_id,
+                message_id=self._conversation_operation_id(state.run_id, "final-report"),
             )
         except Exception as exc:
             # 诊断工具证据已经在各步骤尽力落库；最终持久化短暂失败不能把一个

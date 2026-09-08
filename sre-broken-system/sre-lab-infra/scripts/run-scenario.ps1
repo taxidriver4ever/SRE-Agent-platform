@@ -125,6 +125,70 @@ function Deploy-InventoryBad {
     kubectl -n sre-lab rollout status deployment/inventory-service --timeout=180s | Out-Null
 }
 
+function Wait-MySqlSlowQueryEvidence {
+    param([int]$TimeoutSeconds = 30)
+    foreach ($attempt in 1..$TimeoutSeconds) {
+        $countText = kubectl -n sre-lab exec deployment/mysql -- sh -lc `
+            'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -N -e "SELECT COUNT(*) FROM mysql.slow_log;"' 2>$null
+        if ($LASTEXITCODE -eq 0 -and [int]($countText | Select-Object -Last 1) -gt 0) {
+            return
+        }
+        Start-Sleep -Seconds 1
+    }
+    throw "MySQL slow-query evidence was not observable within $TimeoutSeconds seconds for $Scenario"
+}
+
+function Set-MySqlSlowQueryThreshold {
+    param([double]$Seconds)
+    $threshold = $Seconds.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    $command = 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "SET GLOBAL long_query_time={0};"' -f $threshold
+    kubectl -n sre-lab exec deployment/mysql -- sh -lc $command | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "failed to set MySQL long_query_time=$threshold for $Scenario"
+    }
+}
+
+function Wait-PodRestartEvidence {
+    param([string]$Service, [int]$TimeoutSeconds = 60)
+    foreach ($attempt in 1..$TimeoutSeconds) {
+        $podList = kubectl -n sre-lab get pods -l "app=$Service" -o json | ConvertFrom-Json
+        $restartCount = @($podList.items | ForEach-Object {
+            $_.status.containerStatuses | ForEach-Object { [int]$_.restartCount }
+        } | Measure-Object -Sum).Sum
+        if ($restartCount -gt 0) {
+            return
+        }
+        Start-Sleep -Seconds 1
+    }
+    throw "Pod restart evidence was not observable within $TimeoutSeconds seconds for $Scenario"
+}
+
+function Wait-PrometheusPodCpuEvidence {
+    param([string]$Service, [string]$Pod, [int]$TimeoutSeconds = 45)
+    $query = "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=`"sre-lab`",pod=~`"$Service.*`"}[5m]))"
+    $uri = "http://127.0.0.1:19090/api/v1/query?query=$([Uri]::EscapeDataString($query))"
+    foreach ($attempt in 1..$TimeoutSeconds) {
+        try {
+            $response = Invoke-RestMethod -Uri $uri -TimeoutSec 3
+            $pods = @($response.data.result | ForEach-Object { $_.metric.pod })
+            if ($Pod -in $pods) {
+                return
+            }
+        } catch {
+            # Prometheus 刚重启时短暂不可用，继续在有限超时内等待。
+        }
+        Start-Sleep -Seconds 1
+    }
+    throw "Prometheus CPU evidence for $Pod was not observable within $TimeoutSeconds seconds for $Scenario"
+}
+
+# 全表扫描在宿主机负载较低时偶尔会略低于 Lab 默认 50ms 阈值。只对明确验证
+# SQL 回归的三个 Case 收紧到 10ms，保证同一条真实全表扫描稳定进入 slow_log；
+# 其他 Case 仍使用默认阈值，避免普通 SQL 污染其 Evidence。
+if ($Scenario -in @('SRE-001', 'SRE-007', 'SRE-009')) {
+    Set-MySqlSlowQueryThreshold 0.01
+}
+
 switch($Scenario){
     'SRE-001'{Deploy-OrderBad;Set-AllPodFaults order-service 8080 '/debug/fault/slow_sql';Invoke-ServiceLoad order-service 8080 '/orders/search?email=slow.example.com&limit=20' 12}
     'SRE-002'{Deploy-OrderBad;Set-AllPodFaults order-service 8080 '/debug/fault/pool_exhaustion';$jobs=1..18|ForEach-Object{Start-Job{Invoke-RestMethod 'http://127.0.0.1:18080/orders/search?email=slow.example.com&limit=20' -TimeoutSec 30}};$jobs|Wait-Job|Receive-Job -ErrorAction SilentlyContinue|Out-Null;$jobs|Remove-Job}
@@ -161,5 +225,18 @@ switch($Scenario){
         Write-Host 'Service now balances across two GOOD Pods and one BAD canary Pod.'
     }
     'SRE-010'{kubectl -n sre-lab patch deployment order-service --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/httpGet/path","value":"/broken-health"}]'|Out-Null;Start-Sleep -Seconds 45;Write-Host 'Invalid liveness path produced restart/CrashLoop evidence; reset-lab.ps1 restores it.'}
+}
+
+# 这些 Case 的评测契约明确要求 MySQL Evidence。slow_log 的 TABLE 输出在高负载、
+# Pod 切换或日志重新开启后可能稍晚于业务请求可见；在证据真正可查询前不能把场景
+# 标记为已激活，否则会把故障注入尚未完成误判为 Agent 诊断失败。
+if ($Scenario -in @('SRE-001', 'SRE-002', 'SRE-007', 'SRE-009')) {
+    Wait-MySqlSlowQueryEvidence
+}
+if ($Scenario -eq 'SRE-010') {
+    Wait-PodRestartEvidence order-service
+}
+if ($Scenario -eq 'SRE-008') {
+    Wait-PrometheusPodCpuEvidence order-service $pod
 }
 Write-Host "$Scenario activated. Definition and expected evidence: scenarios/catalog.yaml"

@@ -131,3 +131,12 @@ CREATE TABLE IF NOT EXISTS diagnosis_events (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Diagnosis SSE 领域事件';
 
 ALTER TABLE diagnosis_events COMMENT = 'Diagnosis SSE 领域事件';
+
+-- Diagnosis 模块：记录已经执行的模块内数据库迁移，保证旧库可以幂等升级。
+CREATE TABLE IF NOT EXISTS diagnosis_schema_migrations (
+    version VARCHAR(120) NOT NULL COMMENT '模块迁移版本，例如 001_durable_execution',
+    applied_at VARCHAR(40) NOT NULL COMMENT '迁移完成时间，ISO 8601 格式',
+    PRIMARY KEY (version)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Diagnosis 模块数据库迁移记录';
+
+ALTER TABLE diagnosis_schema_migrations COMMENT = 'Diagnosis 模块数据库迁移记录';

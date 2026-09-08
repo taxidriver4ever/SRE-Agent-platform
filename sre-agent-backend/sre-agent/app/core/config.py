@@ -58,6 +58,9 @@ class Settings:
     repository_allowed_hosts: tuple[str, ...]
     tool_timeout_seconds: float
     diagnosis_deadline_seconds: float
+    diagnosis_max_attempts: int
+    diagnosis_lease_ttl_seconds: float
+    diagnosis_heartbeat_interval_seconds: float
     tool_output_limit: int
     model_context_window: int
     context_compaction_ratio: float
@@ -80,6 +83,18 @@ class Settings:
     sandbox_memory_mb: int
     sandbox_pids_limit: int
     sandbox_timeout_seconds: float
+    validation_workspace_root: str
+    validation_artifact_root: str
+    validation_maven_image: str
+    validation_python_image: str
+    validation_cpus: float
+    validation_memory_mb: int
+    validation_pids_limit: int
+    validation_prepare_timeout_seconds: float
+    validation_build_timeout_seconds: float
+    validation_test_timeout_seconds: float
+    validation_overall_timeout_seconds: float
+    validation_allow_build_network: bool
 
 
 def get_settings() -> Settings:
@@ -128,6 +143,11 @@ def get_settings() -> Settings:
         tool_timeout_seconds=float(os.getenv("TOOL_TIMEOUT_SECONDS", "15")),
         # 整轮诊断的独立截止时间；它高于单 Tool/LLM 超时，但不会无限等待。
         diagnosis_deadline_seconds=float(os.getenv("DIAGNOSIS_DEADLINE_SECONDS", "240")),
+        diagnosis_max_attempts=max(1, min(10, int(os.getenv("DIAGNOSIS_MAX_ATTEMPTS", "3")))),
+        diagnosis_lease_ttl_seconds=max(30.0, float(os.getenv("DIAGNOSIS_LEASE_TTL_SECONDS", "60"))),
+        diagnosis_heartbeat_interval_seconds=max(
+            5.0, min(20.0, float(os.getenv("DIAGNOSIS_HEARTBEAT_INTERVAL_SECONDS", "10")))
+        ),
         tool_output_limit=int(os.getenv("TOOL_OUTPUT_LIMIT", "12000")),
         model_context_window=max(4096, int(os.getenv("MODEL_CONTEXT_WINDOW", "32768"))),
         context_compaction_ratio=min(
@@ -162,4 +182,25 @@ def get_settings() -> Settings:
         sandbox_memory_mb=int(os.getenv("SRE_SANDBOX_MEMORY_MB", "512")),
         sandbox_pids_limit=int(os.getenv("SRE_SANDBOX_PIDS_LIMIT", "128")),
         sandbox_timeout_seconds=float(os.getenv("SRE_SANDBOX_TIMEOUT_SECONDS", "120")),
+        validation_workspace_root=os.getenv(
+            "SRE_VALIDATION_WORKSPACE_ROOT",
+            str(Path(tempfile.gettempdir()) / "sre-pre-merge-validation"),
+        ),
+        validation_artifact_root=os.getenv(
+            "SRE_VALIDATION_ARTIFACT_ROOT",
+            str(Path(tempfile.gettempdir()) / "sre-pre-merge-validation-artifacts"),
+        ),
+        validation_maven_image=os.getenv(
+            "SRE_VALIDATION_MAVEN_IMAGE", "maven:3.9.9-eclipse-temurin-21"
+        ),
+        validation_python_image=os.getenv("SRE_VALIDATION_PYTHON_IMAGE", "sre-validation-python:3.12"),
+        validation_cpus=max(0.25, float(os.getenv("SRE_VALIDATION_CPUS", "1.0"))),
+        validation_memory_mb=max(256, int(os.getenv("SRE_VALIDATION_MEMORY_MB", "1024"))),
+        validation_pids_limit=max(32, int(os.getenv("SRE_VALIDATION_PIDS_LIMIT", "128"))),
+        validation_prepare_timeout_seconds=max(10, float(os.getenv("SRE_VALIDATION_PREPARE_TIMEOUT_SECONDS", "60"))),
+        validation_build_timeout_seconds=max(30, float(os.getenv("SRE_VALIDATION_BUILD_TIMEOUT_SECONDS", "300"))),
+        validation_test_timeout_seconds=max(30, float(os.getenv("SRE_VALIDATION_TEST_TIMEOUT_SECONDS", "600"))),
+        validation_overall_timeout_seconds=max(60, float(os.getenv("SRE_VALIDATION_OVERALL_TIMEOUT_SECONDS", "900"))),
+        # 默认完全断网；仅管理员显式配置后允许容器下载构建依赖。
+        validation_allow_build_network=os.getenv("SRE_VALIDATION_ALLOW_BUILD_NETWORK", "false").lower() == "true",
     )

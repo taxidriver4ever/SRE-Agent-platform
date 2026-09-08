@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -97,3 +98,70 @@ class RepositoryRegistry:
                     timeout=max(self.timeout, 60),
                 )
         return target
+
+    def repositories(self) -> list[str]:
+        """返回 Service Catalog 中已经授权的仓库名称。"""
+        return sorted(self.local_paths)
+
+    async def list_branches(self, service: str) -> list[str]:
+        """只列出授权仓库真实存在的本地或 origin 分支。"""
+        repository = await self.resolve(service)
+        if service in self.remote_urls:
+            # 对显式白名单远程仓库刷新 heads，确保新建 Validation 解析的是
+            # 请求时最新的远端分支，而不是旧缓存中的 origin/*。本地实验仓库
+            # 没有可信远程 URL 时保持纯本地读取，不猜测或访问任意 origin。
+            lock = self._locks.setdefault(service, asyncio.Lock())
+            async with lock:
+                await run_fixed_command(
+                    "git",
+                    ["-C", str(repository), "fetch", "--prune", "origin",
+                     "+refs/heads/*:refs/remotes/origin/*"],
+                    timeout=max(self.timeout, 60),
+                )
+        output = await run_fixed_command(
+            "git",
+            ["-C", str(repository), "for-each-ref", "--format=%(refname)",
+             "refs/heads", "refs/remotes/origin"],
+            timeout=self.timeout,
+        )
+        branches: set[str] = set()
+        for line in output.splitlines():
+            ref = line.strip()
+            if ref.startswith("refs/heads/"):
+                branches.add(ref.removeprefix("refs/heads/"))
+            elif ref.startswith("refs/remotes/origin/") and not ref.endswith("/HEAD"):
+                branches.add(ref.removeprefix("refs/remotes/origin/"))
+        return sorted(branch for branch in branches if self._safe_branch(branch))
+
+    async def resolve_ref(self, service: str, branch: str) -> tuple[Path, str]:
+        """把下拉框中的授权 Branch 冻结为不可变的完整 Commit SHA。"""
+        if branch not in await self.list_branches(service):
+            raise ToolError("branch is not present in the authorized repository")
+        repository = await self.resolve(service)
+        candidates = (
+            [f"refs/remotes/origin/{branch}", f"refs/heads/{branch}"]
+            if service in self.remote_urls
+            else [f"refs/heads/{branch}", f"refs/remotes/origin/{branch}"]
+        )
+        for ref in candidates:
+            try:
+                output = await run_fixed_command(
+                    "git", ["-C", str(repository), "rev-parse", "--verify", f"{ref}^{{commit}}"],
+                    timeout=self.timeout,
+                )
+            except ToolError:
+                continue
+            commit = output.strip().lower()
+            if re.fullmatch(r"[0-9a-f]{40}", commit):
+                return repository, commit
+        raise ToolError("branch did not resolve to a full commit SHA")
+
+    @staticmethod
+    def _safe_branch(branch: str) -> bool:
+        return bool(
+            branch and len(branch) <= 240 and not branch.startswith(("-", "."))
+            and ".." not in branch and "@{" not in branch and "\\" not in branch
+            and not branch.endswith((".", "/", ".lock")) and "//" not in branch
+            and all(character not in branch for character in " ~^:?*[")
+            and all(32 <= ord(character) < 127 for character in branch)
+        )

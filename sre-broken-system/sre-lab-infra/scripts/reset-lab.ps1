@@ -47,6 +47,10 @@ function Set-PodFaultNormal {
 }
 
 kubectl -n sre-lab rollout status deployment/order-service --timeout=240s | Out-Null
+# SQL 回归场景可能临时收紧慢查询阈值；恢复基线时必须同步还原，避免后续
+# 非数据库 Case 被普通 SQL 的 slow_log 记录污染。
+kubectl -n sre-lab exec deployment/mysql -- sh -lc `
+    'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "SET GLOBAL long_query_time=0.05;"' | Out-Null
 Set-PodFaultNormal order-service 8080 '/debug/fault/normal'
 Set-PodFaultNormal inventory-service 8081 '/debug/fault?mode=normal'
 Set-PodFaultNormal user-service 8082 '/debug/fault?mode=normal'

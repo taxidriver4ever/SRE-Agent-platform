@@ -4,7 +4,7 @@
 网关协议和工具逻辑分别保留在各自模块中，避免入口文件演变成业务逻辑集合。
 """
 
-import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -24,10 +24,12 @@ from app.code_state import CodeStateRepository, CodeStateService, initialize_cod
 from app.core.config import get_settings
 from app.core.database import ApplicationDatabase
 from app.diagnosis import (
-    DiagnosisOrchestrator, DiagnosisRepository, DiagnosisService,
+    DiagnosisExecutionManager, DiagnosisOrchestrator, DiagnosisRepository,
+    DiagnosisSelfCheckService, DiagnosisService,
     initialize_diagnosis_schema,
 )
 from app.diagnosis.router import router as diagnosis_router
+from app.diagnosis.self_check_router import router as self_check_router
 from app.llm import GatewayLLM
 from app.intent import IntentRouter, IntentWorkflowRouter
 from app.security import ToolPolicy
@@ -37,6 +39,14 @@ from app.mcp_servers import build_fastmcp_server
 from app.repositories import RepositoryRegistry
 from app.resources import router as resources_router
 from app.workflow import DiagnosisWorkflow
+from app.validation import (
+    AITestGenerator, AdapterRegistry, DockerValidationRunner, ProjectDetector,
+    RunnerLimits, TestFileValidator, ValidationComparator, ValidationRepository,
+    ValidationService, initialize_validation_schema,
+)
+from app.validation.router import router as validation_router
+
+logger = logging.getLogger(__name__)
 
 
 def create_app() -> FastAPI:
@@ -67,6 +77,8 @@ def create_app() -> FastAPI:
     initialize_audit_schema(application_database)
     # Diagnosis 表依赖 users 与 conversations，必须在这两个模块之后初始化。
     initialize_diagnosis_schema(application_database)
+    # Validation 是独立聚合，但其可选 Diagnosis 外键依赖 Diagnosis Schema。
+    initialize_validation_schema(application_database)
     auth_service = AuthService(application_database, settings.auth_token_ttl_hours)
     auth_service.ensure_user(settings.initial_username, settings.initial_password)
     conversation_service = ConversationService(application_database)
@@ -148,6 +160,36 @@ def create_app() -> FastAPI:
     diagnosis_orchestrator = DiagnosisOrchestrator(
         diagnosis_workflow, diagnosis_service, diagnosis_repository,
     )
+    diagnosis_execution_manager = DiagnosisExecutionManager(
+        diagnosis_orchestrator, diagnosis_repository, sandbox_manager,
+        lease_ttl_seconds=settings.diagnosis_lease_ttl_seconds,
+        heartbeat_interval_seconds=settings.diagnosis_heartbeat_interval_seconds,
+        max_attempts=settings.diagnosis_max_attempts,
+    )
+    diagnosis_self_check = DiagnosisSelfCheckService(
+        diagnosis_repository, diagnosis_execution_manager,
+        max_attempts=settings.diagnosis_max_attempts,
+        lease_ttl_seconds=settings.diagnosis_lease_ttl_seconds,
+        heartbeat_interval_seconds=settings.diagnosis_heartbeat_interval_seconds,
+    )
+    validation_repository = ValidationRepository(application_database)
+    validation_service = ValidationService(
+        validation_repository, repository_registry, ProjectDetector(),
+        AdapterRegistry(settings.validation_maven_image, settings.validation_python_image),
+        DockerValidationRunner(settings.validation_workspace_root, settings.validation_artifact_root),
+        ValidationComparator(), TestFileValidator(), AITestGenerator(llm),
+        RunnerLimits(
+            cpus=settings.validation_cpus, memory_mb=settings.validation_memory_mb,
+            pids_limit=settings.validation_pids_limit,
+            prepare_timeout_seconds=settings.validation_prepare_timeout_seconds,
+            build_timeout_seconds=settings.validation_build_timeout_seconds,
+            test_timeout_seconds=settings.validation_test_timeout_seconds,
+            overall_timeout_seconds=settings.validation_overall_timeout_seconds,
+            allow_network=settings.validation_allow_build_network,
+        ),
+        diagnosis_service, diagnosis_repository, diagnosis_execution_manager,
+        code_state_service, code_state_repository,
+    )
     service_aliases = {
         str(alias): service_name
         for service_name, metadata in diagnosis_workflow.catalog.services.items()
@@ -176,7 +218,9 @@ def create_app() -> FastAPI:
         application.state.diagnosis_repository = diagnosis_repository
         application.state.diagnosis_service = diagnosis_service
         application.state.diagnosis_orchestrator = diagnosis_orchestrator
-        application.state.diagnosis_tasks = set()
+        application.state.diagnosis_execution_manager = diagnosis_execution_manager
+        application.state.diagnosis_self_check = diagnosis_self_check
+        application.state.diagnosis_tasks = diagnosis_execution_manager.tasks
         application.state.intent_router = intent_router
         application.state.intent_workflow_router = intent_workflow_router
         application.state.memory_repository = memory_repository
@@ -189,14 +233,25 @@ def create_app() -> FastAPI:
         application.state.default_project_id = settings.default_project_id
         application.state.auth_service = auth_service
         application.state.conversation_service = conversation_service
+        application.state.repository_registry = repository_registry
+        application.state.validation_repository = validation_repository
+        application.state.validation_service = validation_service
+        application.state.validation_execution_manager = validation_service.manager
+        interrupted_validations = validation_repository.fail_incomplete_on_startup()
+        if interrupted_validations:
+            logger.warning("Marked %s interrupted Validation Run(s) failed", interrupted_validations)
+        # Startup 顺序固定为 basic self-check -> stale scan -> atomic recovery claim。
+        startup_report = diagnosis_self_check.basic_check()
+        application.state.startup_self_check = startup_report
+        if startup_report.status.value == "UNHEALTHY":
+            logger.error("Diagnosis Runtime startup self-check unhealthy: %s", startup_report.model_dump(mode="json"))
+        recovered = await diagnosis_execution_manager.recover_stale_diagnoses()
+        if recovered:
+            logger.warning("Recovered %s stale Diagnosis Session(s)", recovered)
         yield
-        # 先取消仍在运行的 Diagnosis Session，再关闭共享 MCP/LLM 资源。
-        # CancelledError 会由 Diagnosis Router 将会话持久化为 CANCELLED。
-        pending_diagnoses = list(application.state.diagnosis_tasks)
-        for task in pending_diagnoses:
-            task.cancel()
-        if pending_diagnoses:
-            await asyncio.gather(*pending_diagnoses, return_exceptions=True)
+        # Redeploy/shutdown 只 interrupt 并释放 Lease；CANCELLED 只留给业务取消。
+        await diagnosis_execution_manager.shutdown()
+        await validation_service.manager.shutdown()
         # 只有 GatewayLLM 自己创建的客户端会被关闭，注入客户端的所有权规则
         # 由 GatewayLLM.close() 内部负责判断。
         await tools.close()
@@ -220,14 +275,16 @@ def create_app() -> FastAPI:
         ],
         allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Content-Type", "Authorization"],
+        allow_headers=["Content-Type", "Authorization", "Idempotency-Key"],
     )
     application.include_router(auth_router)
     application.include_router(conversation_router)
     application.include_router(agent_router)
     application.include_router(chat_router)
     application.include_router(diagnosis_router)
+    application.include_router(self_check_router)
     application.include_router(resources_router)
+    application.include_router(validation_router)
     # 对外端点只暴露项目的 Git/可观测性只读工具。Kubernetes Server 保持独立，
     # 这样第三方版本、RBAC 和进程生命周期不会被伪装成项目自研工具。
     application.mount("/mcp", mcp_app)

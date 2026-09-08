@@ -9,6 +9,7 @@ from app.conversation_memory.schema import initialize_conversation_memory_schema
 from app.core.config import get_settings
 from app.core.database import ApplicationDatabase
 from app.diagnosis.schema import initialize_diagnosis_schema
+from app.validation.schema import initialize_validation_schema
 
 
 def mysql_test_database(*, reset: bool = True) -> ApplicationDatabase:
@@ -28,6 +29,7 @@ def mysql_test_database(*, reset: bool = True) -> ApplicationDatabase:
     initialize_conversation_memory_schema(database)
     initialize_code_state_schema(database)
     initialize_diagnosis_schema(database)
+    initialize_validation_schema(database)
     if reset:
         reset_mysql_test_database(database)
     return database
@@ -40,6 +42,9 @@ def reset_mysql_test_database(database: ApplicationDatabase) -> None:
     with database.connect() as connection:
         connection.execute("SET FOREIGN_KEY_CHECKS = 0")
         for table in (
+            "validation_events", "validation_generated_tests", "validation_uploaded_tests",
+            "validation_evidence", "validation_regressions", "validation_test_results",
+            "validation_executions", "validation_runs",
             "diagnosis_events", "diagnosis_root_causes", "diagnosis_graph_edges",
             "diagnosis_graph_nodes", "diagnosis_evidence", "diagnosis_investigation_steps",
             "diagnosis_sessions",

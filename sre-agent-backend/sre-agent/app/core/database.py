@@ -22,8 +22,9 @@ class DatabaseRow(dict[str, Any]):
 class QueryResult:
     """将 PyMySQL Cursor 收敛成业务层使用的轻量结果接口。"""
 
-    def __init__(self, cursor: Any | None) -> None:
+    def __init__(self, cursor: Any | None, *, rowcount: int | None = None) -> None:
         self._cursor = cursor
+        self.rowcount = int(cursor.rowcount) if rowcount is None and cursor is not None else int(rowcount or 0)
 
     def fetchone(self) -> DatabaseRow | None:
         if self._cursor is None:
@@ -70,8 +71,9 @@ class DatabaseConnection:
             cursor.close()
             raise
         if cursor.description is None:
+            rowcount = int(cursor.rowcount)
             cursor.close()
-            return QueryResult(None)
+            return QueryResult(None, rowcount=rowcount)
         return QueryResult(cursor)
 
     def commit(self) -> None:

@@ -21,6 +21,7 @@
 - `app/workflow/`：八阶段硬性工作流、专项策略、证据门槛与统一报告模型。
 - `app/api/`：保留旧 `/v1/agent/run` 与 `/api/agent/chat` 兼容接口。
 - `app/diagnosis/`：Diagnosis Session、Step、Evidence Store、Incident Graph、Root Cause、Repository、Orchestrator 与 SSE API。
+- `app/validation/`：独立 ValidationRun、模块/接口级 Test Suite 与不可变版本、FastAPI/Spring 接口发现、一键 AI 生成/更新并回归、显式 AI 参考样本、冻结 Commit、Maven/Python Adapter、Ephemeral Docker Runner、JUnit 归一化、确定性 Comparator、持久事件和 Diagnosis Evidence 联动。
 - `app/resources/`：后端 Service Catalog 与只读 Kubernetes Pod 浏览接口。
 - `skills/`：12 个独立 SRE Skill，覆盖语言运行时、Kubernetes、数据库、依赖、发布、Tracing 与证据综合。
 - `evals/`：SRE-001～010 评测数据与 Runner。
@@ -42,7 +43,21 @@ MYSQL_PASSWORD=sre_reader_dev_only
 SRE_REPOSITORY_PATH=D:\SRE-Agent-platform\sre-broken-system
 SERVICE_CATALOG_PATH=D:\SRE-Agent-platform\sre-broken-system\sre-lab-infra\service-catalog.yaml
 TOOL_TIMEOUT_SECONDS=15
+DIAGNOSIS_DEADLINE_SECONDS=240
+DIAGNOSIS_MAX_ATTEMPTS=3
+DIAGNOSIS_LEASE_TTL_SECONDS=60
+DIAGNOSIS_HEARTBEAT_INTERVAL_SECONDS=10
 TOOL_OUTPUT_LIMIT=12000
+SRE_VALIDATION_MAVEN_IMAGE=maven:3.9.9-eclipse-temurin-21
+SRE_VALIDATION_PYTHON_IMAGE=sre-validation-python:3.12
+SRE_VALIDATION_CPUS=1.0
+SRE_VALIDATION_MEMORY_MB=1024
+SRE_VALIDATION_PIDS_LIMIT=128
+SRE_VALIDATION_PREPARE_TIMEOUT_SECONDS=60
+SRE_VALIDATION_BUILD_TIMEOUT_SECONDS=300
+SRE_VALIDATION_TEST_TIMEOUT_SECONDS=600
+SRE_VALIDATION_OVERALL_TIMEOUT_SECONDS=900
+SRE_VALIDATION_ALLOW_BUILD_NETWORK=false
 KUBERNETES_MCP_VERSION=0.0.65
 SRE_REPOSITORY_CACHE_PATH=D:\SRE-Agent-platform\.cache\sre-agent-repositories
 SRE_REPOSITORY_ALLOWED_HOSTS=github.com,gitlab.com,bitbucket.org
@@ -75,6 +90,9 @@ SRE_SANDBOX_TIMEOUT_SECONDS=120
 - `app/conversation_memory/sql/schema.sql`：`conversation_compactions`、`conversation_memory_items`
 - `app/code_state/sql/schema.sql`：`code_state_repositories`、`code_state_components`
 - `app/audit/sql/schema.sql`：`tool_audit_logs`
+- `app/diagnosis/sql/schema.sql`：Session、Step、Evidence、Graph、Root Cause、Event 与 migration registry
+- `app/diagnosis/sql/001_durable_execution.sql`：Checkpoint、Lease、CAS、原子 Step Sequence 与 event key
+- `app/diagnosis/sql/002_tool_parent_evidence.sql`：RUNNING Tool 恢复需要的父 Evidence 血缘
 
 每份 SQL 都包含字段级 `COMMENT` 和表级 `COMMENT`。各模块的 `schema.py` 只负责定位并执行本模块 SQL；`app/core/database.py` 只负责通用 MySQL 连接、事务和 SQL 文件执行，不依赖任何业务表。
 
@@ -123,9 +141,159 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8001/api/agent/chat `
 - `GET /api/diagnoses/{id}/graph`：由后端生成的跨服务 Incident Graph。
 - `GET /api/diagnoses/{id}/root-cause`：结构化根因、置信度与建议。
 - `GET /api/diagnoses/{id}/events`：支持 `Last-Event-ID` 回放的持久化 SSE 事件流。
+- `GET /api/system/self-check?level=1|2|3`：登录后执行只读 Diagnosis Runtime 自检。
 - `GET /api/services`、`GET /api/services/{name}/pods`、`GET /api/pods/{name}`：服务目录和真实只读 Kubernetes 资源浏览。
+- `GET /api/repositories/{repository}/branches`：刷新受信任远程并返回真实 Branch。
+- `GET /api/repositories/{repository}/test-files?ref=...`：列出 Candidate Commit 中可作为 AI 样本的测试文件。
+- `POST/GET /api/validation-test-suites`：创建或查询当前用户的持久化测试集。
+- `GET /api/validation-test-suites/{id}`：读取全部不可变版本及文件。
+- `POST /api/validation-test-suites/{id}/versions`：追加完整测试文件快照作为新版本。
+- `POST /api/validation-test-suites/{id}/metadata`、`.../archive`：修改元数据或软归档。
+- `POST/GET /api/validations`：创建、查询 Base/Candidate 合并前验证。
+- `GET /api/validations/{id}`、`.../events`：读取执行、测试集、AI 测试、比较结果和可恢复事件。
+- `POST /api/validations/{id}/diagnose`、`.../cancel`：诊断确认回归或取消活动任务。
 
-Session 状态机为 `PENDING -> INVESTIGATING -> COMPLETED`，会话级异常进入 `FAILED`。单一 Tool 失败只产生 `FAILED` Step，Orchestrator 会继续尝试其余证据源。
+Session 业务状态机为 `PENDING -> INVESTIGATING -> COMPLETED`，会话级异常进入 `FAILED`，明确业务取消进入 `CANCELLED`。单一 Tool 失败只产生 `FAILED` Step，Orchestrator 会继续尝试其余证据源。Workflow 阶段由独立 `current_phase / phase_status` 表示，不扩张业务状态枚举。
+
+## Durable Diagnosis / Crash Recovery
+
+### Source of Truth 与职责
+
+持久 Diagnosis 的事实来源是 Application MySQL，不是 `asyncio.Task`。进程内 Task 只负责当前一次物理执行；它可以因 `kill -9`、OOM、容器替换或主机重启消失，而数据库仍保存 logical Diagnosis。
+
+| 组件 | Durable Execution 职责 |
+| --- | --- |
+| `DiagnosisRepository` | 单 logical operation 的事务、CAS、Lease、Step、Evidence、Checkpoint 和 Event |
+| `DiagnosisExecutionManager` | 生成 executor_id、claim、Heartbeat、启动 Task、startup recovery、graceful interrupt |
+| `DurableWorkflowRuntime` | 把 Phase/Tool hook 映射到 Repository，并在恢复时提供缓存结果或 RUNNING Tool |
+| `DiagnosisOrchestrator` | Workflow 报告投影为 Root Cause、Graph、REPORT Step 和 Session 完成 |
+| `DiagnosisWorkflow` | 接受 `resume_state`，按持久 Phase 游标跳过已完成阶段，继续使用已有 Evidence/Timeline |
+| `NoopWorkflowRuntime` | 保持 Quick Diagnosis 无 Session、无 Checkpoint、无记忆的原行为 |
+
+```text
+HTTP 202
+  ↓
+diagnosis_sessions: PENDING
+  ↓ atomic affected_rows == 1
+Executor claim (lease_owner / lease_expires_at / attempt_no)
+  ↓
+INVESTIGATING
+  ├─ Phase RUNNING     → checkpoint
+  ├─ Tool RUNNING      → stable logical Step
+  ├─ Tool completion   → Step + Evidence + Checkpoint + Event（同一事务）
+  └─ Phase COMPLETED   → checkpoint
+  ↓ process crash
+Lease expires
+  ↓ startup scan + CAS claim
+load DiagnosisState.model_validate_json(...)
+  ↓
+resume original run_id
+  ↓
+idempotent REPORT → COMPLETED
+```
+
+### 数据字段与双层状态机
+
+`diagnosis_sessions.status` 保留 `PENDING / INVESTIGATING / COMPLETED / FAILED / CANCELLED`，其中后三者不参与恢复。执行游标另存为：
+
+| 字段 | 含义 |
+| --- | --- |
+| `current_phase` | 最近开始或完成的 Workflow Phase |
+| `phase_status` | 当前 Phase 的 `PENDING / RUNNING / COMPLETED` |
+| `checkpoint_json` | `DiagnosisState.model_dump(mode="json")` 的完整可恢复快照 |
+| `checkpoint_seq` | 每次 Checkpoint 单调递增的计数 |
+| `attempt_no` | 同一 logical Diagnosis 被物理 Executor claim 的次数 |
+| `heartbeat_at` | 当前 Executor 最近一次存活更新时间 |
+| `lease_owner / lease_expires_at` | 执行所有权和到期时间 |
+| `state_version` | 乐观锁版本，防止旧 Executor 覆盖新状态 |
+| `next_step_sequence` | 并发安全分配 Investigation Timeline 序号 |
+| `interrupted_at / recovery_reason` | 进程中断和最近恢复原因 |
+
+Checkpoint 沿用现有 `DiagnosisState`，包括 query、conversation、user、run_id、service、symptom、Pod、runtime commit、repository、dependencies、Evidence、Candidates、Timeline、Phases、Synthesis 和 Token Usage。它只保存可公开验证的调查状态，不保存隐藏 Chain-of-Thought。同一 Diagnosis 恢复时 `run_id` 不变，只有 `attempt_no` 从 1 增至 2、3，用于区分物理执行尝试。
+
+### Checkpoint 时机与 Resume 规则
+
+Checkpoint 在 Phase 开始、Phase 完成、每个 Tool 完成、Evidence 更新、Planner 调查轮完成，以及 Pod/commit 等关键 Runtime State 更新后保存。每个 Phase 的写法是：
+
+```text
+current_phase = TRIAGE, phase_status = RUNNING
+  → triage
+  → save DiagnosisState
+current_phase = TRIAGE, phase_status = COMPLETED
+```
+
+若恢复记录是 `TRIAGE / COMPLETED`，Workflow 跳过 START 和 TRIAGE，从 BASELINE 开始。若是 `INVESTIGATE / RUNNING`，则直接带着原 Evidence 和 Timeline 进入 Investigation。已完成 Tool 的数据库结果会回填为 Workflow Evidence/Timeline；中断时仍为 RUNNING 的 Tool 会先于下一次 Planner 决策恢复，避免依赖模型碰巧生成相同决定。
+
+### Tool、Evidence、Conversation 和 Event 幂等
+
+Tool logical key 由 `phase + tool_name + canonical(arguments) + sorted(parent_evidence_ids)` 计算 SHA-256，其中参数严格使用：
+
+```python
+json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+```
+
+`diagnosis_investigation_steps` 对 `(diagnosis_id, idempotency_key)` 建唯一索引，并持久化 `arguments_json`、`parent_evidence_ids_json`、`result_json`、稳定 `evidence_id`、Step `attempt_no` 和 `updated_at`。执行流程为：
+
+```text
+calculate logical key
+  → SELECT existing Step FOR UPDATE
+  → COMPLETED: load result/Evidence，不调用真实 Tool
+  → missing: INSERT RUNNING
+  → stale RUNNING: UPDATE 同一行，attempt_no + 1
+  → execute read-only Tool
+  → atomic commit Step + Evidence + Checkpoint + Event
+```
+
+Evidence ID 由 `diagnosis_id + logical key` 派生并保持稳定。Conversation 的 `tool_call`、`tool_result` 和 final report 使用稳定 Message ID 和 MySQL UPSERT。重要 Event 使用 `(diagnosis_id, event_key)` 唯一键，例如 `phase.completed:TRIAGE`、`step.completed:<key>` 和 `diagnosis.completed`；Recovery attempt 使用 `diagnosis.recovered:<attempt>`，因此每次物理恢复仍可审计。
+
+Baseline 的并发 Step 序号不再查询 `MAX(sequence_no) + 1`。Repository 锁定 Session 行，读取并递增 `next_step_sequence`，保证同一 Diagnosis 内序号唯一且单调。
+
+### Lease、Heartbeat、CAS 与进程生命周期
+
+进程级 `executor_id` 由 hostname、PID 和随机 UUID 组成。Claim 只接受 `PENDING`，或没有有效 Lease 的 `INVESTIGATING`；只有 UPDATE 的 `rowcount == 1` 才创建 Executor Task。默认 Lease TTL 60 秒、Heartbeat 间隔 10 秒，避免 20 秒级 Tool 调用被误判死亡。
+
+Checkpoint、Heartbeat、Tool begin/complete 和 Session completion 都以 `lease_owner + state_version` 为 CAS 条件。CAS 失败表示当前 Executor 已失去 ownership，必须立即停止写入，不能覆盖新进程保存的状态。Heartbeat 只更新 Session，不写高频 SSE Event。
+
+Graceful shutdown 会取消 Task、写 `diagnosis.interrupted`、清空 Lease 并保持 `INVESTIGATING`。这不是用户取消；`CANCELLED` 只用于明确的业务动作。应用启动顺序为：模块 Schema/Migration → Level 1 Self-Check → stale scan → atomic claim → load checkpoint → recovery Task。达到 `DIAGNOSIS_MAX_ATTEMPTS` 后进入 `FAILED` 并记录 `maximum recovery attempts exceeded`。
+
+### 最终报告和 Crash Window
+
+REPORT 重放是安全的：Evidence 与 Root Cause UPSERT，Graph 以稳定 edge ID 重建，REPORT Step 使用固定 `final-report` key，completed Event 使用固定 key，final Conversation Message 使用 run_id 派生 ID，Session completion 对同一 run_id 可重复确认。
+
+外部只读 Tool 无法承诺 exactly-once。如果 Tool 已返回但进程在 MySQL commit 前消失，新 Executor 无法知道外部调用是否发生，允许再调用一次。因此准确保证是：
+
+```text
+External Tool                 at-least-once in crash window
+Logical Step/Evidence/Event   idempotent / exactly-once effect
+```
+
+这一边界安全的前提是所有诊断 Tool 继续保持只读。系统没有引入 Celery、Kafka、RabbitMQ、Redis Queue，也没有创建跨整个 Diagnosis 的长事务。
+
+## Diagnosis Runtime Self-Check
+
+`GET /api/system/self-check` 默认运行 Level 3，可用 `?level=1` 或 `?level=2` 降低扫描范围。端点必须登录，并且只返回当前用户的 Diagnosis ID；启动时只运行不枚举用户数据的 basic Level 1。
+
+| Level | 检查内容 |
+| --- | --- |
+| 1 Runtime Health | Application MySQL、必要列和索引、executor_id、Heartbeat 子系统是否可用 |
+| 2 Durable State | 活跃 Session 的 Lease、Heartbeat、Checkpoint、run_id、Phase、版本计数和 attempt |
+| 3 Data Consistency | Step/Evidence/Root Cause/Graph/Event 的引用与 terminal invariant |
+
+自检实际用 `DiagnosisState.model_validate_json()` 反序列化 Checkpoint，而不是只判断非空。主要 invariant：
+
+- INVESTIGATING 必须有可恢复 Checkpoint；有效运行应有未过期 Lease 和近期 Heartbeat；
+- Checkpoint run_id 必须等于 Session run_id，current_phase 必须出现在 checkpoint phases；
+- COMPLETED 必须处于 END，拥有 Root Cause、REPORT Step 和 completed Event；
+- terminal Session 不能持 Lease，也不能残留 RUNNING Step；
+- RUNNING Step + expired Lease 标记为可恢复的 `INTERRUPTED_RUNNING_STEP`；
+- Step、Root Cause 引用的 Evidence 必须存在，Evidence logical key 必须能找到 Tool Step；
+- Graph Edge 的 source/target Node 必须存在；
+- checkpoint_seq/state_version 不能为负或倒退，attempt 不能越过配置上限；
+- durable schema 必须具备 Checkpoint、Lease、idempotency 和 recovery 索引。
+
+状态策略：Warning-only 返回 `DEGRADED`，例如 `STALE_LEASE`、`MISSING_ACTIVE_LEASE`、`LEASE_EXPIRING_SOON`；Error/Critical 返回 `UNHEALTHY`，例如 `INVALID_CHECKPOINT`、`TERMINAL_SESSION_HOLDS_LEASE`、`ORPHAN_RUNNING_STEP`、`DANGLING_GRAPH_EDGE`、`DURABLE_SCHEMA_INCOMPLETE`。无 issue 返回 `HEALTHY`。
+
+Self-Check 始终 read-only，只发现问题；Recovery 才会 claim、增加 attempt、恢复或在达到上限时失败。它不调用 SRE Tool、LLM 或 Lab 数据库，不消耗 Token，也不替换 `/health`。快照之后发生的并发变化和“外部 Tool 完成但数据库未 commit”的瞬间无法由一次检查完全观察，最终由 Lease/CAS 与 logical idempotency 收敛。
 
 每条请求先被分类为 `SPECIFIC_INCIDENT`、`GENERAL_DIAGNOSIS`、`NEED_CLARIFICATION` 或 `OUT_OF_SCOPE`。具体故障进入 Investigation Workflow；整体巡检先执行全局 System Scan；信息不足或非运维问题只返回普通消息，不允许调用 Kubernetes、Prometheus、Loki、Tempo、MySQL 或 Git 工具。
 
@@ -202,6 +370,24 @@ Workflow 只控制阶段、预算、Tool 调度、Evidence 持久化和终止条
 3. 由管理员手动执行 `python scripts/bind_kubernetes_repositories.py config/repository-bindings.yaml`。脚本会把 `sre.agent/repository-url` 同时写入 Deployment 和 Pod Template。
 4. Agent 先通过 Kubernetes MCP 读取 `repository`、`repository-url`、`git-sha`，再由 Git FastMCP 对白名单主机执行精确 SHA 的浅抓取和源码读取。若当前实验仓库尚未配置 remote，则明确使用现有本地只读镜像，不伪造远程地址。
 
+## Pre-Merge Validation 与测试集管理
+
+Validation 创建时把 Base/Candidate Branch 解析并冻结为完整 40 位 Commit SHA。对于显式配置的白名单 HTTPS 远程仓库，Branch 查询会在 Repository 级异步锁内执行 `fetch --prune`；刷新失败直接返回错误。本地实验仓库没有远程绑定时只读取当前本地 Branch Ref。
+
+测试输入可以组合：Repository Tests、临时 Uploaded Tests、多套持久化 Test Suite（每套选择一个 Version），以及最多 8 个 AI Generated Tests。Managed/Uploaded 文件合并后统一接受路径、扩展名、数量和字节数校验；同路径不同内容会拒绝，AI 文件不能覆盖用户文件。测试集编辑不会覆盖旧内容，而是追加 `v2/v3/...`，Validation 绑定具体 `version_id`，保证历史任务可复现。
+
+每套 Test Suite 必须明确绑定 `Repository → Module → Interface`，并保存 HTTP Method、Route、源码文件和 Symbol。`interfaces.py` 只读取冻结 Git Object：Python 解析 FastAPI 装饰器与 `APIRouter` 前缀，Java 解析 Spring Mapping 与 Controller 前缀，再用稳定 `interface_id` 对比 Base/Candidate，输出 `ADDED/MODIFIED/REMOVED/UNCHANGED`。接口变更只表示源码差异，不会自动推断测试是否通过。
+
+`POST /api/interface-test-suites/generate` 是“一键生成测试集并回归”的受控入口。新增接口会创建绑定目标的 `v1`；已有接口会读取最新测试快照，生成新增或更新测试源码，并追加不可变 `v2/v3/...`。随后服务自动创建只引用该新 `version_id` 的 Validation，所以 Base/Candidate 输入保持完全相同。旧版本不会覆盖，历史 Run 也不会跟随 Branch 或 Suite 的后续变化。
+
+一键入口有独立的用户级 `Idempotency-Key` 记录：同一请求重试返回原 Suite/Version/Validation，不重复追加版本；处理中、失败、或 Key 被不同参数复用时明确报错。Suite 用户、Repository、项目类型、接口 ID、路径白名单、文件数量和大小都会在服务端重新校验。AI 仍只能输出测试源码，不具备修改生产代码、Git、CI、Merge、Push 或部署的能力。
+
+AI 模式允许用户从冻结 Candidate Commit 中选择最多 10 个 `.py/.java` 测试文件作为 `representative_tests`。未选择时自动读取最多 3 个样本。模型只能生成候选测试源码；同一份有效生成文件会注入 Base 和 Candidate，最终分类仍只由真实 Docker Build/JUnit 结果决定。
+
+Comparator 会在两侧都有规范化用例时优先逐测试比较，即使 Base 测试进程退出码非零也不会提前返回。因此 `Base Fail → Candidate Pass` 会稳定分类为 `POSSIBLE_FIX`；`Base Pass → Candidate Fail` 分类为 `NEW_REGRESSION` 或 `AI_CONFIRMED_REGRESSION`。只有无可比较用例、超时、Runner 失败或 Base 无法形成可靠基线时才进入 `COMPARISON_INCONCLUSIVE`。
+
+Validation 详情返回 `test_suite_versions[]`、`ai_reference_test_paths[]`、`generated_tests[]`、`executions[].tests[]` 和 `regressions[]`。完整创建配置另存 SHA-256 指纹，同一个 `Idempotency-Key` 搭配不同测试版本或 AI 样本会被拒绝。
+
 ## 安全
 
 ### Tool Policy 与项目隔离
@@ -257,14 +443,17 @@ Docker 使用 argv + `shell=False` 启动，并有硬超时。未来工作流为
 ## 测试与评测
 
 ```powershell
-python -m pytest -q
+python -B -m pytest -q
+python -B -m pytest tests/test_durable_diagnosis.py tests/test_diagnosis_self_check.py -q
 python evals/run_evals.py --case SRE-001
 python evals/run_evals.py
 # 使用本地已有 mysql:8.4 镜像验证真实 Docker 隔离参数
 python scripts/verify_sandbox.py
 ```
 
-当前代码包含 MCP 安全、Agent、API、MySQL Conversation Compaction、Memory 权限隔离、Code State 增量更新与 Source Reference 回归测试；最终通过数以本机 `pytest` 输出为准。
+当前回归包含 MCP 安全、Agent、API、MySQL Conversation Compaction、Memory 权限隔离、Code State 增量更新、Source Reference、Durable Diagnosis / Self-Check，以及 40 个 Pre-Merge Validation 专项测试。2026-09-08 本机真实 MySQL 8.4 结果为 `164 passed`；唯一 Warning 是 FastAPI TestClient 上游 Starlette/httpx 弃用提示，不影响断言或退出码。新增专项测试覆盖 FastAPI/Spring 接口发现、模块/接口归属持久化、手工创建目标校验、一键创建 v1、修改后追加 v2、冻结版本引用、幂等重试，以及 10 个显式 AI 参考样本全部进入生成提示。
+
+Durable 专项覆盖 Phase checkpoint、INVESTIGATE 中途恢复、RUNNING Tool retry、completed Tool cache hit、Evidence/Event/Report 幂等、Lease 抢占、stale/fresh Lease、graceful shutdown、terminal state、最大尝试次数和近真实 startup recovery。Self-Check 专项覆盖 Healthy、expired Lease、损坏 Checkpoint、run_id/phase mismatch、terminal Lease、orphan Step、缺失 Evidence、dangling Graph、用户隔离 API 与轻量 `/health` 回归。
 
 固定评测只读取 `SRE-001`～`SRE-010`。Runner 发送给 Agent 的请求只有 `symptom + project_id`，`expected_root_cause`、`required_evidence` 和 `forbidden_shortcuts` 只由 Evaluator 使用。每次运行都会在 `evals/results/latest.json` 保存逐 Case 的服务定位、根因、Evidence 完整度、Tool Calls、耗时、Token、最终状态和失败原因，以及整体 Accuracy/平均值；失败 Case 不会被过滤。
 

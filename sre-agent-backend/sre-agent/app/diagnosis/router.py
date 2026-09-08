@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 
 from app.api.router import get_sandbox_manager, get_tool_policy, require_project
 from app.auth import CurrentUser, require_user
-from app.conversation_memory import conversation_memory_scope
+from app.diagnosis.execution import DiagnosisExecutionManager
 from app.diagnosis.models import (
     DiagnosisEvidence, DiagnosisRootCause, DiagnosisSession, DiagnosisStatus,
     IncidentGraph, InvestigationStep,
@@ -41,6 +41,10 @@ def get_diagnosis_service(request: Request) -> DiagnosisService:
 
 def get_diagnosis_orchestrator(request: Request) -> DiagnosisOrchestrator:
     return request.app.state.diagnosis_orchestrator
+
+
+def get_diagnosis_execution_manager(request: Request) -> DiagnosisExecutionManager:
+    return request.app.state.diagnosis_execution_manager
 
 
 @router.post("/quick/stream")
@@ -114,42 +118,15 @@ async def quick_diagnosis_stream(
 @router.post("", response_model=DiagnosisCreatedResponse, status_code=status.HTTP_202_ACCEPTED)
 async def create_diagnosis(
     body: DiagnosisCreateRequest,
-    request: Request,
     user: Annotated[CurrentUser, Depends(require_user)],
     service: Annotated[DiagnosisService, Depends(get_diagnosis_service)],
-    orchestrator: Annotated[DiagnosisOrchestrator, Depends(get_diagnosis_orchestrator)],
+    execution_manager: Annotated[DiagnosisExecutionManager, Depends(get_diagnosis_execution_manager)],
     policy: Annotated[ToolPolicy, Depends(get_tool_policy)],
-    sandbox: Annotated[DockerSandboxManager, Depends(get_sandbox_manager)],
 ) -> DiagnosisCreatedResponse:
     """QUESTION、SERVICE 和 POD 三种入口统一创建独立 Diagnosis Session。"""
     require_project(policy, body.project_id)
     session = service.create(user["id"], body)
-    task_id = uuid4().hex
-
-    async def execute() -> None:
-        try:
-            async with sandbox.task_workspace(task_id) as workspace:
-                with task_security_scope(user["id"], body.project_id, task_id, str(workspace)):
-                    with conversation_memory_scope(user["id"], session.conversation_id):
-                        await orchestrator.run(user["id"], session.id, body)
-        except asyncio.CancelledError:
-            current = service.repository.get(user["id"], session.id)
-            if current and current.status in {DiagnosisStatus.PENDING, DiagnosisStatus.INVESTIGATING}:
-                service.repository.update_session(
-                    session.id, status=DiagnosisStatus.CANCELLED, error_message="诊断任务已取消", finished=True,
-                )
-                service.repository.append_event(session.id, "diagnosis.cancelled", {
-                    "diagnosis_id": session.id, "status": DiagnosisStatus.CANCELLED.value,
-                })
-            raise
-        except Exception as exc:
-            logger.exception("diagnosis session failed: diagnosis_id=%s", session.id)
-            service.fail(user["id"], session.id, exc)
-
-    task = asyncio.create_task(execute(), name=f"diagnosis-{session.id}")
-    tasks: set[asyncio.Task[None]] = request.app.state.diagnosis_tasks
-    tasks.add(task)
-    task.add_done_callback(tasks.discard)
+    execution_manager.submit(session.id)
     return DiagnosisCreatedResponse(
         id=session.id, status=session.status,
         events_url=f"/api/diagnoses/{session.id}/events",
