@@ -264,8 +264,14 @@ def test_manual_suite_request_requires_module_and_interface():
 
 
 def _git(path: Path, *arguments: str) -> str:
-    return subprocess.run(["git", "-C", str(path), *arguments], check=True,
-        capture_output=True, text=True).stdout.strip()
+    return subprocess.run(
+        ["git", "-C", str(path), *arguments],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    ).stdout.strip()
 
 
 @pytest.mark.asyncio

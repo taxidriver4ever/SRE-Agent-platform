@@ -30,6 +30,7 @@
 - [测试与验收](#测试与验收)
 - [停止与环境复原](#停止与环境复原)
 - [AI-assisted CI / Pre-Merge Validation](#ai-assisted-ci--pre-merge-validation)
+- [CI/CD 与本地 Kind 部署](#cicd-与本地-kind-部署)
 - [常见问题](#常见问题)
 
 ## 推荐阅读路径
@@ -1798,6 +1799,274 @@ Workspace 执行后删除；完整 stdout/stderr/test JSON 作为 Artifact 保�
 - 平台不会自动 Merge、Push、修改 Candidate、创建提交、部署或执行自动修复。
 - 当前没有通用 Pipeline DSL、Jenkins/GitHub Actions 替代层、多机 Runner 调度和自动扩缩容。
 - 当前比较目标是功能回归；没有把单次耗时波动直接判定为性能回归。性能门禁需要独立的重复采样、噪声模型和阈值策略。
+
+## CI/CD 与本地 Kind 部署
+
+本仓库为 `sre-agent`、`sre-gateway` 和 `sre-agent-frontend` 提供了一条轻量但真实的 CI/CD 链路。开发方式仍然是原有的 Docker Compose、本地 Python 和 Vite；Kubernetes 只用于发布演示，两种模式互不替代。
+
+现有故障实验环境已经使用名为 `sre-lab` 的 Kind 集群，因此发布方案继续复用 Kind，不额外引入 k3d。CI/CD 不负责部署或改造 vLLM、Ollama、应用 MySQL、Prometheus、Loki、Tempo 和 `sre-broken-system`。
+
+### 架构与安全边界
+
+```mermaid
+flowchart TD
+    A[PR 或 Push main] --> B[GitHub Actions CI]
+    B --> C[Agent pytest]
+    B --> D[Gateway pytest]
+    B --> E[Frontend test + build]
+    C --> F{三项全部通过}
+    D --> F
+    E --> F
+    F -->|否| X[停止，不构建、不部署]
+    F -->|是且为 main push| G[GitHub-hosted Runner 构建镜像]
+    G --> H[GHCR: full Git SHA tag]
+    H --> I[WSL2 Self-hosted Runner]
+    I --> J[本地 Kind / namespace sre]
+    J --> K[RollingUpdate]
+    K --> L[rollout status + HTTP health check]
+    L -->|成功| M[Deployment Complete]
+    L -->|失败| N[kubectl rollout undo]
+    N --> O[验证回滚并保持 Workflow Failure]
+```
+
+关键安全约束：
+
+- PR 只执行 `.github/workflows/ci.yml` 中的 GitHub-hosted Job，绝不会调度本机 self-hosted Runner。
+- `.github/workflows/cd.yml` 只接收名为 `CI` 的 `workflow_run`，并再次验证来源事件是可信仓库的 `main` push、结论是 `success`。
+- Build 在 `ubuntu-latest` 运行；只有部署 Job 使用 `[self-hosted, linux, x64, sre-local-deploy]`。
+- Actions 不打印或传递应用密码；应用 Secret 只保存在本地 Kind 集群中。
+- Runner 不应使用 root 账号，不执行 `curl | sh`，也不让外部 PR 的代码进入本机部署阶段。
+
+### CI：三路独立验证
+
+文件：`.github/workflows/ci.yml`
+
+触发条件：
+
+- 所有 Pull Request；
+- push 到 `main`。
+
+三个 Job 相互独立：
+
+| Job | 工作目录 | 实际检查 | 运行环境 |
+| --- | --- | --- | --- |
+| `agent-test` | `sre-agent-backend/sre-agent` | 安装 `requirements-dev.txt`，运行完整 `pytest` | Ubuntu + 隔离 MySQL 8.4 Service |
+| `gateway-test` | `sre-agent-backend/sre-gateway` | 安装 `requirements-dev.txt`，运行完整 `pytest` | Ubuntu + 隔离 MySQL 8.4 Service |
+| `frontend-build` | `sre-agent-frontend` | `npm ci`、Vitest、Vite production build | Ubuntu + Node.js 22 |
+
+CI 中的账号和密码只用于该次临时 MySQL Service，名称中显式包含 `ci-test-only`，不是仓库、模型或部署环境的真实密钥。任意 Job 失败时，整个 CI 失败；CD 的 `workflow_run` 条件不成立，镜像不会构建，本机也不会收到部署任务。
+
+建议在 GitHub 分支保护中把三个 Job 设为 `main` 的 Required status checks，防止绕过 PR 检查直接合并。
+
+### Build：Docker 与 GHCR
+
+CI 成功且事件是可信的 `main` push 后，CD Workflow 使用官方 Docker Actions 并行构建三个镜像：
+
+```text
+ghcr.io/taxidriver4ever/sre-agent:sha-<完整40位SHA>
+ghcr.io/taxidriver4ever/sre-gateway:sha-<完整40位SHA>
+ghcr.io/taxidriver4ever/sre-agent-frontend:sha-<完整40位SHA>
+```
+
+同时发布便于人工浏览的 `latest`，但 Kubernetes 永远使用不可变的 `sha-<完整40位SHA>`，不使用 `latest`。每个镜像还写入 OCI `org.opencontainers.image.revision` 标签；Deployment、Pod annotation、`GIT_COMMIT` 和 `APP_VERSION` 也保存相同版本信息。
+
+三个 Dockerfile 的运行方式：
+
+- Agent：Python 3.12 slim、非 root 用户、无 `--reload` 的 Uvicorn、`/health` 镜像健康检查；为了现有 Kubernetes MCP 工具保留 Node/npm/npx 运行时。
+- Gateway：Python 3.12 slim、非 root 用户、生产式 Uvicorn、`/health` 健康检查。
+- Frontend：Node 22 只负责构建，最终由 unprivileged Nginx 提供静态文件；`/healthz` 用于探针，未知前端路由 fallback 到 `index.html`。
+- 根目录和两个独立构建上下文均有 `.dockerignore`，排除 `.env`、Git 历史、缓存、测试产物和依赖目录。Dockerfile 不包含 Token、API Key 或数据库密码。
+
+GHCR 登录使用仓库自带的 `GITHUB_TOKEN` 与最小权限：Build Job 只有 `contents: read`、`packages: write`，不需要额外 PAT。
+
+### Kubernetes 资源布局
+
+应用资源位于 `deploy/k8s/`，部署到已有 `kind-sre-lab` context 中的新 Namespace `sre`：
+
+| 资源 | 副本 | Service 端口 | 探针 | 更新策略 |
+| --- | ---: | ---: | --- | --- |
+| `sre-agent` | 2 | 8001 | `/health` | `maxUnavailable: 0`, `maxSurge: 1` |
+| `sre-gateway` | 2 | 8000 | `/health` | `maxUnavailable: 0`, `maxSurge: 1` |
+| `sre-agent-frontend` | 1 | 80 → 8080 | `/healthz` | `maxUnavailable: 0`, `maxSurge: 1` |
+
+`sre-agent-runtime` ServiceAccount 只获得对 `sre-lab` Namespace 的只读查询权限；Role 不包含 Secret 读取和写操作。应用 Pod 使用 non-root、`RuntimeDefault` seccomp、禁止提权、删除 Linux capabilities，并尽量使用只读根文件系统。
+
+配置按职责分离：
+
+- `deploy/k8s/configmap.yaml`：非敏感地址、端口、超时和运行参数；
+- `deploy/k8s/secret.example.yaml`：仅供核对字段，全部是 `CHANGE_ME`/`YOUR_...` 占位符，禁止原样 apply；
+- `sre-agent-secrets`、`sre-gateway-secrets`：由部署者在本机创建，仓库不保存实际值；
+- `*-deployment.yaml`：保留安全的版本占位符，由部署脚本使用已验证的 SHA 渲染，不能直接作为正式版本部署。
+
+### 应用 Pod 如何访问现有基础设施
+
+本次没有把基础设施迁移进 `sre`：
+
+```text
+sre Namespace
+  Agent -------> Gateway.sre.svc.cluster.local
+    |----------> Prometheus/Loki/Tempo/MySQL.sre-lab.svc.cluster.local
+    |----------> 应用 MySQL: host.docker.internal:13308
+  Gateway -----> vLLM:  host.docker.internal:18000
+    |----------> Ollama: host.docker.internal:11434
+    |----------> 应用 MySQL: host.docker.internal:13308
+```
+
+Prometheus、Loki、Tempo 和故障实验 MySQL 已经属于现有 `sre-lab` Kind 环境，所以使用集群 DNS；Compose 中的应用 MySQL、vLLM 和 Ollama 仍在 Docker Desktop/宿主机，通过 `host.docker.internal` 访问。没有写死个人机器 IP。若不是 Windows + Docker Desktop，请先确认 Kind Node 内能够解析该名称，再自行提供等价的主机网关映射。
+
+### 第一次初始化
+
+以下步骤建议在 Windows 上管理 Docker Desktop和现有 PowerShell Lab，在 WSL2 Linux 中安装并运行 Self-hosted Runner、`kubectl`、`kind` 和 Bash 部署脚本。
+
+1. 安装并启动 Docker Desktop，启用 WSL2 integration；安装 `kubectl` 与 `kind`。脚本只检查依赖，不会自动安装系统软件。
+2. 按“快速开始”启动应用 MySQL和模型 Provider；需要完整诊断演示时，继续启动现有故障实验环境：
+
+   ```powershell
+   Set-Location D:\SRE-Agent-platform\sre-agent-backend
+   docker compose -f compose.yml up -d mysql
+
+   Set-Location D:\SRE-Agent-platform\sre-broken-system\sre-lab-infra
+   .\scripts\start-lab.ps1
+   ```
+
+3. 从 WSL2 进入仓库并初始化发布资源。脚本发现 `sre-lab` 已存在时会复用，不会创建第二套集群；若不存在，则使用项目现有 `kind-config.yaml` 创建它：
+
+   ```bash
+   cd /mnt/d/SRE-Agent-platform
+   bash scripts/setup-local-k8s.sh
+   ```
+
+4. 在本地安全创建应用 Secret。下面的变量只存在当前 Shell；输入时不回显。`GATEWAY_API_KEY` 可以先留空，Gateway 启动后生成有效 `gw_sk_...` 再更新 Agent Secret：
+
+   ```bash
+   read -rsp 'Application MySQL password: ' APP_MYSQL_PASSWORD; echo
+   read -rsp 'sre-lab read-only MySQL password: ' LAB_MYSQL_PASSWORD; echo
+   read -rp  'Initial Agent username: ' INITIAL_USERNAME
+   read -rsp 'Initial Agent password: ' INITIAL_PASSWORD; echo
+   read -rsp 'Gateway client API key (optional initially): ' AGENT_GATEWAY_KEY; echo
+   read -rsp 'vLLM provider API key: ' PROVIDER_KEY; echo
+
+   kubectl --context kind-sre-lab -n sre create secret generic sre-agent-secrets \
+     --from-literal=APPLICATION_MYSQL_PASSWORD="$APP_MYSQL_PASSWORD" \
+     --from-literal=MYSQL_PASSWORD="$LAB_MYSQL_PASSWORD" \
+     --from-literal=GATEWAY_API_KEY="$AGENT_GATEWAY_KEY" \
+     --from-literal=SRE_INITIAL_USERNAME="$INITIAL_USERNAME" \
+     --from-literal=SRE_INITIAL_PASSWORD="$INITIAL_PASSWORD"
+
+   kubectl --context kind-sre-lab -n sre create secret generic sre-gateway-secrets \
+     --from-literal=GATEWAY_MYSQL_PASSWORD="$APP_MYSQL_PASSWORD" \
+     --from-literal=VLLM_API_KEY="$PROVIDER_KEY"
+
+   unset APP_MYSQL_PASSWORD LAB_MYSQL_PASSWORD INITIAL_USERNAME INITIAL_PASSWORD AGENT_GATEWAY_KEY PROVIDER_KEY
+   ```
+
+   重复配置时使用 `kubectl create secret ... --dry-run=client -o yaml | kubectl apply -f -`，不要把含真实值的 YAML 保存到仓库。
+
+5. 在 GitHub 仓库进入 `Settings → Actions → Runners → New self-hosted runner`，选择 Linux x64，严格按页面给出的官方命令在 WSL2 安装。不要把页面生成的一次性 Runner Token 复制进 README、脚本或 Git。
+6. 给 Runner 增加自定义标签 `sre-local-deploy`，并以普通 Linux 用户运行。该用户需要能读取 `kind-sre-lab` kubeconfig、执行 `kubectl`，并访问 Docker Desktop；不要使用 root Runner。
+7. 在 `Settings → Actions → Variables → Actions` 可选创建 Repository Variable：
+
+   ```text
+   LOCAL_KUBE_CONTEXT=kind-sre-lab
+   ```
+
+   不配置时 Workflow 使用同一默认值。CI/Build 不需要自定义 GitHub Secret：GHCR 使用自动提供的 `GITHUB_TOKEN`；应用密码保存在本地 Kubernetes Secret，不上传到 GitHub。
+8. 把三个 GHCR Package 设为 public，使 Kind 能直接拉取。若必须保持 private，在本地用独立、最小 `read:packages` 凭据创建 `ghcr-pull`，并把它挂到 `default` 和 `sre-agent-runtime` ServiceAccount；不要把 PAT 放入仓库或 Workflow 文本。
+9. Push 到 `main`，在 GitHub Actions 先查看 `CI`，随后查看 `Build and Local CD`。只有 CI 全绿后才会出现三镜像 Build 和本机 Deploy。
+
+### 手动执行发布
+
+正常发布由 Workflow 注入完整 Git SHA。需要本地演示脚本时：
+
+```bash
+cd /mnt/d/SRE-Agent-platform
+GIT_SHA="$(git rev-parse HEAD)"
+IMAGE_TAG="sha-${GIT_SHA}"
+export GIT_SHA IMAGE_TAG
+bash scripts/deploy-local-k8s.sh
+unset GIT_SHA IMAGE_TAG
+```
+
+脚本拒绝短 SHA、`latest` 或与 `GIT_SHA` 不匹配的 Tag。它会依次：
+
+1. 检查 `kubectl`、context 和两个本地 Secret；
+2. apply Namespace、ConfigMap、RBAC、Services 和已渲染 Deployment；
+3. 显式执行三次 `kubectl set image`；
+4. 等待三个 Deployment 的 `rollout status`；
+5. 通过 Kubernetes API Server 的 Service Proxy 检查 Agent `/health`、Gateway `/health`、Frontend `/healthz`；
+6. 输出 Pod、镜像完整 Tag 和 Commit annotation。
+
+如果 rollout 或 HTTP 检查失败，ERR trap 会对已有的三个 Deployment 执行 `kubectl rollout undo` 并等待回滚完成，最后用原始非零状态退出。因此“回滚成功”不会把失败发布伪装成成功 Workflow。
+
+### 验证部署与追踪 Git Commit
+
+```bash
+kubectl --context kind-sre-lab -n sre get deployments,pods,services -o wide
+kubectl --context kind-sre-lab -n sre rollout status deployment/sre-agent
+kubectl --context kind-sre-lab -n sre rollout status deployment/sre-gateway
+kubectl --context kind-sre-lab -n sre rollout status deployment/sre-agent-frontend
+
+kubectl --context kind-sre-lab -n sre get pods \
+  -l app.kubernetes.io/part-of=sre-agent-platform \
+  -o custom-columns='POD:.metadata.name,IMAGE:.spec.containers[*].image,COMMIT:.metadata.annotations.sre\.agent/git-commit'
+```
+
+输出中的镜像形如 `ghcr.io/taxidriver4ever/sre-agent:sha-<40位SHA>`，可直接用 SHA 在 GitHub 定位 Commit。也可以检查一个 Pod 的完整信息：
+
+```bash
+kubectl --context kind-sre-lab -n sre describe pod <pod-name>
+```
+
+访问前端和健康端点：
+
+```bash
+kubectl --context kind-sre-lab -n sre port-forward service/sre-agent-frontend 3000:80
+# 浏览器打开 http://127.0.0.1:3000/
+```
+
+另一个终端可直接通过 API Server 验证，不需要在业务容器中安装 curl：
+
+```bash
+kubectl --context kind-sre-lab get --raw /api/v1/namespaces/sre/services/http:sre-agent:8001/proxy/health
+kubectl --context kind-sre-lab get --raw /api/v1/namespaces/sre/services/http:sre-gateway:8000/proxy/health
+kubectl --context kind-sre-lab get --raw /api/v1/namespaces/sre/services/http:sre-agent-frontend:80/proxy/healthz
+```
+
+### 手动回滚
+
+查看历史并回滚到上一 Revision：
+
+```bash
+kubectl --context kind-sre-lab -n sre rollout history deployment/sre-agent
+kubectl --context kind-sre-lab -n sre rollout undo deployment/sre-agent
+kubectl --context kind-sre-lab -n sre rollout status deployment/sre-agent --timeout=180s
+
+kubectl --context kind-sre-lab -n sre rollout undo deployment/sre-gateway
+kubectl --context kind-sre-lab -n sre rollout status deployment/sre-gateway --timeout=180s
+```
+
+如果需要指定版本，先从 `rollout history` 核实 Revision，再使用 `--to-revision=<number>`。回滚后重新执行 Service Proxy 健康检查并确认 Pod 的 image/commit；不要只看到 `rollout undo` 命令返回就认为恢复完成。
+
+### CI/CD 文件索引
+
+| 文件 | 职责 |
+| --- | --- |
+| `.github/workflows/ci.yml` | PR/main push 的 Agent、Gateway、Frontend 独立验证 |
+| `.github/workflows/cd.yml` | 成功 main CI 后构建 GHCR 镜像并调度可信本机 Runner |
+| `sre-agent-backend/sre-agent/Dockerfile` | Agent 生产镜像 |
+| `sre-agent-backend/sre-gateway/Dockerfile` | Gateway 生产镜像 |
+| `sre-agent-frontend/Dockerfile`、`nginx.conf` | 前端 multi-stage 镜像与反向代理 |
+| `deploy/k8s/*.yaml` | Namespace、ConfigMap、Secret 示例、RBAC、Deployment、Service |
+| `scripts/setup-local-k8s.sh` | 检查/复用 Kind，初始化非敏感基础资源 |
+| `scripts/deploy-local-k8s.sh` | SHA 渲染、apply、RollingUpdate、健康检查、失败回滚 |
+| `tests/test_cicd_config.py` | CI/CD 安全、版本追踪和部署配置契约测试 |
+
+### 范围与限制
+
+- 本链路不会自动 Merge、Push、修复代码或部署故障实验基础设施。
+- 不包含 Jenkins、Argo CD、Helm、Terraform、Ansible、Canary、Blue/Green、Service Mesh 或云 Kubernetes。
+- GitHub Runner 注册、GHCR Package 可见性和本地 Kubernetes Secret 必须由仓库所有者完成；这些状态无法由代码仓库安全地代替。
+- 本地开发命令与现有 Compose/PowerShell Lab 脚本保持不变；仅在展示发布链路时使用 `deploy/k8s`。
 
 ## 常见问题
 

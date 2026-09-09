@@ -303,6 +303,7 @@ class DiagnosisExecutionManager:
         *,
         lease_ttl_seconds: float = 60,
         heartbeat_interval_seconds: float = 10,
+        recovery_scan_interval_seconds: float = 15,
         max_attempts: int = 3,
     ) -> None:
         self.orchestrator = orchestrator
@@ -310,21 +311,35 @@ class DiagnosisExecutionManager:
         self.sandbox = sandbox
         self.lease_ttl_seconds = lease_ttl_seconds
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
+        self.recovery_scan_interval_seconds = recovery_scan_interval_seconds
         self.max_attempts = max_attempts
         self.executor_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:12]}"
         self.tasks: set[asyncio.Task[None]] = set()
+        self._submitted_diagnoses: set[str] = set()
+        self._recovery_task: asyncio.Task[None] | None = None
         self._heartbeat_diagnoses: set[str] = set()
         self._shutting_down = False
 
     def submit(self, diagnosis_id: str, *, reason: str = "api submission") -> asyncio.Task[None] | None:
-        if self._shutting_down:
+        if self._shutting_down or diagnosis_id in self._submitted_diagnoses:
             return None
+        self._submitted_diagnoses.add(diagnosis_id)
         task = asyncio.create_task(
             self._execute(diagnosis_id, reason), name=f"diagnosis-{diagnosis_id}",
         )
         self.tasks.add(task)
-        task.add_done_callback(self.tasks.discard)
+        task.add_done_callback(
+            lambda completed, current_id=diagnosis_id: self._submission_finished(
+                current_id, completed,
+            )
+        )
         return task
+
+    def _submission_finished(
+        self, diagnosis_id: str, task: asyncio.Task[None],
+    ) -> None:
+        self.tasks.discard(task)
+        self._submitted_diagnoses.discard(diagnosis_id)
 
     async def recover_stale_diagnoses(self) -> int:
         recovered = 0
@@ -336,8 +351,44 @@ class DiagnosisExecutionManager:
                 recovered += 1
         return recovered
 
+    def start_recovery_loop(self) -> asyncio.Task[None] | None:
+        """幂等启动周期扫描；应用 lifespan 负责决定首次启动时机。"""
+        if self._shutting_down:
+            return None
+        if self._recovery_task is not None and not self._recovery_task.done():
+            return self._recovery_task
+        self._recovery_task = asyncio.create_task(
+            self._recovery_loop(), name="diagnosis-recovery-scanner",
+        )
+        return self._recovery_task
+
+    async def _recovery_loop(self) -> None:
+        logger.info(
+            "Diagnosis recovery scanner started: interval_seconds=%s",
+            self.recovery_scan_interval_seconds,
+        )
+        while not self._shutting_down:
+            try:
+                await asyncio.sleep(self.recovery_scan_interval_seconds)
+                if self._shutting_down:
+                    break
+                recovered = await self.recover_stale_diagnoses()
+                if recovered:
+                    logger.warning(
+                        "Recovery scanner submitted %s stale Diagnosis Session(s)",
+                        recovered,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Diagnosis recovery scanner iteration failed")
+
     async def shutdown(self) -> None:
         self._shutting_down = True
+        recovery_task = self._recovery_task
+        if recovery_task is not None and not recovery_task.done():
+            recovery_task.cancel()
+            await asyncio.gather(recovery_task, return_exceptions=True)
         pending = list(self.tasks)
         for task in pending:
             task.cancel()

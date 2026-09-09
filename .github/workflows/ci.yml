@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  agent-test:
+    name: Agent pytest
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci-test-only-root-password
+          MYSQL_DATABASE: sre_agent_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci-test-only-root-password"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      APPLICATION_MYSQL_HOST: 127.0.0.1
+      APPLICATION_MYSQL_PORT: "3306"
+      APPLICATION_MYSQL_USER: root
+      APPLICATION_MYSQL_PASSWORD: ci-test-only-root-password
+      APPLICATION_MYSQL_DATABASE: sre_agent_test
+      APPLICATION_MYSQL_TEST_DATABASE: sre_agent_test
+      SRE_INITIAL_USERNAME: ci-admin
+      SRE_INITIAL_PASSWORD: ci-test-only-password
+      GATEWAY_API_KEY: gw_sk_ci_test_only
+    defaults:
+      run:
+        working-directory: sre-agent-backend/sre-agent
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: sre-agent-backend/sre-agent/requirements-dev.txt
+
+      - name: Install Agent dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Run Agent tests
+        run: python -m pytest
+
+  gateway-test:
+    name: Gateway pytest
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci-test-only-root-password
+          MYSQL_DATABASE: sre_gateway_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci-test-only-root-password"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      GATEWAY_MYSQL_HOST: 127.0.0.1
+      GATEWAY_MYSQL_PORT: "3306"
+      GATEWAY_MYSQL_USER: root
+      GATEWAY_MYSQL_PASSWORD: ci-test-only-root-password
+      GATEWAY_MYSQL_DATABASE: sre_gateway_test
+      GATEWAY_MYSQL_TEST_DATABASE: sre_gateway_test
+      VLLM_API_KEY: ci-test-only-vllm-key
+    defaults:
+      run:
+        working-directory: sre-agent-backend/sre-gateway
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: sre-agent-backend/sre-gateway/requirements-dev.txt
+
+      - name: Install Gateway dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Run Gateway tests
+        run: python -m pytest
+
+  frontend-build:
+    name: Frontend test and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sre-agent-frontend
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: sre-agent-frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run frontend unit tests
+        run: npm run test:run
+
+      - name: Build frontend
+        run: npm run build

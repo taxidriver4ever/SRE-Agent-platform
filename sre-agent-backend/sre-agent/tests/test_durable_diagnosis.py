@@ -293,6 +293,142 @@ class _Sandbox:
         yield Path.cwd()
 
 
+class _EmptyRepository:
+    def list_recoverable(self):
+        return []
+
+
+@pytest.mark.asyncio
+async def test_periodic_recovery_claims_after_fresh_crashed_lease_expires() -> None:
+    database, repository, session = _session()
+    first = repository.claim(
+        session.id, "executor-a", lease_ttl_seconds=60, max_attempts=3,
+        recovery_reason="first attempt",
+    )
+    assert first is not None
+    lease_expires_at = (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat()
+    with database.connect() as connection:
+        connection.execute(
+            "UPDATE diagnosis_sessions SET lease_expires_at = ? WHERE id = ?",
+            (lease_expires_at, session.id),
+        )
+        connection.commit()
+
+    manager = DiagnosisExecutionManager(
+        _WaitingOrchestrator(), repository, _Sandbox(),
+        lease_ttl_seconds=60, heartbeat_interval_seconds=30,
+        recovery_scan_interval_seconds=0.02, max_attempts=3,
+    )
+    assert await manager.recover_stale_diagnoses() == 0
+    assert repository.get_unscoped(session.id).attempt_no == 1
+
+    recovery_task = manager.start_recovery_loop()
+    for _ in range(300):
+        await asyncio.sleep(0.01)
+        recovered = repository.get_unscoped(session.id)
+        if recovered.attempt_no == 2 and recovered.lease_owner == manager.executor_id:
+            break
+
+    recovered = repository.get_unscoped(session.id)
+    assert recovery_task is manager._recovery_task
+    assert recovered.attempt_no == 2
+    assert recovered.lease_owner == manager.executor_id
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_recovery_loop_start_is_idempotent() -> None:
+    manager = DiagnosisExecutionManager(
+        _WaitingOrchestrator(), _EmptyRepository(), _Sandbox(),
+        recovery_scan_interval_seconds=0.01,
+    )
+
+    first = manager.start_recovery_loop()
+    second = manager.start_recovery_loop()
+
+    assert first is not None
+    assert second is first
+    assert manager._recovery_task is first
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_stops_recovery_loop_without_dangling_task() -> None:
+    manager = DiagnosisExecutionManager(
+        _WaitingOrchestrator(), _EmptyRepository(), _Sandbox(),
+        recovery_scan_interval_seconds=0.01,
+    )
+    recovery_task = manager.start_recovery_loop()
+    assert recovery_task is not None
+
+    await manager.shutdown()
+
+    assert manager._shutting_down is True
+    assert recovery_task.done()
+    assert manager.tasks == set()
+    assert manager.start_recovery_loop() is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_loop_continues_after_one_scan_failure(caplog) -> None:
+    manager = DiagnosisExecutionManager(
+        _WaitingOrchestrator(), _EmptyRepository(), _Sandbox(),
+        recovery_scan_interval_seconds=0.01,
+    )
+    scans = 0
+    second_scan = asyncio.Event()
+
+    async def recover() -> int:
+        nonlocal scans
+        scans += 1
+        if scans == 1:
+            raise RuntimeError("temporary database failure")
+        second_scan.set()
+        return 0
+
+    manager.recover_stale_diagnoses = recover
+    manager.start_recovery_loop()
+    await asyncio.wait_for(second_scan.wait(), timeout=1)
+    await manager.shutdown()
+
+    assert scans >= 2
+    assert "Diagnosis recovery scanner iteration failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_two_managers_rely_on_atomic_claim_for_one_stale_diagnosis() -> None:
+    database, repository, session = _session()
+    first = repository.claim(
+        session.id, "crashed-executor", lease_ttl_seconds=60, max_attempts=3,
+        recovery_reason="first attempt",
+    )
+    assert first is not None
+    with database.connect() as connection:
+        connection.execute(
+            "UPDATE diagnosis_sessions SET lease_expires_at = ? WHERE id = ?",
+            (_expired(), session.id),
+        )
+        connection.commit()
+
+    manager_a = DiagnosisExecutionManager(_WaitingOrchestrator(), repository, _Sandbox())
+    manager_b = DiagnosisExecutionManager(_WaitingOrchestrator(), repository, _Sandbox())
+    submitted = await asyncio.gather(
+        manager_a.recover_stale_diagnoses(), manager_b.recover_stale_diagnoses(),
+    )
+    assert submitted == [1, 1]
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        claimed = repository.get_unscoped(session.id)
+        if claimed.attempt_no == 2:
+            break
+
+    claimed = repository.get_unscoped(session.id)
+    assert claimed.attempt_no == 2
+    assert claimed.lease_owner in {manager_a.executor_id, manager_b.executor_id}
+    assert sum(not task.done() for task in manager_a.tasks | manager_b.tasks) == 1
+    await asyncio.gather(manager_a.shutdown(), manager_b.shutdown())
+
+
 @pytest.mark.asyncio
 async def test_graceful_shutdown_interrupts_without_business_cancellation() -> None:
     _, repository, session = _session()

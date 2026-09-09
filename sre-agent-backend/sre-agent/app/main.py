@@ -164,6 +164,7 @@ def create_app() -> FastAPI:
         diagnosis_orchestrator, diagnosis_repository, sandbox_manager,
         lease_ttl_seconds=settings.diagnosis_lease_ttl_seconds,
         heartbeat_interval_seconds=settings.diagnosis_heartbeat_interval_seconds,
+        recovery_scan_interval_seconds=settings.diagnosis_recovery_scan_interval_seconds,
         max_attempts=settings.diagnosis_max_attempts,
     )
     diagnosis_self_check = DiagnosisSelfCheckService(
@@ -248,14 +249,17 @@ def create_app() -> FastAPI:
         recovered = await diagnosis_execution_manager.recover_stale_diagnoses()
         if recovered:
             logger.warning("Recovered %s stale Diagnosis Session(s)", recovered)
-        yield
-        # Redeploy/shutdown 只 interrupt 并释放 Lease；CANCELLED 只留给业务取消。
-        await diagnosis_execution_manager.shutdown()
-        await validation_service.manager.shutdown()
-        # 只有 GatewayLLM 自己创建的客户端会被关闭，注入客户端的所有权规则
-        # 由 GatewayLLM.close() 内部负责判断。
-        await tools.close()
-        await llm.close()
+        diagnosis_execution_manager.start_recovery_loop()
+        try:
+            yield
+        finally:
+            # Redeploy/shutdown 只 interrupt 并释放 Lease；CANCELLED 只留给业务取消。
+            await diagnosis_execution_manager.shutdown()
+            await validation_service.manager.shutdown()
+            # 只有 GatewayLLM 自己创建的客户端会被关闭，注入客户端的所有权规则
+            # 由 GatewayLLM.close() 内部负责判断。
+            await tools.close()
+            await llm.close()
 
     # FastMCP 的 session manager 必须进入自己的 lifespan。官方 combine_lifespans
     # 同时管理 Agent HTTP 资源与 MCP transport，避免嵌套 ASGI lifespan 被忽略。

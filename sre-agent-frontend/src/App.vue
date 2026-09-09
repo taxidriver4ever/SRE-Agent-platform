@@ -3,7 +3,10 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "v
 import ServiceGraph from "./components/ServiceGraph.vue";
 import { getService, services, statusLabel } from "./data/services";
 
-const apiBaseUrl = import.meta.env.VITE_AGENT_API_BASE_URL || "http://127.0.0.1:8001";
+// Development keeps the existing local default. Production uses same-origin
+// relative URLs so an ingress or the container Nginx proxy can route the API.
+const apiBaseUrl = import.meta.env.VITE_AGENT_API_BASE_URL
+  || (import.meta.env.DEV ? "http://127.0.0.1:8001" : "");
 const projectId = "sre-lab";
 const uiPreview = import.meta.env.VITE_UI_PREVIEW === "true";
 const token = ref(localStorage.getItem("sre_agent_token") || "");

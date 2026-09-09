@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sre-agent-frontend
+  namespace: sre
+  labels:
+    app.kubernetes.io/name: sre-agent-frontend
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/part-of: sre-agent-platform
+    app.kubernetes.io/version: "VERSION_PLACEHOLDER"
+  annotations:
+    sre.agent/git-commit: "GIT_SHA_PLACEHOLDER"
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 120
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sre-agent-frontend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sre-agent-frontend
+        app.kubernetes.io/component: frontend
+        app.kubernetes.io/part-of: sre-agent-platform
+        app.kubernetes.io/version: "VERSION_PLACEHOLDER"
+      annotations:
+        sre.agent/git-commit: "GIT_SHA_PLACEHOLDER"
+    spec:
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: sre-agent-frontend
+          image: ghcr.io/taxidriver4ever/sre-agent-frontend:IMAGE_TAG_PLACEHOLDER
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: APP_VERSION
+              value: "IMAGE_TAG_PLACEHOLDER"
+            - name: GIT_COMMIT
+              value: "GIT_SHA_PLACEHOLDER"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: nginx-cache
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

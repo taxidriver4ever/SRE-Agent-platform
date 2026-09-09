@@ -1,0 +1,4 @@
+# Reuse the production dependency set and add only test tooling.
+-r requirements.txt
+pytest>=8.0,<10.0
+pytest-cov>=6.0,<8.0
