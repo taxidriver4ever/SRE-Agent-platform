@@ -16,6 +16,11 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
 
 
+# 以源码所在仓库为默认工作区，避免 Linux CI 把 ``D:\\...`` 当作相对路径。
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
+_SRE_SYSTEM_ROOT = _REPOSITORY_ROOT / "sre-broken-system"
+
+
 def _required_env(name: str) -> str:
     """读取必填环境变量，拒绝缺失或纯空白配置。"""
     value = os.getenv(name, "").strip()
@@ -124,15 +129,15 @@ def get_settings() -> Settings:
         mysql_user=os.getenv("MYSQL_USER", "sre_reader"),
         mysql_password=os.getenv("MYSQL_PASSWORD", "sre_reader_dev_only"),
         mysql_database=os.getenv("MYSQL_DATABASE", "sre_lab"),
-        repository_path=os.getenv("SRE_REPOSITORY_PATH", r"D:\SRE-Agent-platform\sre-broken-system"),
+        repository_path=os.getenv("SRE_REPOSITORY_PATH", str(_SRE_SYSTEM_ROOT)),
         service_catalog_path=os.getenv(
             "SERVICE_CATALOG_PATH",
-            r"D:\SRE-Agent-platform\sre-broken-system\sre-lab-infra\service-catalog.yaml",
+            str(_SRE_SYSTEM_ROOT / "sre-lab-infra" / "service-catalog.yaml"),
         ),
         # 远程仓库只允许克隆到独立缓存目录，绝不覆盖用户现有工作树。
         repository_cache_path=os.getenv(
             "SRE_REPOSITORY_CACHE_PATH",
-            r"D:\SRE-Agent-platform\.cache\sre-agent-repositories",
+            str(_REPOSITORY_ROOT / ".cache" / "sre-agent-repositories"),
         ),
         # Kubernetes 注解属于外部输入。默认只允许公共代码托管主机，避免 SSRF。
         repository_allowed_hosts=tuple(

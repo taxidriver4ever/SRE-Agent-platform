@@ -36,6 +36,8 @@ jobs:
       SRE_INITIAL_USERNAME: ci-admin
       SRE_INITIAL_PASSWORD: ci-test-only-password
       GATEWAY_API_KEY: gw_sk_ci_test_only
+      SRE_REPOSITORY_PATH: ${{ github.workspace }}/sre-broken-system
+      SERVICE_CATALOG_PATH: ${{ github.workspace }}/sre-broken-system/sre-lab-infra/service-catalog.yaml
     defaults:
       run:
         working-directory: sre-agent-backend/sre-agent

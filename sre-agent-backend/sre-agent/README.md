@@ -40,8 +40,9 @@ MYSQL_HOST=127.0.0.1
 MYSQL_PORT=13307
 MYSQL_USER=sre_reader
 MYSQL_PASSWORD=sre_reader_dev_only
-SRE_REPOSITORY_PATH=D:\SRE-Agent-platform\sre-broken-system
-SERVICE_CATALOG_PATH=D:\SRE-Agent-platform\sre-broken-system\sre-lab-infra\service-catalog.yaml
+# 可选；默认根据当前源码仓库位置自动定位，跨 Windows/Linux/macOS 生效。
+SRE_REPOSITORY_PATH=/path/to/SRE-Agent-platform/sre-broken-system
+SERVICE_CATALOG_PATH=/path/to/SRE-Agent-platform/sre-broken-system/sre-lab-infra/service-catalog.yaml
 TOOL_TIMEOUT_SECONDS=15
 DIAGNOSIS_DEADLINE_SECONDS=240
 DIAGNOSIS_MAX_ATTEMPTS=3

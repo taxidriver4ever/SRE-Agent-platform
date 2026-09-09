@@ -11,6 +11,8 @@ from pathlib import Path
 
 import yaml
 
+from app.core.config import get_settings
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 WORKFLOW_DIR = REPOSITORY_ROOT / ".github" / "workflows"
@@ -42,6 +44,34 @@ def test_ci_has_three_independent_github_hosted_jobs() -> None:
     assert "python -m pytest" in workflow_text
     assert "npm run build" in workflow_text
     assert "self-hosted" not in workflow_text
+
+
+def test_agent_ci_uses_linux_workspace_paths_for_repository_catalog() -> None:
+    workflow = _load_yaml(WORKFLOW_DIR / "ci.yml")
+    environment = workflow["jobs"]["agent-test"]["env"]
+
+    assert environment["SRE_REPOSITORY_PATH"] == "${{ github.workspace }}/sre-broken-system"
+    assert environment["SERVICE_CATALOG_PATH"] == (
+        "${{ github.workspace }}/sre-broken-system/sre-lab-infra/service-catalog.yaml"
+    )
+
+
+def test_default_repository_paths_are_anchored_to_checkout(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("SRE_REPOSITORY_PATH", raising=False)
+    monkeypatch.delenv("SERVICE_CATALOG_PATH", raising=False)
+    monkeypatch.delenv("SRE_REPOSITORY_CACHE_PATH", raising=False)
+
+    settings = get_settings()
+
+    assert Path(settings.repository_path) == REPOSITORY_ROOT / "sre-broken-system"
+    assert Path(settings.service_catalog_path) == (
+        REPOSITORY_ROOT / "sre-broken-system" / "sre-lab-infra" / "service-catalog.yaml"
+    )
+    assert Path(settings.repository_cache_path) == (
+        REPOSITORY_ROOT / ".cache" / "sre-agent-repositories"
+    )
 
 
 def test_cd_is_gated_by_successful_trusted_main_ci() -> None:
