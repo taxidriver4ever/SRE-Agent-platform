@@ -174,8 +174,9 @@ def test_mysql_explain_accepts_literal_percent_wildcard():
     MySQLReadBackend._validate_select("SELECT COUNT(*) FROM orders WHERE customer_email LIKE '%slow.example.com%'")
 
 
-def test_git_path_cannot_escape_repository():
-    """源码读取路径 resolve 后必须仍位于配置的仓库根目录。"""
+@pytest.mark.parametrize("escaped_path", ["../outside-secret.txt", "..\\outside-secret.txt"])
+def test_git_path_cannot_escape_repository(escaped_path: str):
+    """两种目录分隔符在 Windows 和 Linux 上都不能逃逸仓库根目录。"""
     settings = get_settings()
     repository = Path(settings.repository_path) / "order-service"
     tool = GitReadBackend(
@@ -186,7 +187,7 @@ def test_git_path_cannot_escape_repository():
         repositories={"order-service": repository},
     )
     with pytest.raises(ToolError, match="不能逃逸"):
-        asyncio.run(tool.execute({"repository": "order-service", "path": "..\\outside-secret.txt"}))
+        asyncio.run(tool.execute({"repository": "order-service", "path": escaped_path}))
 
 
 def test_bounded_marks_and_truncates_large_results():

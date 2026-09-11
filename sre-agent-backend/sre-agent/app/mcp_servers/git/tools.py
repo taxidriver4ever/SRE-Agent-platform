@@ -141,14 +141,21 @@ class GitReadBackend:
         return value
 
     def _safe_path(self, repository: Path, value: str, required: bool = False) -> str:
-        """把路径约束到仓库内，并统一成 Git 使用的正斜线相对路径。"""
+        """跨平台解析调用方路径，并将其严格约束在仓库根目录内。"""
         if required and not value:
             raise ToolError(f"{self.name} 必须提供 path")
         if not value:
             return ""
-        candidate = (repository / value).resolve()
+        # API 参数不应随服务端操作系统改变语义：Linux 的 pathlib 会把反斜杠
+        # 当普通字符，但 Windows 调用方通常用它表示目录层级。先统一为 Git 的
+        # 正斜线路径，确保 ``../`` 和 ``..\\`` 在所有 Runner 上都受到相同校验。
+        normalized = value.replace("\\", "/")
+        if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
+            raise ToolError("path 不能逃逸仓库根目录")
+        root = repository.resolve()
+        candidate = (root / normalized).resolve()
         try:
-            relative = candidate.relative_to(repository)
+            relative = candidate.relative_to(root)
         except ValueError as exc:
             raise ToolError("path 不能逃逸仓库根目录") from exc
         return relative.as_posix()
