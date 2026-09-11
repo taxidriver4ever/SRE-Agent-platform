@@ -37,12 +37,18 @@ class GitReadBackend:
         # 来冒充正在运行的代码。
         requested_commit = str(arguments.get("commit") or arguments.get("head") or "HEAD")
         repository = await self._select_repository(identifier, requested_commit)
+        # 路径属于不可信调用参数，必须先做纯路径边界校验。即使仓库尚未初始化
+        # 或 CI checkout 未包含嵌套 .git，也不能让后续状态检查掩盖目录逃逸。
+        relative_path = self._safe_path(
+            repository,
+            str(arguments.get("path") or ""),
+            required=self.name.startswith("read_file"),
+        )
         if not (repository / ".git").is_dir():
             raise ToolError(f"不是 Git 仓库: {repository}")
         commit = self._safe_ref(str(arguments.get("commit") or "HEAD"))
         base = self._safe_ref(str(arguments.get("base") or f"{commit}^"))
         head = self._safe_ref(str(arguments.get("head") or commit))
-        relative_path = self._safe_path(repository, str(arguments.get("path") or ""), required=self.name.startswith("read_file"))
         start_line, end_line = self._safe_line_range(arguments)
         prefix = ["-C", str(repository)]
 

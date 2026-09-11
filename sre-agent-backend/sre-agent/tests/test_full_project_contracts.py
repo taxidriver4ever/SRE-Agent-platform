@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.api.router import get_tool_policy
 from app.auth import require_user
+from app.core.config import get_settings
 from app.diagnosis.models import DiagnosisEvent, DiagnosisSession
 from app.diagnosis.router import (
     get_diagnosis_execution_manager,
@@ -20,7 +21,15 @@ from app.diagnosis.router import (
 from app.main import create_app
 
 
-def _login(client: TestClient, username: str = "admin", password: str = "admin123") -> dict[str, str]:
+def _login(
+    client: TestClient,
+    username: str | None = None,
+    password: str | None = None,
+) -> dict[str, str]:
+    if username is None or password is None:
+        settings = get_settings()
+        username = settings.initial_username
+        password = settings.initial_password
     response = client.post("/api/auth/login", json={"username": username, "password": password})
     assert response.status_code == 200
     return {"Authorization": f"Bearer {response.json()['access_token']}"}

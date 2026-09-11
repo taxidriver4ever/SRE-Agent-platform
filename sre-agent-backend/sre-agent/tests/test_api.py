@@ -2,12 +2,17 @@
 
 from fastapi.testclient import TestClient
 
+from app.core.config import get_settings
 from app.main import create_app
 
 
 def login_headers(client: TestClient) -> dict[str, str]:
-    """使用本地初始账号登录，返回受保护 API 所需 Authorization Header。"""
-    response = client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+    """使用环境注入的初始账号登录，返回受保护 API 所需 Authorization Header。"""
+    settings = get_settings()
+    response = client.post(
+        "/api/auth/login",
+        json={"username": settings.initial_username, "password": settings.initial_password},
+    )
     assert response.status_code == 200
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
 
