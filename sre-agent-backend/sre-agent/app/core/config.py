@@ -67,6 +67,7 @@ class Settings:
     diagnosis_lease_ttl_seconds: float
     diagnosis_heartbeat_interval_seconds: float
     diagnosis_recovery_scan_interval_seconds: float
+    diagnosis_recovery_batch_size: int
     tool_output_limit: int
     model_context_window: int
     context_compaction_ratio: float
@@ -156,6 +157,9 @@ def get_settings() -> Settings:
         ),
         diagnosis_recovery_scan_interval_seconds=max(
             5.0, float(os.getenv("DIAGNOSIS_RECOVERY_SCAN_INTERVAL_SECONDS", "15"))
+        ),
+        diagnosis_recovery_batch_size=max(
+            1, min(200, int(os.getenv("DIAGNOSIS_RECOVERY_BATCH_SIZE", "20")))
         ),
         tool_output_limit=int(os.getenv("TOOL_OUTPUT_LIMIT", "12000")),
         model_context_window=max(4096, int(os.getenv("MODEL_CONTEXT_WINDOW", "32768"))),

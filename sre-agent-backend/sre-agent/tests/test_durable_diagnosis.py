@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 
+from app.core.config import get_settings
 from app.diagnosis.execution import DiagnosisExecutionManager, DurableWorkflowRuntime
 from app.diagnosis.models import DiagnosisEvidence
 from app.diagnosis.orchestrator import DiagnosisOrchestrator
@@ -53,6 +54,25 @@ def _state(session, run_id: str = "run-durable-1") -> DiagnosisState:
 
 def _expired() -> str:
     return (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+
+
+def _pending_sessions(count: int):
+    """在同一用户与会话下创建一组顺序稳定的 PENDING Diagnosis。"""
+    database, repository, first = _session()
+    sessions = [first]
+    for index in range(1, count):
+        sessions.append(repository.create(
+            str(first.user_id), first.conversation_id,
+            f"queued diagnosis {index}", "QUESTION", None,
+        ))
+    with database.connect() as connection:
+        for index, session in enumerate(sessions):
+            connection.execute(
+                "UPDATE diagnosis_sessions SET created_at = ? WHERE id = ?",
+                (f"2026-01-01T00:00:{index:02d}+00:00", session.id),
+            )
+        connection.commit()
+    return database, repository, sessions
 
 
 def test_phase_cursor_resumes_after_completed_triage() -> None:
@@ -234,6 +254,48 @@ def test_stale_lease_is_recoverable_but_terminal_states_are_not() -> None:
         assert all(item.id != session.id for item in repository.list_recoverable())
 
 
+def test_recoverable_batch_is_limited_and_oldest_pending_sessions_are_first() -> None:
+    """超过批次时只返回前 N 个，并按 created_at 从旧到新稳定排序。"""
+    _, repository, sessions = _pending_sessions(30)
+
+    recovered = repository.list_recoverable(limit=20)
+
+    assert len(recovered) == 20
+    assert [item.id for item in recovered] == [item.id for item in sessions[:20]]
+
+
+def test_recoverable_batch_includes_only_pending_or_stale_investigating() -> None:
+    """终态和有效 Lease 不恢复，PENDING 与过期/缺失 Lease 可以恢复。"""
+    database, repository, sessions = _pending_sessions(7)
+    pending, expired, missing_lease, valid, completed, failed, cancelled = sessions
+    future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    with database.connect() as connection:
+        connection.execute(
+            "UPDATE diagnosis_sessions SET status = 'INVESTIGATING', lease_owner = 'old', lease_expires_at = ? WHERE id = ?",
+            (_expired(), expired.id),
+        )
+        connection.execute(
+            "UPDATE diagnosis_sessions SET status = 'INVESTIGATING', lease_owner = NULL, lease_expires_at = NULL WHERE id = ?",
+            (missing_lease.id,),
+        )
+        connection.execute(
+            "UPDATE diagnosis_sessions SET status = 'INVESTIGATING', lease_owner = 'active', lease_expires_at = ? WHERE id = ?",
+            (future, valid.id),
+        )
+        for session, status in (
+            (completed, "COMPLETED"), (failed, "FAILED"), (cancelled, "CANCELLED"),
+        ):
+            connection.execute(
+                "UPDATE diagnosis_sessions SET status = ? WHERE id = ?",
+                (status, session.id),
+            )
+        connection.commit()
+
+    recovered_ids = {item.id for item in repository.list_recoverable(limit=20)}
+
+    assert recovered_ids == {pending.id, expired.id, missing_lease.id}
+
+
 @pytest.mark.asyncio
 async def test_recovery_marks_attempt_limit_failed_without_starting_executor() -> None:
     database, repository, session = _session()
@@ -294,8 +356,67 @@ class _Sandbox:
 
 
 class _EmptyRepository:
-    def list_recoverable(self):
+    def list_recoverable(self, *, limit=20):
+        del limit
         return []
+
+
+def test_recovery_batch_size_config_defaults_and_bounds(monkeypatch) -> None:
+    monkeypatch.delenv("DIAGNOSIS_RECOVERY_BATCH_SIZE", raising=False)
+    assert get_settings().diagnosis_recovery_batch_size == 20
+
+    monkeypatch.setenv("DIAGNOSIS_RECOVERY_BATCH_SIZE", "0")
+    assert get_settings().diagnosis_recovery_batch_size == 1
+
+    monkeypatch.setenv("DIAGNOSIS_RECOVERY_BATCH_SIZE", "9999")
+    assert get_settings().diagnosis_recovery_batch_size == 200
+
+
+@pytest.mark.asyncio
+async def test_each_recovery_tick_submits_only_one_batch_then_next_tick_continues() -> None:
+    """单轮最多提交 batch_size；任务 claim 后，下一轮再处理剩余任务。"""
+    database, repository, sessions = _pending_sessions(30)
+    manager = DiagnosisExecutionManager(
+        _WaitingOrchestrator(), repository, _Sandbox(),
+        lease_ttl_seconds=60, heartbeat_interval_seconds=30,
+        recovery_batch_size=20, max_attempts=3,
+    )
+
+    assert await manager.recover_stale_diagnoses() == 20
+    assert len(manager.tasks) == 20
+    with database.connect() as connection:
+        before_claim = connection.execute(
+            "SELECT COUNT(*) AS total FROM diagnosis_sessions WHERE status = 'PENDING'"
+        ).fetchone()
+    assert int(before_claim["total"]) == 30
+
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        with database.connect() as connection:
+            claimed = connection.execute(
+                "SELECT COUNT(*) AS total FROM diagnosis_sessions WHERE lease_owner = ?",
+                (manager.executor_id,),
+            ).fetchone()
+        if int(claimed["total"]) == 20:
+            break
+    assert int(claimed["total"]) == 20
+
+    assert await manager.recover_stale_diagnoses() == 10
+    assert len(manager.tasks) == 30
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        with database.connect() as connection:
+            claimed = connection.execute(
+                "SELECT COUNT(*) AS total FROM diagnosis_sessions WHERE lease_owner = ?",
+                (manager.executor_id,),
+            ).fetchone()
+        if int(claimed["total"]) == 30:
+            break
+    assert int(claimed["total"]) == 30
+    assert {
+        item.id for item in repository.list_recoverable(limit=20)
+    }.isdisjoint({item.id for item in sessions})
+    await manager.shutdown()
 
 
 @pytest.mark.asyncio

@@ -165,6 +165,7 @@ def create_app() -> FastAPI:
         lease_ttl_seconds=settings.diagnosis_lease_ttl_seconds,
         heartbeat_interval_seconds=settings.diagnosis_heartbeat_interval_seconds,
         recovery_scan_interval_seconds=settings.diagnosis_recovery_scan_interval_seconds,
+        recovery_batch_size=settings.diagnosis_recovery_batch_size,
         max_attempts=settings.diagnosis_max_attempts,
     )
     diagnosis_self_check = DiagnosisSelfCheckService(

@@ -304,6 +304,7 @@ class DiagnosisExecutionManager:
         lease_ttl_seconds: float = 60,
         heartbeat_interval_seconds: float = 10,
         recovery_scan_interval_seconds: float = 15,
+        recovery_batch_size: int = 20,
         max_attempts: int = 3,
     ) -> None:
         self.orchestrator = orchestrator
@@ -312,6 +313,7 @@ class DiagnosisExecutionManager:
         self.lease_ttl_seconds = lease_ttl_seconds
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.recovery_scan_interval_seconds = recovery_scan_interval_seconds
+        self.recovery_batch_size = max(1, min(200, int(recovery_batch_size)))
         self.max_attempts = max_attempts
         self.executor_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:12]}"
         self.tasks: set[asyncio.Task[None]] = set()
@@ -342,8 +344,11 @@ class DiagnosisExecutionManager:
         self._submitted_diagnoses.discard(diagnosis_id)
 
     async def recover_stale_diagnoses(self) -> int:
+        # 一个 scanner tick 只读取并提交一批；剩余任务留给下一个 interval，
+        # 避免积压时在同一轮创建无界数量的 asyncio Task。
+        sessions = self.repository.list_recoverable(limit=self.recovery_batch_size)
         recovered = 0
-        for session in self.repository.list_recoverable():
+        for session in sessions:
             if session.attempt_no >= self.max_attempts:
                 self.repository.mark_max_attempts_exceeded(session.id, self.max_attempts)
                 continue
@@ -364,8 +369,8 @@ class DiagnosisExecutionManager:
 
     async def _recovery_loop(self) -> None:
         logger.info(
-            "Diagnosis recovery scanner started: interval_seconds=%s",
-            self.recovery_scan_interval_seconds,
+            "Diagnosis recovery scanner started: interval_seconds=%s batch_size=%s",
+            self.recovery_scan_interval_seconds, self.recovery_batch_size,
         )
         while not self._shutting_down:
             try:

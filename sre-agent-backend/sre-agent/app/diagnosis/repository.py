@@ -738,8 +738,12 @@ class DiagnosisRepository:
                 )
             connection.commit()
 
-    def list_recoverable(self, now: str | None = None) -> list[DiagnosisSession]:
+    def list_recoverable(
+        self, now: str | None = None, limit: int = 20,
+    ) -> list[DiagnosisSession]:
+        """按创建时间返回一批可恢复任务；每次调用只读取固定数量且不使用 OFFSET。"""
         cutoff = now or self._now()
+        bounded_limit = max(1, min(200, int(limit)))
         with closing(self.database.connect()) as connection:
             rows = connection.execute(
                 """
@@ -748,9 +752,10 @@ class DiagnosisRepository:
                    OR (status = 'INVESTIGATING' AND (
                         lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at < ?
                    ))
-                ORDER BY created_at
+                ORDER BY created_at ASC, id ASC
+                LIMIT ?
                 """,
-                (cutoff,),
+                (cutoff, bounded_limit),
             ).fetchall()
         return [self._session(row) for row in rows]
 
