@@ -15,3 +15,6 @@ PyMySQL>=1.1,<2.0
 # 使用 FastMCP 提供标准 MCP Server、工具 Schema、参数验证、发现和调用能力。
 # 精确锁定稳定版，避免 MCP 生态快速演进时次版本破坏现有 Agent 行为。
 fastmcp==3.4.5
+# Framework abstractions and official MCP-to-LangChain tool conversion.
+langchain-core==1.6.4
+langchain-mcp-adapters==0.3.2

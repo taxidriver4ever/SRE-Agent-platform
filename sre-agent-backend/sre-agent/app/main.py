@@ -31,6 +31,7 @@ from app.diagnosis import (
 from app.diagnosis.router import router as diagnosis_router
 from app.diagnosis.self_check_router import router as self_check_router
 from app.llm import GatewayLLM
+from app.llm.langchain import LangChainLLM
 from app.intent import IntentRouter, IntentWorkflowRouter
 from app.security import ToolPolicy
 from app.sandbox import DockerSandboxManager
@@ -86,13 +87,14 @@ def create_app() -> FastAPI:
     code_state_repository = CodeStateRepository(application_database)
 
     # GatewayLLM 是唯一连接外部模型能力的组件。Agent 不直接访问厂商 API。
-    llm = GatewayLLM(
+    gateway_llm = GatewayLLM(
         base_url=settings.gateway_base_url,
         api_key=settings.gateway_api_key,
         model=settings.gateway_model,
         timeout=settings.gateway_timeout_seconds,
         max_tokens=settings.gateway_max_tokens,
     )
+    llm = LangChainLLM(gateway_llm) if settings.agent_backend == "langchain" else gateway_llm
     # FastMCP 负责工具注册、Schema、参数校验和标准 MCP 调用；Agent 只持有官方
     # in-memory Client 的薄适配器，没有自研 MCP 注册中心或协议实现。
     repository_registry = RepositoryRegistry(
@@ -128,13 +130,14 @@ def create_app() -> FastAPI:
     mcp_app = mcp_server.http_app(path="/")
     # Kubernetes 不再注册到项目自有 Server，而是由维护活跃的第三方 MCP
     # 以 read-only/core/single-context 模式直接访问 Kubernetes API。
-    kubernetes_mcp = KubernetesMCPAdapter(settings.kubernetes_namespace)
+    kubernetes_mcp = KubernetesMCPAdapter(settings.kubernetes_namespace, backend=settings.agent_backend)
     tools = FastMCPToolClient(
         mcp_server,
         kubernetes_mcp,
         policy=tool_policy,
         audit_repository=audit_repository,
         default_project_id=settings.default_project_id,
+        backend=settings.agent_backend,
     )
     context_service = ConversationCompactionService(
         memory_repository,

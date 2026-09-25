@@ -4,6 +4,16 @@
 
 ## 模块
 
+默认使用 LangChain Core 的 Prompt/ChatModel/Parser 调用链和官方
+`langchain-mcp-adapters` 工具适配。Gateway HTTP 协议、只读 Policy/Audit、
+Evidence Gate 和 MySQL Task/Lease/CAS/Checkpoint 继续由原模块负责。
+详见 [架构分析、分阶段实施与验收](../../docs/langchain-mcp-refactor.md)。
+
+更新环境后执行 `python -m pip install -r requirements-dev.txt`。
+在 Agent 的 `.env` 设置 `SRE_AGENT_BACKEND=legacy` 并重启，可回滚到原 Gateway/MCP
+调用后端；默认值为 `langchain`。此开关不卸载依赖、不回滚业务数据，也不撤销
+所有权检查修正；Prompt 文本、结构化修复规则和业务调度共用一份实现。
+
 - `app/llm/`：Provider 无关协议与 Gateway Client，Agent 不使用厂商 SDK。
 - `app/intent/`：LLM Structured Output 意图分类与工作流闸门；合法意图确认前禁止进入工具 Runtime。
 - `app/security/`：项目级 Tool Policy、严格参数 Schema 与服务端 Task Scope。

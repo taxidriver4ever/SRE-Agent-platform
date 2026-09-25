@@ -11,7 +11,8 @@ from typing import Any
 from app.code_state.models import CodeComponent, CodeReference, CodeRolePatch
 from app.code_state.repository import CodeStateRepository
 from app.core.process import run_fixed_command
-from app.llm.base import LLM, LLMMessage
+from app.llm.base import LLM
+from app.llm.prompts import prompt_messages
 from app.llm.structured_output import validate_structured_output
 from app.repositories import RepositoryRegistry
 from fastmcp.exceptions import ToolError
@@ -218,17 +219,14 @@ class CodeStateService:
             "current_role": item.role,
         } for item in components[:40]]
         try:
-            response = await self.llm.complete([
-                LLMMessage(
-                    "system",
+            response = await self.llm.complete(prompt_messages(
                     "你是 Code State 导航维护器。只根据 Git diff 和符号签名完善短 role/relationships；"
                     "不得输出源码，不得创建输入中不存在的 path 或 symbol。只输出 JSON。/no_think",
-                ),
-                LLMMessage("user", json.dumps({
+                json.dumps({
                     "change_summary": change_summary[:16000],
                     "navigation": navigation,
-                }, ensure_ascii=False)),
-            ])
+                }, ensure_ascii=False),
+            ))
             patch = validate_structured_output(response.content, CodeRolePatch)
         except Exception:
             return components

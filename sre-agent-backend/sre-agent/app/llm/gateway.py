@@ -23,6 +23,14 @@ class GatewayRequestError(GatewayError):
     """Gateway 网络、HTTP 或响应协议异常。"""
 
 
+class LLMTimeoutError(GatewayRequestError):
+    """The configured transport deadline expired; the caller owns retry policy."""
+
+
+class LLMRateLimitError(GatewayRequestError):
+    """Gateway HTTP 429, without implicit retries or provider bypass."""
+
+
 class GatewayLLM:
     """通过统一 Gateway 调用任意已配置的模型 Provider。
 
@@ -106,9 +114,12 @@ class GatewayLLM:
         except httpx.HTTPStatusError as exc:
             # 仅提取响应正文中的 detail；绝不拼接包含 Authorization 的 Request。
             detail = _safe_error_detail(exc.response)
-            raise GatewayRequestError(
+            error_type = LLMRateLimitError if exc.response.status_code == 429 else GatewayRequestError
+            raise error_type(
                 f"Gateway returned HTTP {exc.response.status_code}: {detail}"
             ) from exc
+        except httpx.TimeoutException as exc:
+            raise LLMTimeoutError("Gateway request or response is invalid") from exc
         except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
             # 同时覆盖网络错误、非法 JSON 和网关响应字段类型不正确等情况。
             raise GatewayRequestError("Gateway request or response is invalid") from exc

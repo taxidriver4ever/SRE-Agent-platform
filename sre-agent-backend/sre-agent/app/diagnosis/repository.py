@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
-from contextlib import closing
+from contextlib import closing, contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
 from app.core.database import ApplicationDatabase
+from app.core.errors import TaskOwnershipLostError
 from app.diagnosis.models import (
     DiagnosisEvent, DiagnosisEvidence, DiagnosisRootCause, DiagnosisSession,
     DiagnosisStatus, DiagnosisTarget, IncidentGraph, IncidentGraphEdge,
@@ -16,8 +18,21 @@ from app.diagnosis.models import (
 )
 
 
-class DiagnosisOwnershipLost(RuntimeError):
+class DiagnosisOwnershipLost(TaskOwnershipLostError):
     """CAS 或 Lease 校验失败；当前 Executor 必须立即放弃写入。"""
+
+
+class _ProjectionConnection:
+    """Repository methods share an outer transaction without committing it early."""
+
+    def __init__(self, connection):
+        self.execute = connection.execute
+
+    def commit(self):
+        pass
+
+    def close(self):
+        pass
 
 
 class DiagnosisRepository:
@@ -25,6 +40,43 @@ class DiagnosisRepository:
 
     def __init__(self, database: ApplicationDatabase) -> None:
         self.database = database
+        self._projection = ContextVar("diagnosis_projection", default=None)
+
+    def _projection_connect(self):
+        return self._projection.get() or self.database.connect()
+
+    def _lock_owner(self, connection, diagnosis_id: str, owner: str, version: int):
+        """Always lock Task before Step/Evidence, including report projections."""
+        row = connection.execute(
+            "SELECT lease_owner, state_version, lease_expires_at, status, next_step_sequence FROM diagnosis_sessions WHERE id = ? FOR UPDATE",
+            (diagnosis_id,),
+        ).fetchone()
+        if (row is None or row["lease_owner"] != owner or int(row["state_version"]) != version
+                or row["status"] != "INVESTIGATING"
+                or not row["lease_expires_at"] or str(row["lease_expires_at"]) <= self._now()):
+            connection.rollback()
+            raise DiagnosisOwnershipLost("task ownership check failed")
+        return row
+
+    @contextmanager
+    def owned_projection(self, diagnosis_id: str, owner: str, version: int):
+        """Fence synchronous report/start projections in the same SQL transaction.
+
+        No await, framework callback or network operation may run inside this scope.
+        Existing projection methods commit only when the outer transaction succeeds.
+        """
+        with closing(self.database.connect()) as connection:
+            self._lock_owner(connection, diagnosis_id, owner, version)
+            token = self._projection.set(_ProjectionConnection(connection))
+            try:
+                yield
+                self._lock_owner(connection, diagnosis_id, owner, version)
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                self._projection.reset(token)
 
     def create(
         self,
@@ -120,7 +172,7 @@ class DiagnosisRepository:
             assignments.append("finished_at = ?")
             parameters.append(self._now())
         parameters.append(diagnosis_id)
-        with closing(self.database.connect()) as connection:
+        with closing(self._projection_connect()) as connection:
             connection.execute(
                 f"UPDATE diagnosis_sessions SET {', '.join(assignments)} WHERE id = ?",
                 parameters,
@@ -150,7 +202,7 @@ class DiagnosisRepository:
         step_id = uuid4().hex
         started_value = started_at or self._now()
         finished_value = finished_at or (self._now() if status in {"COMPLETED", "FAILED"} else None)
-        with closing(self.database.connect()) as connection:
+        with closing(self._projection_connect()) as connection:
             session = connection.execute(
                 "SELECT next_step_sequence FROM diagnosis_sessions WHERE id = ? FOR UPDATE",
                 (diagnosis_id,),
@@ -213,7 +265,7 @@ class DiagnosisRepository:
         ) for row in rows]
 
     def get_step_by_key(self, diagnosis_id: str, idempotency_key: str) -> InvestigationStep | None:
-        with closing(self.database.connect()) as connection:
+        with closing(self._projection_connect()) as connection:
             row = connection.execute(
                 """
                 SELECT * FROM diagnosis_investigation_steps
@@ -224,7 +276,7 @@ class DiagnosisRepository:
         return self._step(row) if row else None
 
     def get_step_by_evidence_id(self, diagnosis_id: str, evidence_id: str) -> InvestigationStep | None:
-        with closing(self.database.connect()) as connection:
+        with closing(self._projection_connect()) as connection:
             row = connection.execute(
                 """
                 SELECT * FROM diagnosis_investigation_steps
@@ -248,7 +300,7 @@ class DiagnosisRepository:
         return [self._step(row) for row in rows]
 
     def upsert_evidence(self, evidence: DiagnosisEvidence) -> None:
-        with closing(self.database.connect()) as connection:
+        with closing(self._projection_connect()) as connection:
             connection.execute(
                 """
                 INSERT INTO diagnosis_evidence(
@@ -312,7 +364,7 @@ class DiagnosisRepository:
         )
 
     def replace_graph(self, diagnosis_id: str, graph: IncidentGraph) -> None:
-        with closing(self.database.connect()) as connection:
+        with closing(self._projection_connect()) as connection:
             connection.execute("DELETE FROM diagnosis_graph_edges WHERE diagnosis_id = ?", (diagnosis_id,))
             connection.execute("DELETE FROM diagnosis_graph_nodes WHERE diagnosis_id = ?", (diagnosis_id,))
             for node in graph.nodes:
@@ -363,7 +415,7 @@ class DiagnosisRepository:
     def upsert_root_cause(self, diagnosis_id: str, root: DiagnosisRootCause) -> None:
         now = self._now()
         resource = root.root_resource
-        with closing(self.database.connect()) as connection:
+        with closing(self._projection_connect()) as connection:
             connection.execute(
                 """
                 INSERT INTO diagnosis_root_causes(
@@ -407,7 +459,7 @@ class DiagnosisRepository:
     def append_event(
         self, diagnosis_id: str, event_type: str, data: dict[str, Any], *, event_key: str | None = None,
     ) -> int:
-        with closing(self.database.connect()) as connection:
+        with closing(self._projection_connect()) as connection:
             result = connection.execute(
                 """
                 INSERT INTO diagnosis_events(diagnosis_id, event_type, event_key, data_json, created_at)
@@ -467,9 +519,9 @@ class DiagnosisRepository:
                 SET heartbeat_at = ?, lease_expires_at = ?, state_version = state_version + 1,
                     updated_at = ?
                 WHERE id = ? AND lease_owner = ? AND state_version = ?
-                  AND status = 'INVESTIGATING'
+                  AND status = 'INVESTIGATING' AND lease_expires_at > ?
                 """,
-                (now, self._future(lease_ttl_seconds), now, diagnosis_id, lease_owner, expected_version),
+                (now, self._future(lease_ttl_seconds), now, diagnosis_id, lease_owner, expected_version, now),
             )
             connection.commit()
         if result.rowcount != 1:
@@ -499,12 +551,12 @@ class DiagnosisRepository:
                     heartbeat_at = ?, lease_expires_at = ?, state_version = state_version + 1,
                     updated_at = ?
                 WHERE id = ? AND lease_owner = ? AND state_version = ?
-                  AND status = 'INVESTIGATING'
+                  AND status = 'INVESTIGATING' AND lease_expires_at > ?
                 """,
                 (
                     checkpoint.get("run_id"), current_phase, phase_status,
                     self._json(checkpoint), now, self._future(lease_ttl_seconds), now,
-                    diagnosis_id, lease_owner, expected_version,
+                    diagnosis_id, lease_owner, expected_version, now,
                 ),
             )
             if result.rowcount != 1:
@@ -539,6 +591,7 @@ class DiagnosisRepository:
         """返回 ``(step, completed_cache_hit, state_version)``。"""
         now = self._now()
         with closing(self.database.connect()) as connection:
+            session = self._lock_owner(connection, diagnosis_id, lease_owner, expected_version)
             existing = connection.execute(
                 """
                 SELECT * FROM diagnosis_investigation_steps
@@ -548,18 +601,6 @@ class DiagnosisRepository:
             ).fetchone()
             if existing is not None and str(existing["status"]) == "COMPLETED":
                 return self._step(existing), True, expected_version
-
-            session = connection.execute(
-                "SELECT state_version, next_step_sequence, lease_owner FROM diagnosis_sessions WHERE id = ? FOR UPDATE",
-                (diagnosis_id,),
-            ).fetchone()
-            if (
-                session is None
-                or str(session["lease_owner"] or "") != lease_owner
-                or int(session["state_version"]) != expected_version
-            ):
-                connection.rollback()
-                raise DiagnosisOwnershipLost("tool begin CAS failed")
 
             if existing is not None:
                 connection.execute(
@@ -649,6 +690,7 @@ class DiagnosisRepository:
         """Step、Evidence、Checkpoint 和 completed/failed Event 使用同一事务。"""
         now = self._now()
         with closing(self.database.connect()) as connection:
+            self._lock_owner(connection, diagnosis_id, lease_owner, expected_version)
             row = connection.execute(
                 """
                 SELECT * FROM diagnosis_investigation_steps
@@ -682,12 +724,12 @@ class DiagnosisRepository:
                     checkpoint_seq = checkpoint_seq + 1, heartbeat_at = ?, lease_expires_at = ?,
                     state_version = state_version + 1, updated_at = ?
                 WHERE id = ? AND lease_owner = ? AND state_version = ?
-                  AND status = 'INVESTIGATING'
+                  AND status = 'INVESTIGATING' AND lease_expires_at > ?
                 """,
                 (
                     checkpoint.get("run_id"), self._json(checkpoint), now,
                     self._future(lease_ttl_seconds), now,
-                    diagnosis_id, lease_owner, expected_version,
+                    diagnosis_id, lease_owner, expected_version, now,
                 ),
             )
             if updated.rowcount != 1:
@@ -802,11 +844,11 @@ class DiagnosisRepository:
                     lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
                     state_version = state_version + 1, updated_at = ?
                 WHERE id = ? AND lease_owner = ? AND state_version = ?
-                  AND status = 'INVESTIGATING'
+                  AND status = 'INVESTIGATING' AND lease_expires_at > ?
                 """,
                 (
                     run_id, summary, self._json(list(dict.fromkeys(affected_services))),
-                    now, now, diagnosis_id, lease_owner, expected_version,
+                    now, now, diagnosis_id, lease_owner, expected_version, now,
                 ),
             )
             if result.rowcount != 1:
@@ -845,9 +887,9 @@ class DiagnosisRepository:
                 SET status = 'FAILED', error_message = ?, finished_at = ?,
                     lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
                     state_version = state_version + 1, updated_at = ?
-                WHERE id = ? AND lease_owner = ? AND status = 'INVESTIGATING'
+                WHERE id = ? AND lease_owner = ? AND status = 'INVESTIGATING' AND lease_expires_at > ?
                 """,
-                (error_message[:4000], now, now, diagnosis_id, lease_owner),
+                (error_message[:4000], now, now, diagnosis_id, lease_owner, now),
             )
             if result.rowcount == 1:
                 self._insert_event(

@@ -56,6 +56,7 @@ README 同时服务于体验者、开发者和运维者，不需要第一次就�
 - Event Diagnosis 保留完整聊天机器人能力，支持创建新对话、历史查询、不选服务、单选服务或多选服务。
 - 前置 Intent Router 使用 Structured Output 将请求限定为具体故障、整体巡检、需要澄清或非运维问题；合法意图确认前不调用任何诊断工具。
 - 统一 LLM Gateway，默认使用 vLLM，并支持 Ollama 回滚、OpenAI、Claude 和 DeepSeek，业务 Agent 不依赖厂商 SDK。
+- Agent 调用层使用 LangChain Core 管理 Prompt、模型和结构化输出，通过官方 MCP Adapter 调用只读工具；业务诊断阶段、Evidence Gate 与 MySQL 任务恢复独立保留。详见[架构分析与迁移说明](docs/langchain-mcp-refactor.md)。
 - Prometheus、Loki、Tempo、MySQL、Kubernetes 和 Git 多源证据交叉验证。
 - MySQL 持久化会话；上下文达到约 80% 预算后生成短 Summary、State、Evidence Reference，再让旧消息退出 Active Context，原始消息永久保留。
 - Code State 只保存模块、symbol、路径、行号和 commit SHA 等导航信息；源码始终按 Git 版本精确读取。

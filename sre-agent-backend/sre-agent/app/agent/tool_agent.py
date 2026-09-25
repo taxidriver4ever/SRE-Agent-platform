@@ -9,11 +9,12 @@ import json
 from app.agent.prompt import build_system_prompt
 from app.agent.schemas import AgentDecision, AgentResult, AgentStep
 from app.llm import LLM, LLMMessage
+from app.llm.prompts import prompt_messages
+from app.llm.structured import StructuredOutputParser
 from app.llm.structured_output import (
     StructuredOutputError,
     schema_retry_message,
     template_refill_message,
-    validate_structured_output,
 )
 from app.mcp_clients import FastMCPToolClient, ToolExecutionError
 
@@ -61,10 +62,7 @@ class ToolAgent:
         """
         # 首轮只放入稳定的系统协议和用户问题。工具说明由注册中心动态生成，
         # 因此新增工具后无需手动同步提示词中的工具列表。
-        messages = [
-            LLMMessage("system", build_system_prompt(await self.tools.specifications())),
-            LLMMessage("user", query),
-        ]
+        messages = prompt_messages(build_system_prompt(await self.tools.specifications()), query)
         # ``steps`` 只记录真正发生的工具调用；纯推理轮和协议修复轮不算工具轨迹。
         steps: list[AgentStep] = []
 
@@ -184,4 +182,4 @@ def _parse_decision(content: str) -> AgentDecision:
     协议要求裸 JSON；公共结构化输出层会有限兼容代码围栏、前缀文字、尾随逗号
     和单引号，再以严格 Schema 作为是否允许执行工具的最终边界。
     """
-    return validate_structured_output(content, AgentDecision)
+    return StructuredOutputParser(schema_type=AgentDecision).parse(content)

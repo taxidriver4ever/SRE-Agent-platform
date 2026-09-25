@@ -102,6 +102,8 @@ class Settings:
     validation_test_timeout_seconds: float
     validation_overall_timeout_seconds: float
     validation_allow_build_network: bool
+    # One process uses one backend; rollback never double-executes a request.
+    agent_backend: str = "langchain"
 
 
 def get_settings() -> Settings:
@@ -110,7 +112,11 @@ def get_settings() -> Settings:
     API Key 在真正调用模型时才校验。这样即便部署系统尚未注入密钥，服务也
     能启动并响应健康检查，运维侧可以获得明确的 503 配置错误。
     """
+    backend = os.getenv("SRE_AGENT_BACKEND", "langchain").strip().lower()
+    if backend not in {"legacy", "langchain"}:
+        raise ValueError("SRE_AGENT_BACKEND must be legacy or langchain")
     return Settings(
+        agent_backend=backend,
         gateway_base_url=os.getenv("GATEWAY_BASE_URL", "http://127.0.0.1:8000").rstrip("/"),
         gateway_api_key=os.getenv("GATEWAY_API_KEY"),
         # 本项目默认走本地 Docker vLLM；仍可用环境变量切换到其他 Provider。

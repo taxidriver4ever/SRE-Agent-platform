@@ -8,7 +8,8 @@ import re
 from pathlib import PurePosixPath
 from typing import Any
 
-from app.llm.base import LLM, LLMMessage
+from app.llm.base import LLM
+from app.llm.prompts import prompt_messages
 from app.llm.structured_output import validate_structured_output
 from app.validation.models import (
     GeneratedTestCase, GeneratedTestSuite, InterfaceTarget, ProjectType, UploadedTestFile,
@@ -87,18 +88,17 @@ class AITestGenerator:
     async def generate(self, *, project_type: ProjectType, diff: str,
                        changed_files: list[str], code_state: list[dict[str,Any]],
                        test_samples: dict[str,str]) -> list[GeneratedTestCase]:
-        response=await self.llm.complete([
-            LLMMessage("system",
+        response=await self.llm.complete(prompt_messages(
                 "你是受限的回归测试生成器。只能新增 test source，不能修改生产源码、构建文件、"
                 "Dockerfile、脚本或 CI 配置；不能使用网络、进程、文件系统危险 API。"
-                "输出严格 JSON：{\"tests\":[{target_file,test_name,test_code,reason,covered_change}]}。/no_think"),
-            LLMMessage("user",json.dumps({
+                "输出严格 JSON：{\"tests\":[{target_file,test_name,test_code,reason,covered_change}]}。/no_think",
+            json.dumps({
                 "project_type":project_type.value,"changed_files":changed_files,
                 "bounded_diff":diff[:16000],"code_state":code_state[:20],
                 # 自动选择时调用方只给 3 个；用户显式选择时必须完整保留最多 10 个。
                 "representative_tests":{key:value[:4000] for key,value in list(test_samples.items())[:10]},
-            },ensure_ascii=False)),
-        ])
+            },ensure_ascii=False),
+        ))
         return validate_structured_output(response.content,GeneratedTestSuite).tests
 
     async def generate_interface_tests(self, *, project_type: ProjectType,
@@ -106,14 +106,13 @@ class AITestGenerator:
                                        candidate_source: str,
                                        existing_tests: dict[str,str]) -> list[GeneratedTestCase]:
         """为一个已冻结接口生成测试；写入由 TestFileValidator 再次把关。"""
-        response = await self.llm.complete([
-            LLMMessage("system",
+        response = await self.llm.complete(prompt_messages(
                 "你是接口级回归测试生成器。只输出测试源码文件，不能修改生产源码、构建文件、"
                 "Dockerfile、脚本或 CI 配置，也不能使用网络、进程或危险文件系统 API。"
                 "若提供既有测试，请针对 Candidate 接口变化给出需要新增或更新的测试文件；"
                 "系统会把结果保存为新的不可变 Test Suite Version，绝不覆盖历史版本。"
-                "输出严格 JSON：{\"tests\":[{target_file,test_name,test_code,reason,covered_change}]}。/no_think"),
-            LLMMessage("user",json.dumps({
+                "输出严格 JSON：{\"tests\":[{target_file,test_name,test_code,reason,covered_change}]}。/no_think",
+            json.dumps({
                 "project_type":project_type.value,
                 "target_interface":target.model_dump(mode="json"),
                 "bounded_candidate_source":candidate_source[:12000],
@@ -121,6 +120,6 @@ class AITestGenerator:
                 "existing_suite_files":{
                     key:value[:6000] for key,value in list(existing_tests.items())[:20]
                 },
-            },ensure_ascii=False)),
-        ])
+            },ensure_ascii=False),
+        ))
         return validate_structured_output(response.content,GeneratedTestSuite).tests

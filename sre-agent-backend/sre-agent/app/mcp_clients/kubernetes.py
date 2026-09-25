@@ -9,6 +9,7 @@ MCP Server 直接调用 Kubernetes API 完成；本类只把项目历史工作�
 from __future__ import annotations
 
 import json
+import asyncio
 import os
 import tempfile
 from pathlib import Path
@@ -38,9 +39,11 @@ class KubernetesMCPAdapter:
         "get_container_image": "resources_get",
     }
 
-    def __init__(self, namespace: str) -> None:
+    def __init__(self, namespace: str, *, backend: str = "legacy") -> None:
         """构造惰性 MCP Client；应用健康检查不会触发 npx 下载或集群连接。"""
         self.namespace = namespace
+        self.backend = backend
+        self._connect_lock = asyncio.Lock()
         version = os.getenv("KUBERNETES_MCP_VERSION", DEFAULT_KUBERNETES_MCP_VERSION)
         command = os.getenv("KUBERNETES_MCP_COMMAND", "npx.cmd" if os.name == "nt" else "npx")
         # --read-only 会让第三方 Server 根本不注册 create/update/delete/exec 等写工具；
@@ -104,18 +107,27 @@ class KubernetesMCPAdapter:
             else upstream_name
         )
         upstream_arguments = self._translate_arguments(semantic_name, arguments)
-        result = await self._client.call_tool(callable_name, upstream_arguments)
+        if self.backend == "langchain":
+            from app.mcp_clients.langchain import call_tool
+            result = await call_tool(self._client, callable_name, upstream_arguments)
+        else:
+            result = await self._client.call_tool(callable_name, upstream_arguments)
         payload = self._decode_result(result)
         return self._shape_result(semantic_name, payload)
 
     async def _ensure_connected(self) -> None:
         """首次 K8s 查询时启动并缓存 stdio 会话，避免每个证据都重新拉起 npx。"""
-        if self._entered:
-            return
-        await self._client.__aenter__()
-        self._entered = True
-        tools = await self._client.list_tools()
-        self._available_names = {tool.name for tool in tools}
+        async with self._connect_lock:
+            if self._entered:
+                return
+            await self._client.__aenter__()
+            try:
+                tools = await self._client.list_tools()
+                self._available_names = {tool.name for tool in tools}
+                self._entered = True
+            except BaseException:
+                await self._client.__aexit__(None, None, None)
+                raise
 
     def _translate_arguments(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """只传递第三方 Server 明确定义的参数，拒绝透传未知写入参数。"""

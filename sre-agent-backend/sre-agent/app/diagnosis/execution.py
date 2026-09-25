@@ -72,6 +72,11 @@ class DurableWorkflowRuntime(WorkflowRuntime):
             )
             self._has_checkpoint = True
 
+    async def persist_projection(self, writer):
+        async with self._lock:
+            with self.repository.owned_projection(self.diagnosis_id, self.lease_owner, self.state_version):
+                return writer()
+
     def should_skip_phase(self, phase: WorkflowPhase) -> bool:
         if not self.resume_phase:
             return False
@@ -171,6 +176,7 @@ class DurableWorkflowRuntime(WorkflowRuntime):
                 evidence_id=step.evidence_id,
             )
         return ToolExecutionClaim(
+            step_id=step.id,
             idempotency_key=key, evidence_id=evidence_id, completed=completed,
             result=step.result, evidence=existing_evidence, record=existing_record,
         )
@@ -411,12 +417,6 @@ class DiagnosisExecutionManager:
         runtime = DurableWorkflowRuntime(
             self.repository, session, self.executor_id, self.lease_ttl_seconds,
         )
-        if session.attempt_no > 1:
-            self.repository.append_event(
-                diagnosis_id, "diagnosis.recovered",
-                {"diagnosis_id": diagnosis_id, "attempt_no": session.attempt_no, "run_id": session.run_id},
-                event_key=f"diagnosis.recovered:{session.attempt_no}",
-            )
         try:
             resume_state = (
                 DiagnosisState.model_validate_json(session.checkpoint_json)
@@ -436,16 +436,34 @@ class DiagnosisExecutionManager:
         )
         heartbeat_task = asyncio.create_task(self._heartbeat(runtime), name=f"heartbeat-{diagnosis_id}")
         try:
+            if session.attempt_no > 1:
+                await runtime.persist_projection(lambda: self.repository.append_event(
+                    diagnosis_id, "diagnosis.recovered",
+                    {"diagnosis_id": diagnosis_id, "attempt_no": session.attempt_no, "run_id": session.run_id},
+                    event_key=f"diagnosis.recovered:{session.attempt_no}",
+                ))
             task_id = f"{diagnosis_id}-{session.attempt_no}-{uuid4().hex[:8]}"
             async with self.sandbox.task_workspace(task_id) as workspace:
                 with task_security_scope(
                     str(session.user_id), session.project_id, task_id, str(workspace),
                 ):
                     with conversation_memory_scope(str(session.user_id), session.conversation_id):
-                        await self.orchestrator.run(
+                        work = asyncio.create_task(self.orchestrator.run(
                             str(session.user_id), diagnosis_id, request,
                             resume_state=resume_state, runtime=runtime,
-                        )
+                        ))
+                        try:
+                            done, _ = await asyncio.wait(
+                                {work, heartbeat_task}, return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if heartbeat_task in done:
+                                # A failed heartbeat must stop the model/tool await immediately.
+                                await heartbeat_task
+                            await work
+                        finally:
+                            if not work.done():
+                                work.cancel()
+                            await asyncio.gather(work, return_exceptions=True)
         except asyncio.CancelledError:
             self.repository.interrupt(diagnosis_id, self.executor_id, "application shutdown")
             raise

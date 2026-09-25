@@ -3,13 +3,9 @@
 import re
 
 from app.intent.models import IntentDecision, SREIntent
-from app.llm import LLM, LLMMessage
-from app.llm.structured_output import (
-    StructuredOutputError,
-    schema_retry_message,
-    template_refill_message,
-    validate_structured_output,
-)
+from app.llm import LLM
+from app.llm.prompts import prompt_messages
+from app.llm.structured import generate_structured
 
 
 class IntentRouter:
@@ -33,9 +29,7 @@ class IntentRouter:
         fast_decision = self._specific_incident_fast_path(message)
         if fast_decision is not None:
             return fast_decision
-        messages = [
-            LLMMessage(
-                "system",
+        messages = prompt_messages(
                 "你是 SRE 请求意图路由器，不是诊断 Agent，禁止调用或建议调用任何工具。"
                 "只能返回一个 JSON 对象，字段严格为 intent、target、symptom。"
                 "intent 只能是 SPECIFIC_INCIDENT、GENERAL_DIAGNOSIS、NEED_CLARIFICATION、OUT_OF_SCOPE。"
@@ -43,38 +37,19 @@ class IntentRouter:
                 "缺少可执行的现象或范围选 NEED_CLARIFICATION；非运维/故障排查选 OUT_OF_SCOPE。"
                 "target 尽量使用规范服务名，未知为 null；symptom 使用简短 snake_case，未知为 null。"
                 "不要输出解释或 Markdown。/no_think",
-            ),
-            LLMMessage("user", message),
-        ]
-        first_output = ""
-        for attempt in range(self.structured_output_retries + 1):
-            response = await self.llm.complete(messages)
-            if not first_output:
-                first_output = response.content
-            messages.append(LLMMessage("assistant", response.content or "{}"))
-            try:
-                decision = validate_structured_output(response.content, IntentDecision)
-                self.last_failed_raw_output = ""
-                return decision
-            except StructuredOutputError as exc:
-                if attempt < self.structured_output_retries:
-                    messages.append(LLMMessage("user", schema_retry_message(exc)))
-
+            message,
+        )
         template = IntentDecision(
             intent=SREIntent.NEED_CLARIFICATION,
             target=None,
             symptom=None,
         ).model_dump(mode="json")
-        messages.append(LLMMessage("user", template_refill_message(template, first_output)))
-        refill = await self.llm.complete(messages)
-        try:
-            decision = validate_structured_output(refill.content, IntentDecision)
-            self.last_failed_raw_output = ""
-            return decision
-        except StructuredOutputError:
-            # 分类不可信时绝不放行工具；保留原始输出供服务日志/测试诊断。
-            self.last_failed_raw_output = first_output
-            return IntentDecision(intent=SREIntent.NEED_CLARIFICATION)
+        result = await generate_structured(
+            self.llm, messages, IntentDecision,
+            retries=self.structured_output_retries, template=template,
+        )
+        self.last_failed_raw_output = result.original_output if result.value is None else ""
+        return result.value if result.value is not None else IntentDecision(intent=SREIntent.NEED_CLARIFICATION)
 
     def _specific_incident_fast_path(self, message: str) -> IntentDecision | None:
         """对“规范服务名 + 明确故障现象”直接路由，避免浪费一次本地模型调用。

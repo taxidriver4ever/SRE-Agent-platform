@@ -39,20 +39,9 @@ class DiagnosisOrchestrator:
         resume_state: DiagnosisState | None = None,
         runtime: WorkflowRuntime,
     ) -> DiagnosisReport:
-        session = self.service.transition(user_id, diagnosis_id, DiagnosisStatus.INVESTIGATING)
-        target, system_scan = self._resolve_target(request)
-        target_type = request.initial_target.type.value if request.initial_target else None
-        target_id = request.initial_target.name if request.initial_target else (target if target != "unknown" else None)
-        if self.repository.get_step_by_key(diagnosis_id, "target-resolution") is None:
-            self.repository.append_step(
-                diagnosis_id, step_type="TARGET_RESOLUTION", status="COMPLETED",
-                target_type=target_type or ("SERVICE" if target_id else None), target_id=target_id,
-                summary=self._target_summary(request, target), idempotency_key="target-resolution",
-            )
-        self.repository.append_event(diagnosis_id, "diagnosis.started", {
-            "diagnosis_id": diagnosis_id, "status": DiagnosisStatus.INVESTIGATING.value,
-            "resolved_target": target_id, "system_scan": system_scan,
-        }, event_key="diagnosis.started")
+        session, target, system_scan = await runtime.persist_projection(
+            lambda: self._start_projection(user_id, diagnosis_id, request),
+        )
 
         async def publish(event: dict[str, Any]) -> None:
             event_type = str(event.get("type", ""))
@@ -71,12 +60,31 @@ class DiagnosisOrchestrator:
             resume_state=resume_state,
             runtime=runtime,
         )
-        affected = self._persist_report(diagnosis_id, report, request)
+        affected = await runtime.persist_projection(
+            lambda: self._persist_report(diagnosis_id, report, request),
+        )
         await runtime.finalize_session(
             run_id=report.run_id, summary=report.decision_summary,
             affected_services=affected,
         )
         return report
+
+    def _start_projection(self, user_id, diagnosis_id, request):
+        session = self.service.transition(user_id, diagnosis_id, DiagnosisStatus.INVESTIGATING)
+        target, system_scan = self._resolve_target(request)
+        target_type = request.initial_target.type.value if request.initial_target else None
+        target_id = request.initial_target.name if request.initial_target else (target if target != "unknown" else None)
+        if self.repository.get_step_by_key(diagnosis_id, "target-resolution") is None:
+            self.repository.append_step(
+                diagnosis_id, step_type="TARGET_RESOLUTION", status="COMPLETED",
+                target_type=target_type or ("SERVICE" if target_id else None), target_id=target_id,
+                summary=self._target_summary(request, target), idempotency_key="target-resolution",
+            )
+        self.repository.append_event(diagnosis_id, "diagnosis.started", {
+            "diagnosis_id": diagnosis_id, "status": DiagnosisStatus.INVESTIGATING.value,
+            "resolved_target": target_id, "system_scan": system_scan,
+        }, event_key="diagnosis.started")
+        return session, target, system_scan
 
     def resolve_target(self, request: DiagnosisCreateRequest) -> tuple[str, bool]:
         """公开一次性诊断所需的目标解析，但不创建或读取会话。"""

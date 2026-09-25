@@ -7,7 +7,7 @@ Quick Diagnosis 使用 No-op；持久 Diagnosis 由 diagnosis.execution 提供 M
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from app.workflow.models import DiagnosisState, Evidence, ToolCallRecord, WorkflowPhase
 
@@ -20,6 +20,7 @@ class ToolExecutionClaim:
     result: Any = None
     evidence: Evidence | None = None
     record: ToolCallRecord | None = None
+    step_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -33,6 +34,8 @@ class PendingToolCall:
 
 
 class WorkflowRuntime(Protocol):
+    async def persist_projection(self, writer: Callable[[], Any]) -> Any: ...
+
     async def initialize(self, state: DiagnosisState) -> None: ...
 
     def should_skip_phase(self, phase: WorkflowPhase) -> bool: ...
@@ -74,6 +77,9 @@ class WorkflowRuntime(Protocol):
 
 class NoopWorkflowRuntime:
     """Quick Diagnosis 与旧调用路径保持无数据库 Checkpoint。"""
+
+    async def persist_projection(self, writer: Callable[[], Any]) -> Any:
+        return writer()
 
     async def initialize(self, state: DiagnosisState) -> None:
         del state

@@ -9,6 +9,8 @@ from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 from app.conversation import ConversationService
+from app.agent.observability import agent_call_context
+from app.core.errors import TaskOwnershipLostError
 from app.conversation_memory import ConversationCompactionService
 from app.code_state import CodeStateService
 from app.evidence import build_source_references, normalize_tool_result
@@ -185,7 +187,11 @@ class DiagnosisWorkflow:
             await self._phase(state, WorkflowPhase.VERIFY, on_event, runtime)
             # Planner 直接消费有界 Evidence，不需要等待会话压缩。压缩在报告落库后
             # 后台执行，避免把最多 30 秒的增强任务计入同步诊断延迟。
-            await self._synthesize_with_gateway(state, planner, on_event)
+            with agent_call_context(
+                correlation_id=state.run_id, phase=WorkflowPhase.VERIFY.value,
+                diagnosis_id=getattr(runtime, "diagnosis_id", None),
+            ):
+                await self._synthesize_with_gateway(state, planner, on_event)
             await runtime.phase_completed(state, WorkflowPhase.VERIFY)
         report = self._report(state)
         if not runtime.should_skip_phase(WorkflowPhase.REPORT):
@@ -441,7 +447,11 @@ class DiagnosisWorkflow:
             planner_started_at = datetime.now(timezone.utc)
             planner_started = time.perf_counter()
             try:
-                decision = await planner.decide(state, tool_specs)
+                with agent_call_context(
+                    correlation_id=state.run_id, phase=WorkflowPhase.INVESTIGATE.value,
+                    diagnosis_id=getattr(runtime, "diagnosis_id", None),
+                ):
+                    decision = await planner.decide(state, tool_specs)
             except GatewayError as exc:
                 record = ToolCallRecord(
                     tool_name="llm_planner",
@@ -479,6 +489,7 @@ class DiagnosisWorkflow:
                 parent_evidence_ids=decision.parent_evidence_ids,
                 runtime=runtime,
                 phase=WorkflowPhase.INVESTIGATE,
+                reason=decision.reason,
             )
             if decision.tool_name in {"list_pods", "get_pod"}:
                 self._extract_pod_runtime(state, result)
@@ -500,6 +511,7 @@ class DiagnosisWorkflow:
         parent_evidence_ids: list[str] | None = None,
         runtime: WorkflowRuntime | None = None,
         phase: WorkflowPhase = WorkflowPhase.INVESTIGATE,
+        reason: str | None = None,
     ) -> Any:
         """执行工具并记录 timestamp/duration/error；到达 max_steps 后拒绝继续。"""
         if len(state.timeline) >= self.max_steps:
@@ -537,7 +549,13 @@ class DiagnosisWorkflow:
                 message_id=self._conversation_operation_id(claim.idempotency_key, "call"),
             )
         try:
-            result = await self.tools.execute(tool_name, arguments)
+            with agent_call_context(
+                correlation_id=state.run_id, diagnosis_id=getattr(active_runtime, "diagnosis_id", None),
+                phase=phase.value, step_id=claim.step_id, logical_step_key=claim.idempotency_key,
+                tool_name=tool_name, reason=reason or title,
+                evidence_id=claim.evidence_id,
+            ):
+                result = await self.tools.execute(tool_name, arguments)
             references = build_source_references(
                 tool_name,
                 arguments,
@@ -579,6 +597,8 @@ class DiagnosisWorkflow:
                 direct_evidence=self._is_direct_evidence(tool_name, arguments, summary),
             )
             state.evidence.append(evidence)
+        except TaskOwnershipLostError:
+            raise
         except Exception as exc:
             error = self._exception_text(exc)
             summary = ""
@@ -632,32 +652,35 @@ class DiagnosisWorkflow:
         """并发执行一组互不依赖的只读调用，并在调度前统一预留预算。
 
         ``_call`` 会把工具异常转换为失败 ToolCall，因此单个数据源失败不会
-        取消其他任务。这里使用 ``return_exceptions`` 额外隔离 callback 或持久化
-        层的意外异常；时间线与 Evidence 的 append 都发生在事件循环单线程内，
+        取消其他任务。callback 或持久化层的普通异常仍隔离；所有权丢失和取消
+        则立即终止同组请求。时间线与 Evidence 的 append 都发生在事件循环单线程内，
         每条记录在发送 SSE 前已经完整写入。
         """
         available = max(0, self.max_steps - len(state.timeline))
         selected = calls[:available]
         if not selected:
             return []
-        results = await asyncio.gather(
-            *(
-                self._call(
+        async def invoke(tool_name, arguments, title):
+            try:
+                return await self._call(
                     state, tool_name, arguments, title, callback,
                     runtime=runtime, phase=phase,
                 )
-                for tool_name, arguments, title in selected
-            ),
-            return_exceptions=True,
-        )
-        normalized: list[Any] = []
-        for result in results:
-            if isinstance(result, BaseException):
-                logger.warning("concurrent baseline task failed outside tool boundary: %s", self._exception_text(result))
-                normalized.append(None)
-            else:
-                normalized.append(result)
-        return normalized
+            except (TaskOwnershipLostError, asyncio.CancelledError):
+                raise
+            except Exception as exc:
+                logger.warning("concurrent baseline task failed outside tool boundary: %s", self._exception_text(exc))
+                return None
+
+        tasks = [asyncio.create_task(invoke(*call)) for call in selected]
+        try:
+            return await asyncio.gather(*tasks)
+        except BaseException:
+            # Fencing/cancellation are fatal, unlike an isolated data-source error.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
     @staticmethod
     def _conversation_operation_id(idempotency_key: str | None, suffix: str) -> str | None:

@@ -12,6 +12,7 @@ from app.conversation_memory.scope import current_conversation_memory_scope
 from app.audit import ToolAuditRepository
 from app.security import ToolPolicy, ToolPolicyError, current_task_scope
 from app.security.models import TaskSecurityScope
+from app.core.errors import TaskOwnershipLostError
 
 
 class ToolExecutionError(Exception):
@@ -33,23 +34,26 @@ class FastMCPToolClient:
         policy: ToolPolicy | None = None,
         audit_repository: ToolAuditRepository | None = None,
         default_project_id: str = "sre-lab",
+        backend: str = "legacy",
     ) -> None:
         self.server = server
         self.kubernetes = kubernetes
         self.policy = policy
         self.audit_repository = audit_repository
         self.default_project_id = default_project_id
+        self.backend = backend
 
     async def specifications(self) -> list[dict[str, Any]]:
         """合并标准 tools/list Schema 与审核过的 Kubernetes 语义 Schema。"""
         async with Client(self.server) as client:
-            tools = await client.list_tools()
-        specifications = [{
-            "name": tool.name,
-            "description": tool.description or "",
-            "input_schema": tool.inputSchema,
-        } for tool in tools if (
-            tool.name != "search_conversation_memory"
+            if self.backend == "langchain":
+                from app.mcp_clients.langchain import specifications as load_specifications
+                loaded = await load_specifications(client)
+            else:
+                loaded = [{"name": tool.name, "description": tool.description or "",
+                           "input_schema": tool.inputSchema} for tool in await client.list_tools()]
+        specifications = [item for item in loaded if (
+            item["name"] != "search_conversation_memory"
             or current_conversation_memory_scope() is not None
         )]
         if self.kubernetes:
@@ -78,12 +82,18 @@ class FastMCPToolClient:
                 value = await self.kubernetes.call(name, arguments)
             else:
                 async with Client(self.server) as client:
-                    result = await client.call_tool(name, arguments)
+                    if self.backend == "langchain":
+                        from app.mcp_clients.langchain import call_tool
+                        result = await call_tool(client, name, arguments)
+                    else:
+                        result = await client.call_tool(name, arguments)
                 value = result.data if result.data is not None else {
                     "content": [block.model_dump(mode="json") for block in result.content]
                 }
             self._audit(scope, name, arguments, "success", started)
             return value
+        except TaskOwnershipLostError:
+            raise
         except ToolPolicyError as exc:
             self._audit(scope, name, arguments, "denied", started, exc.__class__.__name__)
             raise ToolExecutionError(f"Tool Policy denied '{name}': {exc}") from exc
