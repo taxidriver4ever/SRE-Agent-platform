@@ -1,4 +1,4 @@
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-trixie@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
 
 ARG GIT_COMMIT=unknown
 LABEL org.opencontainers.image.source="https://github.com/taxidriver4ever/SRE-Agent-platform" \

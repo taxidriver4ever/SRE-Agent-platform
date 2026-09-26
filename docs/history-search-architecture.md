@@ -1,5 +1,7 @@
 # History Search 与统一采集改造
 
+> CI/CD 后续调整：文中旧 `deploy/k8s/configmap.yaml` 已迁移至 GitOps Helm values；当前部署入口见 [GitOps 交付说明](gitops-delivery.md)。
+
 ## 修改前分析和实施方案
 
 当前 `conversation_memory/models.py` 定义 ShortContextState 和 MemoryItemDraft。会话原文在 MySQL `conversation_messages`，压缩快照在 `conversation_compactions`，会话内记忆在 `conversation_memory_items`。它们不是跨诊断案例库，保留现有读取、压缩边界和归属检查。

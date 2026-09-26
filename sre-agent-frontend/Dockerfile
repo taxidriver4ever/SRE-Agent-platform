@@ -11,7 +11,8 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
-FROM nginxinc/nginx-unprivileged:1.27-alpine
+# Stable patched runtime; pin the reviewed multi-platform manifest as well as the version.
+FROM nginxinc/nginx-unprivileged:1.30.5-alpine@sha256:4714e0b1b2577eaa1a6131d07c958b67f0eb68e6d0521e90c6e5287db8cf0bc5
 
 ARG GIT_COMMIT=unknown
 LABEL org.opencontainers.image.source="https://github.com/taxidriver4ever/SRE-Agent-platform" \

@@ -1,0 +1,30 @@
+name: GitOps desired state
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  helm:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+        with:
+          version: v3.17.3
+      - name: Lint and render approved desired state
+        env:
+          TARGET_ENV: ${{ matrix.environment }}
+        run: |
+          helm lint charts/sre-platform -f "environments/$TARGET_ENV/values.yaml" --strict
+          helm template sre-platform charts/sre-platform -n "sre-$TARGET_ENV" -f "environments/$TARGET_ENV/values.yaml" > rendered.yaml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rendered-${{ matrix.environment }}
+          path: rendered.yaml

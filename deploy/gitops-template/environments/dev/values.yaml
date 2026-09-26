@@ -1,0 +1,26 @@
+# Example desired state: initialize repositories/tags with export_gitops.py.
+environment: dev
+agent:
+  replicaCount: 1
+  image:
+    tag: ''
+  pdb:
+    enabled: false
+  config:
+    APPLICATION_MYSQL_DATABASE: sre_agent_dev
+    SRE_DEFAULT_PROJECT_ID: sre-lab
+    ELASTICSEARCH_HISTORY_INDEX: sre-agent-history-dev-v1
+gateway:
+  replicaCount: 1
+  image:
+    tag: ''
+  pdb:
+    enabled: false
+  config:
+    GATEWAY_MYSQL_DATABASE: sre_gateway_dev
+frontend:
+  replicaCount: 1
+  image:
+    tag: ''
+  pdb:
+    enabled: false

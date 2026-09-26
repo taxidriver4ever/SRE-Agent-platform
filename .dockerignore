@@ -7,6 +7,12 @@
 **/__pycache__
 **/.pytest_cache
 .test-tmp
+.cache
+**/.cache
+.runtime
+.test-runtime
+output
+gitops-checkout
 **/.venv
 **/node_modules
 **/dist

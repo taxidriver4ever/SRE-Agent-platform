@@ -1,0 +1,42 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: sre-platform
+  namespace: argocd
+spec:
+  sourceRepos:
+  - https://github.com/REPLACE_OWNER/sre-agent-deploy.git
+  destinations:
+  - server: https://kubernetes.default.svc
+    namespace: sre-dev
+  - server: https://kubernetes.default.svc
+    namespace: sre-staging
+  - server: https://kubernetes.default.svc
+    namespace: sre-prod
+  - server: https://kubernetes.default.svc
+    namespace: sre-lab
+  clusterResourceWhitelist:
+  - group: ''
+    kind: Namespace
+  namespaceResourceWhitelist:
+  - group: ''
+    kind: Service
+  - group: ''
+    kind: ConfigMap
+  - group: ''
+    kind: ServiceAccount
+  - group: apps
+    kind: Deployment
+  - group: policy
+    kind: PodDisruptionBudget
+  - group: autoscaling
+    kind: HorizontalPodAutoscaler
+  - group: networking.k8s.io
+    kind: Ingress
+  - group: rbac.authorization.k8s.io
+    kind: Role
+  - group: rbac.authorization.k8s.io
+    kind: RoleBinding
+  - group: batch
+    kind: Job
+

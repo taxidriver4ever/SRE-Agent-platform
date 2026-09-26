@@ -1,0 +1,6 @@
+apiVersion: v2
+name: sre-platform
+description: SRE application workloads; external MySQL and observability remain independent
+type: application
+version: 0.1.0
+appVersion: "git-sha"

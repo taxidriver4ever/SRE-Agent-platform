@@ -1,0 +1,290 @@
+# Bootstrap template only. Set real repositories and full SHA before use.
+environment: dev
+imagePullSecrets: []
+serviceAccount:
+  create: true
+  name: sre-agent-runtime
+rbac:
+  create: true
+  targetNamespace: sre-lab
+ingress:
+  enabled: false
+  className: ''
+  host: sre.local
+  annotations: {}
+  tls: []
+agent:
+  name: sre-agent
+  replicaCount: 1
+  image:
+    repository: ghcr.io/REPLACE_OWNER/sre-agent
+    tag: ''
+    digest: ''
+  service:
+    type: ClusterIP
+    port: 8001
+  containerPort: 8001
+  config:
+    GATEWAY_BASE_URL: http://sre-gateway:8000
+    GATEWAY_MODEL: vllm/qwen3-4b
+    GATEWAY_TIMEOUT_SECONDS: '180'
+    GATEWAY_MAX_TOKENS: '512'
+    KUBERNETES_NAMESPACE: sre-lab
+    PROMETHEUS_BASE_URL: http://prometheus.sre-lab.svc.cluster.local:9090
+    ELASTICSEARCH_URL: http://elasticsearch.sre-lab.svc.cluster.local:9200
+    SKYWALKING_OAP_URL: http://skywalking-oap.sre-lab.svc.cluster.local:12800
+    SKYWALKING_ZIPKIN_URL: http://skywalking-oap.sre-lab.svc.cluster.local:9412/zipkin
+    ELASTICSEARCH_INDEX_PATTERN: sre-logs-*
+    SKYWALKING_SERVICE_NAME: sre-agent
+    MYSQL_HOST: mysql.sre-lab.svc.cluster.local
+    MYSQL_PORT: '3306'
+    MYSQL_USER: sre_reader
+    MYSQL_DATABASE: sre_lab
+    APPLICATION_MYSQL_HOST: host.docker.internal
+    APPLICATION_MYSQL_PORT: '13308'
+    APPLICATION_MYSQL_USER: sre_agent
+    APPLICATION_MYSQL_DATABASE: sre_agent
+    SERVICE_CATALOG_PATH: /opt/sre-broken-system/sre-lab-infra/service-catalog.yaml
+    SRE_REPOSITORY_PATH: /opt/sre-broken-system
+    SRE_REPOSITORY_CACHE_PATH: /var/lib/sre-agent/repositories
+    SRE_REPOSITORY_ALLOWED_HOSTS: github.com,gitlab.com,bitbucket.org
+    SRE_TOOL_POLICY_PATH: /opt/sre-agent-platform/sre-agent-backend/sre-agent/config/tool-policy.yaml
+    SRE_DEFAULT_PROJECT_ID: sre-lab
+    SRE_SANDBOX_WORKSPACE_ROOT: /var/lib/sre-agent/sandbox
+    SRE_VALIDATION_WORKSPACE_ROOT: /var/lib/sre-agent/validation
+    SRE_VALIDATION_ARTIFACT_ROOT: /var/lib/sre-agent/artifacts
+    SRE_NPM_CACHE: /home/sre/.npm
+    KUBERNETES_MCP_COMMAND: npx
+    DIAGNOSIS_DEADLINE_SECONDS: '240'
+    DIAGNOSIS_LEASE_TTL_SECONDS: '60'
+    DIAGNOSIS_HEARTBEAT_INTERVAL_SECONDS: '10'
+    DIAGNOSIS_RECOVERY_SCAN_INTERVAL_SECONDS: '15'
+    HISTORY_SEARCH_ENABLED: 'true'
+    ELASTICSEARCH_HISTORY_INDEX: sre-agent-history-v1
+    HISTORY_TIMEOUT_SECONDS: '2'
+    HISTORY_TOP_K: '5'
+    LOGSTASH_URL: http://logstash.sre-lab.svc.cluster.local:8080
+  env: []
+  existingSecret: sre-agent-secrets
+  resources:
+    requests:
+      cpu: 200m
+      memory: 384Mi
+    limits:
+      cpu: '1'
+      memory: 1Gi
+  startupProbe:
+    httpGet:
+      path: /health
+      port: http
+    periodSeconds: 5
+    failureThreshold: 60
+    timeoutSeconds: 3
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 6
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 30
+    periodSeconds: 20
+    timeoutSeconds: 3
+    failureThreshold: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  terminationGracePeriodSeconds: 45
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  volumeMounts:
+  - name: runtime
+    mountPath: /var/lib/sre-agent
+  - name: npm-cache
+    mountPath: /home/sre/.npm
+  - name: tmp
+    mountPath: /tmp
+  volumes:
+  - name: runtime
+    emptyDir: {}
+  - name: npm-cache
+    emptyDir: {}
+  - name: tmp
+    emptyDir: {}
+  pdb:
+    enabled: false
+    minAvailable: 1
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 75
+gateway:
+  name: sre-gateway
+  replicaCount: 1
+  image:
+    repository: ghcr.io/REPLACE_OWNER/sre-gateway
+    tag: ''
+    digest: ''
+  service:
+    type: ClusterIP
+    port: 8000
+  containerPort: 8000
+  config:
+    GATEWAY_MYSQL_HOST: host.docker.internal
+    GATEWAY_MYSQL_PORT: '13308'
+    GATEWAY_MYSQL_USER: sre_agent
+    GATEWAY_MYSQL_DATABASE: sre_agent
+    VLLM_BASE_URL: http://host.docker.internal:18000/v1
+    OLLAMA_BASE_URL: http://host.docker.internal:11434
+    PROVIDER_TIMEOUT_SECONDS: '180'
+  env: []
+  existingSecret: sre-gateway-secrets
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  startupProbe:
+    httpGet:
+      path: /health
+      port: http
+    periodSeconds: 5
+    failureThreshold: 60
+    timeoutSeconds: 3
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 8
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 6
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 25
+    periodSeconds: 20
+    timeoutSeconds: 3
+    failureThreshold: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  terminationGracePeriodSeconds: 30
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  volumeMounts:
+  - name: tmp
+    mountPath: /tmp
+  volumes:
+  - name: tmp
+    emptyDir: {}
+  pdb:
+    enabled: false
+    minAvailable: 1
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 75
+frontend:
+  name: sre-agent-frontend
+  replicaCount: 1
+  image:
+    repository: ghcr.io/REPLACE_OWNER/sre-agent-frontend
+    tag: ''
+    digest: ''
+  service:
+    type: ClusterIP
+    port: 80
+  containerPort: 8080
+  config: {}
+  env: []
+  existingSecret: ''
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      cpu: 250m
+      memory: 128Mi
+  startupProbe:
+    httpGet:
+      path: /healthz
+      port: http
+    periodSeconds: 5
+    failureThreshold: 60
+    timeoutSeconds: 3
+  readinessProbe:
+    httpGet:
+      path: /healthz
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 6
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: http
+    initialDelaySeconds: 15
+    periodSeconds: 20
+    timeoutSeconds: 3
+    failureThreshold: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  terminationGracePeriodSeconds: 20
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 101
+    runAsGroup: 101
+    fsGroup: 101
+    seccompProfile:
+      type: RuntimeDefault
+  volumeMounts:
+  - name: nginx-cache
+    mountPath: /var/cache/nginx
+  - name: tmp
+    mountPath: /tmp
+  volumes:
+  - name: nginx-cache
+    emptyDir: {}
+  - name: tmp
+    emptyDir: {}
+  pdb:
+    enabled: false
+    minAvailable: 1
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 75
+
+smoke:
+  enabled: false
+

@@ -1,5 +1,7 @@
 # 可观测性迁移记录
 
+> CI/CD 后续调整：文中旧 `deploy/k8s/configmap.yaml` 已迁移至 GitOps Helm values；当前部署入口见 [GitOps 交付说明](gitops-delivery.md)。
+
 > 本文记录前一阶段迁移。当前采集链路已增加 Logstash，History 检索与最新验收以 [History Search 架构报告](history-search-architecture.md) 为准。下文直接 Filebeat→ES 的验证属于历史记录。
 
 ## 修改前分析与方案

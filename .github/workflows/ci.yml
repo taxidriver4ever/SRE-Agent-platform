@@ -1,14 +1,14 @@
 name: CI
-
-on:
-  pull_request:
+'on':
+  pull_request: null
   push:
     branches:
-      - main
-
+    - main
 permissions:
   contents: read
-
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   agent-test:
     name: Agent pytest
@@ -20,15 +20,22 @@ jobs:
           MYSQL_ROOT_PASSWORD: ci-test-only-root-password
           MYSQL_DATABASE: sre_agent_test
         ports:
-          - 3306:3306
-        options: >-
-          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci-test-only-root-password"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=10
+        - 3306:3306
+        options: --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci-test-only-root-password" --health-interval=10s
+          --health-timeout=5s --health-retries=10
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.17.3
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: 'false'
+          ES_JAVA_OPTS: -Xms512m -Xmx512m
+        ports:
+        - 9200:9200
+        options: --health-cmd="curl -fsS http://localhost:9200/_cluster/health" --health-interval=10s --health-timeout=5s
+          --health-retries=30
     env:
       APPLICATION_MYSQL_HOST: 127.0.0.1
-      APPLICATION_MYSQL_PORT: "3306"
+      APPLICATION_MYSQL_PORT: '3306'
       APPLICATION_MYSQL_USER: root
       APPLICATION_MYSQL_PASSWORD: ci-test-only-root-password
       APPLICATION_MYSQL_DATABASE: sre_agent_test
@@ -38,28 +45,36 @@ jobs:
       GATEWAY_API_KEY: gw_sk_ci_test_only
       SRE_REPOSITORY_PATH: ${{ github.workspace }}/sre-broken-system
       SERVICE_CATALOG_PATH: ${{ github.workspace }}/sre-broken-system/sre-lab-infra/service-catalog.yaml
+      HISTORY_TEST_ES_URL: http://127.0.0.1:9200
     defaults:
       run:
         working-directory: sre-agent-backend/sre-agent
     steps:
-      - name: Check out source
-        uses: actions/checkout@v7
-
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: sre-agent-backend/sre-agent/requirements-dev.txt
-
-      - name: Install Agent dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt
-
-      - name: Run Agent tests
-        run: python -m pytest
-
+    - name: Check out source
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        cache: pip
+        cache-dependency-path: sre-agent-backend/sre-agent/requirements-dev.txt
+    - name: Install Agent dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -r requirements-dev.txt
+    - name: Unit and component tests
+      run: python -m pytest --ignore=tests/test_history_search.py --ignore=tests/test_durable_diagnosis.py --junitxml=unit.xml
+    - name: MySQL recovery and real Elasticsearch integration
+      run: python -m pytest tests/test_history_search.py tests/test_durable_diagnosis.py --junitxml=integration.xml
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: agent-test-results
+        path: sre-agent-backend/sre-agent/*.xml
+        if-no-files-found: error
+    timeout-minutes: 30
   gateway-test:
     name: Gateway pytest
     runs-on: ubuntu-latest
@@ -70,15 +85,12 @@ jobs:
           MYSQL_ROOT_PASSWORD: ci-test-only-root-password
           MYSQL_DATABASE: sre_gateway_test
         ports:
-          - 3306:3306
-        options: >-
-          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci-test-only-root-password"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=10
+        - 3306:3306
+        options: --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci-test-only-root-password" --health-interval=10s
+          --health-timeout=5s --health-retries=10
     env:
       GATEWAY_MYSQL_HOST: 127.0.0.1
-      GATEWAY_MYSQL_PORT: "3306"
+      GATEWAY_MYSQL_PORT: '3306'
       GATEWAY_MYSQL_USER: root
       GATEWAY_MYSQL_PASSWORD: ci-test-only-root-password
       GATEWAY_MYSQL_DATABASE: sre_gateway_test
@@ -88,24 +100,23 @@ jobs:
       run:
         working-directory: sre-agent-backend/sre-gateway
     steps:
-      - name: Check out source
-        uses: actions/checkout@v7
-
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: sre-agent-backend/sre-gateway/requirements-dev.txt
-
-      - name: Install Gateway dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt
-
-      - name: Run Gateway tests
-        run: python -m pytest
-
+    - name: Check out source
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        cache: pip
+        cache-dependency-path: sre-agent-backend/sre-gateway/requirements-dev.txt
+    - name: Install Gateway dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -r requirements-dev.txt
+    - name: Run Gateway tests
+      run: python -m pytest
+    timeout-minutes: 30
   frontend-build:
     name: Frontend test and build
     runs-on: ubuntu-latest
@@ -113,21 +124,306 @@ jobs:
       run:
         working-directory: sre-agent-frontend
     steps:
-      - name: Check out source
-        uses: actions/checkout@v7
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: sre-agent-frontend/package-lock.json
-
-      - name: Install frontend dependencies
-        run: npm ci
-
-      - name: Run frontend unit tests
-        run: npm run test:run
-
-      - name: Build frontend
-        run: npm run build
+    - name: Check out source
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        cache: npm
+        cache-dependency-path: sre-agent-frontend/package-lock.json
+    - name: Install frontend dependencies
+      run: npm ci
+    - name: Run frontend unit tests
+      run: npm run test:run
+    - name: Build frontend
+      run: npm run build
+    timeout-minutes: 30
+  agent-regression:
+    name: Agent Base Candidate regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - run: python -m pip install -r sre-agent-backend/sre-agent/requirements-dev.txt
+    - name: Freeze baseline checkout
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+      run: |
+        set -euo pipefail
+        if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ || "$BASE_SHA" == 0000000000000000000000000000000000000000 ]]; then
+          echo 'No comparable baseline; establish a baseline before enabling publication.' >&2
+          exit 1
+        fi
+        git worktree add --detach "$RUNNER_TEMP/agent-base" "$BASE_SHA"
+    - name: Run same suite against Base and Candidate
+      run: python scripts/ci/agent_regression.py --base "$RUNNER_TEMP/agent-base" --candidate . --output .cache/agent-regression
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: agent-regression
+        path: .cache/agent-regression
+        include-hidden-files: true
+        if-no-files-found: error
+  delivery-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112
+      with:
+        version: v3.17.3
+    - run: python -m pip install -r sre-agent-backend/sre-agent/requirements-dev.txt
+    - run: python -m pytest scripts/ci/tests -q
+    - run: python scripts/ci/validate_delivery.py
+  dependency-scan:
+    name: Resolved dependency scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Resolve the same backend dependencies used by builds
+      run: |
+        set -euo pipefail
+        for component in sre-agent sre-gateway; do
+          python -m venv "$RUNNER_TEMP/$component"
+          "$RUNNER_TEMP/$component/bin/pip" install -r "sre-agent-backend/$component/requirements.txt"
+          mkdir -p ".cache/security/$component"
+          "$RUNNER_TEMP/$component/bin/pip" freeze > ".cache/security/$component/requirements.txt"
+        done
+        cp sre-agent-frontend/package-lock.json .cache/security/package-lock.json
+    - uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+      env:
+        TRIVY_INCLUDE_DEV_DEPS: 'true'
+      with:
+        scan-type: fs
+        scan-ref: .cache/security
+        scanners: vuln
+        severity: CRITICAL
+        exit-code: '1'
+        ignore-unfixed: false
+        format: json
+        output: dependency-scan.json
+        version: v0.69.3
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: dependency-scan
+        path: dependency-scan.json
+        if-no-files-found: error
+  build-images:
+    name: Scan and publish ${{ matrix.image }}
+    needs:
+    - agent-test
+    - gateway-test
+    - frontend-build
+    - agent-regression
+    - delivery-contracts
+    - dependency-scan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: image-${{ github.sha }}-${{ matrix.image }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - image: sre-agent
+          context: .
+          dockerfile: sre-agent-backend/sre-agent/Dockerfile
+        - image: sre-gateway
+          context: sre-agent-backend/sre-gateway
+          dockerfile: sre-agent-backend/sre-gateway/Dockerfile
+        - image: sre-agent-frontend
+          context: sre-agent-frontend
+          dockerfile: sre-agent-frontend/Dockerfile
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Image identity
+      env:
+        OWNER: ${{ github.repository_owner }}
+        IMAGE: ${{ matrix.image }}
+      run: echo "IMAGE_REF=ghcr.io/${OWNER,,}/$IMAGE:$GITHUB_SHA" >> "$GITHUB_ENV"
+    - uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - uses: docker/setup-buildx-action@v3
+    - name: Reuse an existing immutable SHA instead of overwriting
+      id: existing
+      run: |
+        set -euo pipefail
+        if docker manifest inspect "$IMAGE_REF" > /dev/null 2> manifest-error.txt; then
+          docker pull "$IMAGE_REF"
+          echo 'found=true' >> "$GITHUB_OUTPUT"
+        elif grep -Eqi 'manifest unknown|no such manifest|not found' manifest-error.txt; then
+          echo 'found=false' >> "$GITHUB_OUTPUT"
+        else
+          cat manifest-error.txt >&2
+          exit 1
+        fi
+    - uses: docker/build-push-action@v6
+      if: steps.existing.outputs.found != 'true'
+      with:
+        context: ${{ matrix.context }}
+        file: ${{ matrix.dockerfile }}
+        load: true
+        push: false
+        platforms: linux/amd64
+        build-args: GIT_COMMIT=${{ github.sha }}
+        tags: ${{ env.IMAGE_REF }}
+        cache-from: type=gha,scope=${{ matrix.image }}
+        cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+    - name: Check packaged runtime before publication
+      env:
+        IMAGE: ${{ matrix.image }}
+      run: |
+        set -euo pipefail
+        case "$IMAGE" in
+          sre-agent)
+            docker run --rm --read-only --tmpfs /tmp --entrypoint python "$IMAGE_REF" -c 'from app.core.config import get_settings; import fastmcp, langchain_core, langchain_mcp_adapters'
+            docker run --rm --read-only --entrypoint node "$IMAGE_REF" --version
+            docker run --rm --read-only --entrypoint git "$IMAGE_REF" --version
+            ;;
+          sre-gateway)
+            docker run --rm --read-only --tmpfs /tmp --entrypoint python "$IMAGE_REF" -c 'import app.core.config, fastapi, pymysql, sqlalchemy'
+            ;;
+          sre-agent-frontend)
+            docker run --rm --read-only --tmpfs /tmp --tmpfs /var/cache/nginx --add-host sre-agent:127.0.0.1 --entrypoint nginx "$IMAGE_REF" -t
+            ;;
+          *) exit 1 ;;
+        esac
+    - uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+      with:
+        image-ref: ${{ env.IMAGE_REF }}
+        scanners: vuln
+        severity: CRITICAL
+        exit-code: '1'
+        ignore-unfixed: false
+        format: json
+        output: image-scan.json
+        version: v0.69.3
+    - name: Push exactly the scanned local image
+      if: steps.existing.outputs.found != 'true'
+      run: docker push "$IMAGE_REF"
+    - name: Record immutable image digest
+      env:
+        IMAGE: ${{ matrix.image }}
+      run: |
+        set -euo pipefail
+        docker pull "$IMAGE_REF"
+        revision=$(docker image inspect "$IMAGE_REF" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+        [[ "$revision" == "$GITHUB_SHA" ]] || { echo 'Image revision does not match tested source'; exit 1; }
+        export DIGEST="$(docker image inspect "$IMAGE_REF" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)"
+        python - <<'PY'
+        import json,os,re
+        assert re.fullmatch(r'sha256:[0-9a-f]{64}', os.environ['DIGEST'])
+        with open(os.environ['IMAGE']+'.json','w') as f:
+            json.dump({'source_sha':os.environ['GITHUB_SHA'],'image':os.environ['IMAGE'],'digest':os.environ['DIGEST']},f)
+        PY
+        echo "$IMAGE_REF@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+    - uses: actions/upload-artifact@v4
+      with:
+        name: digest-${{ matrix.image }}
+        path: ${{ matrix.image }}.json
+        if-no-files-found: error
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: scan-${{ matrix.image }}
+        path: image-scan.json
+        if-no-files-found: error
+  update-gitops:
+    name: Commit dev desired state
+    needs:
+    - build-images
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    concurrency:
+      group: gitops-dev
+      cancel-in-progress: false
+    env:
+      DEPLOY_REPOSITORY: ${{ vars.GITOPS_REPOSITORY }}
+      DEPLOY_BRANCH: ${{ vars.GITOPS_BRANCH || 'main' }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Require explicit deployment repository
+      env:
+        TOKEN: ${{ secrets.GITOPS_TOKEN }}
+      run: '[[ "$DEPLOY_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && test -n "$TOKEN" || { echo ''Configure
+        GITOPS_REPOSITORY and scoped GITOPS_TOKEN''; exit 1; }'
+    - uses: actions/checkout@v4
+      with:
+        repository: ${{ env.DEPLOY_REPOSITORY }}
+        ref: ${{ env.DEPLOY_BRANCH }}
+        token: ${{ secrets.GITOPS_TOKEN }}
+        path: gitops-checkout
+        fetch-depth: 0
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - run: python -m pip install PyYAML==6.0.2
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: digest-*
+        path: .cache/digests
+        merge-multiple: true
+    - name: Commit and push without force; reject stale CI runs
+      env:
+        OWNER: ${{ github.repository_owner }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
+        git -C gitops-checkout config user.name 'sre-release-bot'
+        git -C gitops-checkout config user.email 'sre-release-bot@users.noreply.github.com'
+        for attempt in 1 2 3; do
+          newest=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          if [[ "$newest" != "$GITHUB_SHA" ]]; then
+            echo 'Superseded by a newer main commit; no environment change.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git -C gitops-checkout fetch origin "$DEPLOY_BRANCH"
+          git -C gitops-checkout reset --hard FETCH_HEAD
+          python scripts/ci/update_gitops.py --repo gitops-checkout --environment dev --sha "$GITHUB_SHA" --registry "ghcr.io/${OWNER,,}" --digests .cache/digests
+          git -C gitops-checkout add environments/dev/values.yaml
+          if git -C gitops-checkout diff --cached --quiet; then exit 0; fi
+          git -C gitops-checkout commit -m "chore(deploy): update platform images to $GITHUB_SHA"
+          if git -C gitops-checkout push origin "HEAD:$DEPLOY_BRANCH"; then
+            revision=$(git -C gitops-checkout rev-parse HEAD)
+            echo "Source: $GITHUB_SHA → GitOps: $DEPLOY_REPOSITORY@$revision → Argo CD sre-dev" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+        done
+        echo 'Concurrent GitOps changes; retry the workflow. Never force-push.' >&2
+        exit 1

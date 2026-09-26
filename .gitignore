@@ -256,6 +256,11 @@ sre-broken-system/.legacy-monorepo-git/
 output/
 tmp/
 
+# Deployment checkout and CI reports are generated locally, not application source.
+/gitops-checkout/
+/sre-agent-backend/sre-agent/unit.xml
+/sre-agent-backend/sre-agent/integration.xml
+
 # Pytest caches created with a custom cache directory name.
 .pytest-cache-*/
 

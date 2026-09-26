@@ -1,0 +1,50 @@
+{{- if .Values.smoke.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sre-platform-acceptance
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+spec:
+  activeDeadlineSeconds: 180
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: acceptance
+          image: "{{ .Values.agent.image.repository }}:{{ .Values.agent.image.tag }}{{ if .Values.agent.image.digest }}@{{ .Values.agent.image.digest }}{{ end }}"
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          envFrom:
+            - secretRef: {name: {{ .Values.agent.existingSecret }}}
+          command: [python, -c]
+          args:
+            - |
+              import json, os, urllib.request
+              for url in ["http://{{ .Values.agent.name }}:{{ .Values.agent.service.port }}/health", "http://{{ .Values.gateway.name }}:{{ .Values.gateway.service.port }}/health", "http://{{ .Values.frontend.name }}:{{ .Values.frontend.service.port }}/healthz"]:
+                  with urllib.request.urlopen(url, timeout=10) as response:
+                      assert response.status == 200
+              origin = "http://{{ .Values.frontend.name }}:{{ .Values.frontend.service.port }}"
+              payload = json.dumps({"username": os.environ['SRE_INITIAL_USERNAME'], "password": os.environ['SRE_INITIAL_PASSWORD']}).encode()
+              request = urllib.request.Request(origin + '/api/auth/login', data=payload, headers={'Content-Type': 'application/json'})
+              with urllib.request.urlopen(request, timeout=10) as response:
+                  token = json.load(response)['access_token']
+              request = urllib.request.Request(origin + '/api/diagnoses', headers={'Authorization': 'Bearer ' + token})
+              with urllib.request.urlopen(request, timeout=10) as response:
+                  assert response.status == 200
+              from app.workflow.evidence_gate import build_report
+              from app.workflow.models import DiagnosisState, DiagnosisSynthesis
+              state = DiagnosisState(query='staging acceptance', synthesis=DiagnosisSynthesis(status='confirmed',root_cause='unverified',confidence=.9,evidence_ids=[]))
+              assert build_report(state).status == 'insufficient_evidence'
+              print('Health, frontend-auth-MySQL path and deployed Agent evidence gate passed')
+{{- end }}

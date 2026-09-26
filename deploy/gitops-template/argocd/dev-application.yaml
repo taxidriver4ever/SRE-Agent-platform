@@ -1,0 +1,31 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sre-dev
+  namespace: argocd
+spec:
+  project: sre-platform
+  source:
+    repoURL: https://github.com/REPLACE_OWNER/sre-agent-deploy.git
+    targetRevision: main
+    path: charts/sre-platform
+    helm:
+      releaseName: sre-platform
+      valueFiles:
+      - ../../environments/dev/values.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sre-dev
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+    - CreateNamespace=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 1m

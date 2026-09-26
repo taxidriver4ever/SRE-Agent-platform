@@ -1,0 +1,156 @@
+{{- range $key := list "agent" "gateway" "frontend" }}
+{{- $c := index $.Values $key }}
+{{- if and (eq $.Values.environment "prod") (lt (int $c.replicaCount) 2) }}
+{{- fail "prod requires at least 2 replicas for each component" }}
+{{- end }}
+{{- if and (eq $.Values.environment "prod") (not $c.pdb.enabled) }}
+{{- fail "prod requires a PodDisruptionBudget for each component" }}
+{{- end }}
+{{- if and (eq $.Values.environment "prod") $c.autoscaling.enabled (lt (int $c.autoscaling.minReplicas) 2) }}
+{{- fail "prod HPA minReplicas must be at least 2" }}
+{{- end }}
+{{- range $c.env }}
+{{- if has .name (list "APP_VERSION" "GIT_COMMIT" "ENVIRONMENT" "GATEWAY_BASE_URL") }}
+{{- fail (printf "%s is managed by the chart" .name) }}
+{{- end }}
+{{- if and (hasKey . "value") (regexMatch "(?i)(password|secret|api_key|token)" .name) (ne .name "GATEWAY_MAX_TOKENS") }}
+{{- fail (printf "%s must use valueFrom.secretKeyRef or existingSecret" .name) }}
+{{- end }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $c.name }}
+  namespace: {{ $.Release.Namespace }}
+  labels: {app.kubernetes.io/name: {{ $c.name }}, app.kubernetes.io/instance: {{ $.Release.Name }}}
+  annotations:
+    sre.agent/git-commit: {{ $c.image.tag | quote }}
+spec:
+  {{- if not $c.autoscaling.enabled }}
+  replicas: {{ $c.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 600
+  strategy: {{ toYaml $c.strategy | nindent 4 }}
+  selector:
+    matchLabels: {app.kubernetes.io/name: {{ $c.name }}, app.kubernetes.io/instance: {{ $.Release.Name }}}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $c.name }}
+        app.kubernetes.io/instance: {{ $.Release.Name }}
+        app.kubernetes.io/part-of: sre-agent-platform
+        app.kubernetes.io/version: {{ $c.image.tag | quote }}
+      annotations:
+        sre.agent/git-commit: {{ $c.image.tag | quote }}
+        checksum/config: {{ toJson $.Values | sha256sum }}
+    spec:
+      {{- if eq $key "agent" }}
+      serviceAccountName: {{ $.Values.serviceAccount.name }}
+      automountServiceAccountToken: true
+      {{- else }}
+      automountServiceAccountToken: false
+      {{- end }}
+      securityContext: {{ toYaml $c.securityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ $c.terminationGracePeriodSeconds }}
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ $c.name }}
+          image: "{{ $c.image.repository }}:{{ $c.image.tag }}{{ if $c.image.digest }}@{{ $c.image.digest }}{{ end }}"
+          imagePullPolicy: IfNotPresent
+          ports: [{name: http, containerPort: {{ $c.containerPort }}}]
+          envFrom:
+            - configMapRef: {name: {{ $c.name }}-config}
+            {{- if $c.existingSecret }}
+            - secretRef: {name: {{ $c.existingSecret }}}
+            {{- end }}
+          env:
+            - {name: GIT_COMMIT, value: {{ $c.image.tag | quote }}}
+            - {name: APP_VERSION, value: {{ $c.image.tag | quote }}}
+            {{- with $c.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          startupProbe: {{ toYaml $c.startupProbe | nindent 12 }}
+          readinessProbe: {{ toYaml $c.readinessProbe | nindent 12 }}
+          livenessProbe: {{ toYaml $c.livenessProbe | nindent 12 }}
+          resources: {{ toYaml $c.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            {{- toYaml $c.volumeMounts | nindent 12 }}
+            {{- if eq $key "frontend" }}
+            - name: nginx-config
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- toYaml $c.volumes | nindent 8 }}
+        {{- if eq $key "frontend" }}
+        - name: nginx-config
+          configMap: {name: sre-frontend-nginx}
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $c.name }}
+  namespace: {{ $.Release.Namespace }}
+spec:
+  type: {{ $c.service.type }}
+  selector: {app.kubernetes.io/name: {{ $c.name }}, app.kubernetes.io/instance: {{ $.Release.Name }}}
+  ports: [{name: http, port: {{ $c.service.port }}, targetPort: http}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $c.name }}-config
+  namespace: {{ $.Release.Namespace }}
+data:
+  ENVIRONMENT: {{ $.Values.environment | quote }}
+  {{- if eq $key "agent" }}
+  GATEWAY_BASE_URL: "http://{{ $.Values.gateway.name }}:{{ $.Values.gateway.service.port }}"
+  {{- end }}
+  {{- range $name, $value := $c.config }}
+  {{- if and (ne $name "ENVIRONMENT") (not (and (eq $key "agent") (eq $name "GATEWAY_BASE_URL"))) }}
+  {{- if regexMatch "(?i)(password|secret|api_key|token)" $name }}
+  {{- if ne $name "GATEWAY_MAX_TOKENS" }}{{ fail (printf "%s must use existingSecret" $name) }}{{ end }}
+  {{- end }}
+  {{ $name }}: {{ $value | quote }}
+  {{- end }}
+  {{- end }}
+{{- if $c.pdb.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $c.name }}
+  namespace: {{ $.Release.Namespace }}
+spec:
+  minAvailable: {{ $c.pdb.minAvailable }}
+  selector:
+    matchLabels: {app.kubernetes.io/name: {{ $c.name }}, app.kubernetes.io/instance: {{ $.Release.Name }}}
+{{- end }}
+{{- if $c.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $c.name }}
+  namespace: {{ $.Release.Namespace }}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: {{ $c.name }}}
+  minReplicas: {{ $c.autoscaling.minReplicas }}
+  maxReplicas: {{ $c.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: {{ $c.autoscaling.targetCPUUtilizationPercentage }}}
+{{- end }}
+{{- end }}

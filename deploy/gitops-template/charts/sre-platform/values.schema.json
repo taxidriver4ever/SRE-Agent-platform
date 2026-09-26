@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": [
+    "environment",
+    "agent",
+    "gateway",
+    "frontend"
+  ],
+  "properties": {
+    "environment": {
+      "enum": [
+        "dev",
+        "staging",
+        "prod"
+      ]
+    },
+    "agent": {
+      "type": "object",
+      "required": [
+        "image",
+        "replicaCount",
+        "resources",
+        "startupProbe",
+        "readinessProbe",
+        "livenessProbe"
+      ],
+      "properties": {
+        "replicaCount": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "image": {
+          "type": "object",
+          "required": [
+            "repository",
+            "tag"
+          ],
+          "properties": {
+            "repository": {
+              "type": "string",
+              "pattern": "^ghcr[.]io/[a-z0-9_.-]+/[a-z0-9_.-]+$"
+            },
+            "tag": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "digest": {
+              "type": "string",
+              "pattern": "^$|^sha256:[0-9a-f]{64}$"
+            }
+          }
+        }
+      }
+    },
+    "gateway": {
+      "type": "object",
+      "required": [
+        "image",
+        "replicaCount",
+        "resources",
+        "startupProbe",
+        "readinessProbe",
+        "livenessProbe"
+      ],
+      "properties": {
+        "replicaCount": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "image": {
+          "type": "object",
+          "required": [
+            "repository",
+            "tag"
+          ],
+          "properties": {
+            "repository": {
+              "type": "string",
+              "pattern": "^ghcr[.]io/[a-z0-9_.-]+/[a-z0-9_.-]+$"
+            },
+            "tag": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "digest": {
+              "type": "string",
+              "pattern": "^$|^sha256:[0-9a-f]{64}$"
+            }
+          }
+        }
+      }
+    },
+    "frontend": {
+      "type": "object",
+      "required": [
+        "image",
+        "replicaCount",
+        "resources",
+        "startupProbe",
+        "readinessProbe",
+        "livenessProbe"
+      ],
+      "properties": {
+        "replicaCount": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "image": {
+          "type": "object",
+          "required": [
+            "repository",
+            "tag"
+          ],
+          "properties": {
+            "repository": {
+              "type": "string",
+              "pattern": "^ghcr[.]io/[a-z0-9_.-]+/[a-z0-9_.-]+$"
+            },
+            "tag": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "digest": {
+              "type": "string",
+              "pattern": "^$|^sha256:[0-9a-f]{64}$"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
