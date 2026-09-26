@@ -7,7 +7,7 @@ COPY src ./src
 RUN mvn -q test package
 
 # 官方 OpenTelemetry Java 自动探针提供 HTTP、JDBC 和下游请求 Trace。
-FROM otel/autoinstrumentation-java:2.17.1 AS otel
+FROM otel/autoinstrumentation-java:2.27.0 AS otel
 FROM eclipse-temurin:21-jre
 ARG VCS_REF=unknown
 ARG VCS_SOURCE=local/order-service

@@ -78,6 +78,8 @@ def main():
         nginx = next(d for d in extra if d['metadata']['name']=='sre-frontend-nginx')
         assert 'sre-agent:9001' in nginx['data']['default.conf']
     print('CI boundary and all Helm environment contracts passed')
+    from validate_lab import validate
+    validate()
 
 
 if __name__ == '__main__':

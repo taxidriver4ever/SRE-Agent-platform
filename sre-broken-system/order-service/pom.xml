@@ -12,7 +12,11 @@
     <artifactId>order-service</artifactId>
     <version>0.1.0</version>
     <name>order-service</name>
-    <properties><java.version>21</java.version></properties>
+    <properties>
+        <java.version>21</java.version>
+        <!-- Keep the Boot API baseline; patch its embedded Tomcat for the image security gate. -->
+        <tomcat.version>10.1.59</tomcat.version>
+    </properties>
     <dependencies>
         <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency>
         <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-jdbc</artifactId></dependency>

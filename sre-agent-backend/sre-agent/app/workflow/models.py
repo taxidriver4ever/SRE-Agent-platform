@@ -142,6 +142,7 @@ class DiagnosisState(BaseModel):
     max_tool_steps: int = 12
     pod_name: str | None = None
     runtime_commit: str | None = None
+    previous_runtime_commit: str | None = None
     language: str = "unknown"
     repository: str | None = None
     repository_url: str | None = None

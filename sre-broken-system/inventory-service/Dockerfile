@@ -1,5 +1,5 @@
 # Go 构建在容器中完成，因此宿主机不需要安装 Go SDK。
-FROM golang:1.23-alpine AS build
+FROM golang:1.26.8-alpine AS build
 WORKDIR /src
 COPY go.mod ./
 COPY cmd ./cmd

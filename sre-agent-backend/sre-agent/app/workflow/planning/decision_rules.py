@@ -114,7 +114,9 @@ def evidence_driven_decision(state: DiagnosisState) -> PlannerDecision | None:
             return PlannerDecision(action="tool", tool_name="get_commit", arguments=commit_arguments,
                 title="读取运行版本提交元数据", reason="运行对象给出了 repository 与 commit",
                 parent_evidence_ids=parents(lambda item: item.source == "Kubernetes"))
-        diff_arguments = {"repository": state.repository, "base": f"{state.runtime_commit}^", "head": state.runtime_commit}
+        diff_arguments = {"repository": state.repository,
+                          "base": state.previous_runtime_commit or f"{state.runtime_commit}^",
+                          "head": state.runtime_commit}
         if not called("get_commit_diff", diff_arguments):
             return PlannerDecision(action="tool", tool_name="get_commit_diff", arguments=diff_arguments,
                 title="比较运行提交与前一版本", reason="症状与版本变化相关，需要验证实际 Diff",

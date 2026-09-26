@@ -1,5 +1,5 @@
 # Compile and test the Go service in a reproducible builder image.
-FROM golang:1.23-alpine AS build
+FROM golang:1.26.8-alpine AS build
 WORKDIR /src
 COPY go.mod ./
 COPY cmd ./cmd

@@ -49,6 +49,9 @@ class GitReadBackend:
         commit = self._safe_ref(str(arguments.get("commit") or "HEAD"))
         base = self._safe_ref(str(arguments.get("base") or f"{commit}^"))
         head = self._safe_ref(str(arguments.get("head") or commit))
+        if self.registry and self.name in {"get_commit_diff", "list_changed_files"} and re.fullmatch(r"[0-9a-f]{40}", base):
+            # Previous deployed versions may precede HEAD by many source commits.
+            await self._select_repository(identifier, base)
         start_line, end_line = self._safe_line_range(arguments)
         prefix = ["-C", str(repository)]
 

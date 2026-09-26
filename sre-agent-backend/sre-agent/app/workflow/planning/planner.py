@@ -46,6 +46,7 @@ class EvidencePlanner:
         payload = {
             "query": state.query, "service": state.service, "symptom": state.symptom,
             "repository": state.repository, "runtime_commit": state.runtime_commit,
+            "previous_runtime_commit": state.previous_runtime_commit,
             "source_code_location": state.source_code_location,
             "available_tools": self._compact_tool_specs(tool_specs), "evidence": evidence,
             "previous_calls": calls,

@@ -1,0 +1,172 @@
+releaseReady: false
+sourceRepository: https://github.com/taxidriver4ever/SRE-Agent-platform.git
+imagePullSecrets: []
+databaseSecret: sre-lab-database
+services:
+  order-service:
+    image:
+      repository: ''
+      tag: ''
+      digest: ''
+    previousSourceSha: ''
+    replicas: 3
+    language: Java 21
+    sourcePath: sre-broken-system/order-service/src/main/java/local/srelab/order/repository/OrderRepository.java
+    port: 8080
+    serviceType: NodePort
+    nodePort: 30080
+    readinessPath: /actuator/health/readiness
+    livenessPath: /actuator/health/liveness
+    metricsPath: /actuator/prometheus
+    resources:
+      requests:
+        cpu: 100m
+        memory: 192Mi
+      limits:
+        cpu: '1'
+        memory: 512Mi
+    config:
+      DB_URL: jdbc:mysql://mysql:3306/sre_lab?useSSL=false&allowPublicKeyRetrieval=true
+      DB_USERNAME: sre_app
+      INVENTORY_BASE_URL: http://inventory-service:8081
+      USER_BASE_URL: http://user-service:8082
+      PAYMENT_BASE_URL: http://payment-service:8083
+      NOTIFICATION_BASE_URL: http://notification-service:8084
+      OTEL_SERVICE_NAME: order-service
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+  inventory-service:
+    image:
+      repository: ''
+      tag: ''
+      digest: ''
+    previousSourceSha: ''
+    replicas: 2
+    language: Go 1.26
+    sourcePath: sre-broken-system/inventory-service/internal/client/recommendation.go
+    port: 8081
+    serviceType: ClusterIP
+    nodePort: null
+    readinessPath: /health
+    livenessPath: /health
+    metricsPath: /metrics
+    resources:
+      requests:
+        cpu: 50m
+        memory: 48Mi
+      limits:
+        cpu: 600m
+        memory: 160Mi
+    config:
+      RECOMMENDATION_BASE_URL: http://recommendation-service:8085
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+  user-service:
+    image:
+      repository: ''
+      tag: ''
+      digest: ''
+    previousSourceSha: ''
+    replicas: 2
+    language: Python 3.12
+    sourcePath: sre-broken-system/user-service/app/api/routes.py
+    port: 8082
+    serviceType: ClusterIP
+    nodePort: null
+    readinessPath: /health
+    livenessPath: /health
+    metricsPath: /metrics
+    resources:
+      requests:
+        cpu: 75m
+        memory: 96Mi
+      limits:
+        cpu: 700m
+        memory: 256Mi
+    config:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      SKYWALKING_AGENT_ENABLED: 'true'
+      SKYWALKING_AGENT_COLLECTOR: skywalking-oap:11800
+      SKYWALKING_SERVICE_NAME: user-service
+  payment-service:
+    image:
+      repository: ''
+      tag: ''
+      digest: ''
+    previousSourceSha: ''
+    replicas: 2
+    language: Node.js 22 / TypeScript
+    sourcePath: sre-broken-system/payment-service/src/repositories/payment-repository.ts
+    port: 8083
+    serviceType: ClusterIP
+    nodePort: null
+    readinessPath: /health
+    livenessPath: /health
+    metricsPath: /metrics
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 600m
+        memory: 128Mi
+    config:
+      NOTIFICATION_BASE_URL: http://notification-service:8084
+      NODE_OPTIONS: --max-old-space-size=96
+  notification-service:
+    image:
+      repository: ''
+      tag: ''
+      digest: ''
+    previousSourceSha: ''
+    replicas: 2
+    language: Go 1.26
+    sourcePath: sre-broken-system/notification-service/cmd/server/main.go
+    port: 8084
+    serviceType: ClusterIP
+    nodePort: null
+    readinessPath: /health
+    livenessPath: /health
+    metricsPath: /metrics
+    resources:
+      requests:
+        cpu: 30m
+        memory: 48Mi
+      limits:
+        cpu: 400m
+        memory: 128Mi
+    config: {}
+  recommendation-service:
+    image:
+      repository: ''
+      tag: ''
+      digest: ''
+    previousSourceSha: ''
+    replicas: 2
+    language: Python 3.12
+    sourcePath: sre-broken-system/recommendation-service/app/service/recommendation_service.py
+    port: 8085
+    serviceType: ClusterIP
+    nodePort: null
+    readinessPath: /health
+    livenessPath: /health
+    metricsPath: /metrics
+    resources:
+      requests:
+        cpu: 75m
+        memory: 96Mi
+      limits:
+        cpu: 700m
+        memory: 256Mi
+    config:
+      SKYWALKING_AGENT_ENABLED: 'true'
+      SKYWALKING_AGENT_COLLECTOR: skywalking-oap:11800
+      SKYWALKING_SERVICE_NAME: recommendation-service
+orderCanary:
+  enabled: false
+  replicas: 1
+  image:
+    repository: ''
+    tag: ''
+    digest: ''

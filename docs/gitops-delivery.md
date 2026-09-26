@@ -269,6 +269,31 @@ Python 3.12、Node 22 主版本与业务启动命令不变；CI 新增镜像内�
   原有后端完整 pytest 保留在 CI；本轮本地重点验证交付改动，没有把上一轮后端测试数字
   当成本轮全量结果。
 
+## 2026-09-26 CI 失败修复
+
+GitHub Run `36238638523`（应用提交 `8d64daa`）的 Agent 单元/组件测试为
+222 passed、7 failed。7 项均来自未随 GitOps 迁移更新的 `tests/test_cicd_config.py`：
+旧测试仍要求只有三个 CI Job、存在 `cd.yml` / `deploy/k8s`，并执行命令式部署回滚。
+现已更新为 GitOps 契约：所有质量门禁成功且 main push 才能发布，CRITICAL 扫描先于
+push，完整 SHA/digest 可追踪，仅更新 dev，Helm 保留探针/滚动更新/生产 PDB，凭据使用
+外部 Secret，旧部署脚本保持 fail-closed。没有删除失败测试来绕过门禁。
+
+两个 Workflow 均固定为 `ubuntu-24.04`，避免 `ubuntu-latest` 自动迁移到 Ubuntu 26。
+Actions 使用官方核验版本并固定完整提交 SHA：checkout 7.0.1、setup-python 7.0.0、
+setup-node 7.0.0、upload-artifact 7.0.1、download-artifact 8.0.1、setup-helm 5.0.1、
+trivy-action 0.36.0、docker/login 4.6.0、setup-buildx 4.4.1、build-push 7.4.0。
+已核对直接 JavaScript Action 的 Node 24 元数据及 Trivy 内部 cache/setup-trivy 依赖。
+扫描 CLI 仍为 Trivy 0.69.3，应用 Python/Node 版本与业务逻辑不变。
+
+本地验证已通过 Workflow actionlint、三环境 Helm lint/render、15 项交付脚本测试，
+以及 Agent 全量 266 项测试（293.36 秒，包含独立 MySQL 8.4 / Elasticsearch 8.17.3
+的真实集成测试）。10 个固定 Action 的官方元数据及所有传入参数均已核对。
+Windows 默认 pytest 临时目录存在权限限制，本地验证使用项目内独立 `--basetemp`；
+这一参数不改变 GitHub Linux Runner 配置。修复提交需要推送后才能确认新一轮远端 CI 结果。
+参考：[失败运行](https://github.com/taxidriver4ever/SRE-Agent-platform/actions/runs/36238638523)、
+[setup-python Node 24 说明](https://github.com/actions/setup-python)、
+[Trivy Action 0.36.0](https://github.com/aquasecurity/trivy-action/releases/tag/v0.36.0)。
+
 ## 当前简化与未来升级
 
 * Kind 三 Namespace 模拟环境；企业集群可独立集群/网络策略、Backing services、身份与资源配额。
@@ -289,3 +314,8 @@ Helm 参数由 Argo CD 渲染、再由 Argo CD 管理资源，而非由应用 CI
 [Argo CD Helm 文档](https://argo-cd.readthedocs.io/en/latest/user-guide/helm/)。自动同步与回滚
 限制见 [Automated Sync](https://argo-cd.readthedocs.io/en/stable/user-guide/auto_sync/)。
 扫描门禁参数见 [Trivy Action](https://github.com/aquasecurity/trivy-action)。
+## Lab 增量交付
+
+六个故障服务已新增独立 Lab CI、Chart、dev values 与 `sre-lab-dev` Application。
+平台路径和 Application 名称保持兼容；具体接入、不可变版本追踪及故障操作见
+[Lab GitOps 交付说明](lab-gitops.md)。本文原有平台发布/推广流程继续有效。

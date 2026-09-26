@@ -12,7 +12,7 @@ concurrency:
 jobs:
   agent-test:
     name: Agent pytest
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       mysql:
         image: mysql:8.4
@@ -51,11 +51,11 @@ jobs:
         working-directory: sre-agent-backend/sre-agent
     steps:
     - name: Check out source
-      uses: actions/checkout@v4
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
       with:
         python-version: '3.12'
         cache: pip
@@ -68,7 +68,7 @@ jobs:
       run: python -m pytest --ignore=tests/test_history_search.py --ignore=tests/test_durable_diagnosis.py --junitxml=unit.xml
     - name: MySQL recovery and real Elasticsearch integration
       run: python -m pytest tests/test_history_search.py tests/test_durable_diagnosis.py --junitxml=integration.xml
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       if: always()
       with:
         name: agent-test-results
@@ -77,7 +77,7 @@ jobs:
     timeout-minutes: 30
   gateway-test:
     name: Gateway pytest
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       mysql:
         image: mysql:8.4
@@ -101,11 +101,11 @@ jobs:
         working-directory: sre-agent-backend/sre-gateway
     steps:
     - name: Check out source
-      uses: actions/checkout@v4
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
       with:
         python-version: '3.12'
         cache: pip
@@ -119,17 +119,17 @@ jobs:
     timeout-minutes: 30
   frontend-build:
     name: Frontend test and build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: sre-agent-frontend
     steps:
     - name: Check out source
-      uses: actions/checkout@v4
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
     - name: Set up Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
       with:
         node-version: '22'
         cache: npm
@@ -143,14 +143,14 @@ jobs:
     timeout-minutes: 30
   agent-regression:
     name: Agent Base Candidate regression
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         fetch-depth: 0
         persist-credentials: false
-    - uses: actions/setup-python@v5
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
       with:
         python-version: '3.12'
     - run: python -m pip install -r sre-agent-backend/sre-agent/requirements-dev.txt
@@ -166,7 +166,7 @@ jobs:
         git worktree add --detach "$RUNNER_TEMP/agent-base" "$BASE_SHA"
     - name: Run same suite against Base and Candidate
       run: python scripts/ci/agent_regression.py --base "$RUNNER_TEMP/agent-base" --candidate . --output .cache/agent-regression
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       if: always()
       with:
         name: agent-regression
@@ -174,16 +174,16 @@ jobs:
         include-hidden-files: true
         if-no-files-found: error
   delivery-contracts:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
-    - uses: actions/setup-python@v5
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
       with:
         python-version: '3.12'
-    - uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112
+    - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
       with:
         version: v3.17.3
     - run: python -m pip install -r sre-agent-backend/sre-agent/requirements-dev.txt
@@ -191,13 +191,13 @@ jobs:
     - run: python scripts/ci/validate_delivery.py
   dependency-scan:
     name: Resolved dependency scan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
-    - uses: actions/setup-python@v5
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
       with:
         python-version: '3.12'
     - name: Resolve the same backend dependencies used by builds
@@ -210,7 +210,7 @@ jobs:
           "$RUNNER_TEMP/$component/bin/pip" freeze > ".cache/security/$component/requirements.txt"
         done
         cp sre-agent-frontend/package-lock.json .cache/security/package-lock.json
-    - uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+    - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
       env:
         TRIVY_INCLUDE_DEV_DEPS: 'true'
       with:
@@ -223,7 +223,7 @@ jobs:
         format: json
         output: dependency-scan.json
         version: v0.69.3
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       if: always()
       with:
         name: dependency-scan
@@ -239,7 +239,7 @@ jobs:
     - delivery-contracts
     - dependency-scan
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: read
@@ -261,7 +261,7 @@ jobs:
           context: sre-agent-frontend
           dockerfile: sre-agent-frontend/Dockerfile
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
     - name: Image identity
@@ -269,12 +269,12 @@ jobs:
         OWNER: ${{ github.repository_owner }}
         IMAGE: ${{ matrix.image }}
       run: echo "IMAGE_REF=ghcr.io/${OWNER,,}/$IMAGE:$GITHUB_SHA" >> "$GITHUB_ENV"
-    - uses: docker/login-action@v3
+    - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-    - uses: docker/setup-buildx-action@v3
+    - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
     - name: Reuse an existing immutable SHA instead of overwriting
       id: existing
       run: |
@@ -288,7 +288,7 @@ jobs:
           cat manifest-error.txt >&2
           exit 1
         fi
-    - uses: docker/build-push-action@v6
+    - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
       if: steps.existing.outputs.found != 'true'
       with:
         context: ${{ matrix.context }}
@@ -319,7 +319,7 @@ jobs:
             ;;
           *) exit 1 ;;
         esac
-    - uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+    - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
       with:
         image-ref: ${{ env.IMAGE_REF }}
         scanners: vuln
@@ -348,12 +348,12 @@ jobs:
             json.dump({'source_sha':os.environ['GITHUB_SHA'],'image':os.environ['IMAGE'],'digest':os.environ['DIGEST']},f)
         PY
         echo "$IMAGE_REF@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: digest-${{ matrix.image }}
         path: ${{ matrix.image }}.json
         if-no-files-found: error
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       if: always()
       with:
         name: scan-${{ matrix.image }}
@@ -364,7 +364,7 @@ jobs:
     needs:
     - build-images
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -375,7 +375,7 @@ jobs:
       DEPLOY_REPOSITORY: ${{ vars.GITOPS_REPOSITORY }}
       DEPLOY_BRANCH: ${{ vars.GITOPS_BRANCH || 'main' }}
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
     - name: Require explicit deployment repository
@@ -383,18 +383,18 @@ jobs:
         TOKEN: ${{ secrets.GITOPS_TOKEN }}
       run: '[[ "$DEPLOY_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && test -n "$TOKEN" || { echo ''Configure
         GITOPS_REPOSITORY and scoped GITOPS_TOKEN''; exit 1; }'
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         repository: ${{ env.DEPLOY_REPOSITORY }}
         ref: ${{ env.DEPLOY_BRANCH }}
         token: ${{ secrets.GITOPS_TOKEN }}
         path: gitops-checkout
         fetch-depth: 0
-    - uses: actions/setup-python@v5
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
       with:
         python-version: '3.12'
     - run: python -m pip install PyYAML==6.0.2
-    - uses: actions/download-artifact@v4
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
         pattern: digest-*
         path: .cache/digests
@@ -422,6 +422,230 @@ jobs:
           if git -C gitops-checkout push origin "HEAD:$DEPLOY_BRANCH"; then
             revision=$(git -C gitops-checkout rev-parse HEAD)
             echo "Source: $GITHUB_SHA → GitOps: $DEPLOY_REPOSITORY@$revision → Argo CD sre-dev" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+        done
+        echo 'Concurrent GitOps changes; retry the workflow. Never force-push.' >&2
+        exit 1
+  detect-lab-changes:
+    name: Select changed Lab services
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      changed: ${{ steps.select.outputs.changed }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+        fetch-depth: 0
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.12'
+    - run: python -m pip install PyYAML==6.0.2
+    - name: Read last desired Lab revisions on main
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.GITOPS_REPOSITORY != ''
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: ${{ vars.GITOPS_REPOSITORY }}
+        ref: ${{ vars.GITOPS_BRANCH || 'main' }}
+        token: ${{ secrets.GITOPS_TOKEN }}
+        path: .cache/lab-desired
+        persist-credentials: false
+    - id: select
+      env:
+        PR_BASE: ${{ github.event.pull_request.base.sha }}
+      run: |
+        set -euo pipefail
+        if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+          base=$(git merge-base "$PR_BASE" "$GITHUB_SHA")
+          matrix=$(python scripts/ci/lab_changes.py --head "$GITHUB_SHA" --base "$base")
+        else
+          matrix=$(python scripts/ci/lab_changes.py --head "$GITHUB_SHA" --desired .cache/lab-desired/environments/dev/lab-values.yaml)
+        fi
+        echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+        if [[ "$matrix" == '{"service": []}' ]]; then
+          echo 'changed=false' >> "$GITHUB_OUTPUT"
+        else
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+        fi
+        echo "Lab matrix: $matrix" >> "$GITHUB_STEP_SUMMARY"
+  build-lab-images:
+    name: 'Lab: scan and publish ${{ matrix.service }}'
+    needs:
+    - detect-lab-changes
+    - delivery-contracts
+    if: needs.detect-lab-changes.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: lab-image-${{ github.sha }}-${{ matrix.service }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.detect-lab-changes.outputs.matrix) }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.12'
+    - name: Image identity
+      env:
+        OWNER: ${{ github.repository_owner }}
+        IMAGE: sre-lab-${{ matrix.service }}
+      run: echo "IMAGE_REF=ghcr.io/${OWNER,,}/$IMAGE:$GITHUB_SHA" >> "$GITHUB_ENV"
+    - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+    - name: Reuse an existing immutable SHA instead of overwriting
+      id: existing
+      run: |
+        set -euo pipefail
+        if docker manifest inspect "$IMAGE_REF" > /dev/null 2> manifest-error.txt; then
+          docker pull "$IMAGE_REF"
+          echo 'found=true' >> "$GITHUB_OUTPUT"
+        elif grep -Eqi 'manifest unknown|no such manifest|not found' manifest-error.txt; then
+          echo 'found=false' >> "$GITHUB_OUTPUT"
+        else
+          cat manifest-error.txt >&2
+          exit 1
+        fi
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+      if: steps.existing.outputs.found != 'true'
+      with:
+        context: sre-broken-system/${{ matrix.service }}
+        file: sre-broken-system/${{ matrix.service }}/Dockerfile
+        load: true
+        push: false
+        platforms: linux/amd64
+        build-args: |-
+          VCS_REF=${{ github.sha }}
+          VCS_SOURCE=https://github.com/${{ github.repository }}
+        tags: ${{ env.IMAGE_REF }}
+        cache-from: type=gha,scope=lab-${{ matrix.service }}
+        cache-to: type=gha,mode=max,scope=lab-${{ matrix.service }}
+    - name: Check packaged Lab runtime
+      env:
+        SERVICE: ${{ matrix.service }}
+      run: python scripts/ci/lab_runtime_check.py --service "$SERVICE" --image "$IMAGE_REF" --sha "$GITHUB_SHA"
+    - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+      with:
+        image-ref: ${{ env.IMAGE_REF }}
+        scanners: vuln
+        severity: CRITICAL
+        exit-code: '1'
+        ignore-unfixed: false
+        format: json
+        output: image-scan.json
+        version: v0.69.3
+    - name: Push exactly the scanned local image
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.existing.outputs.found != 'true'
+      run: docker push "$IMAGE_REF"
+    - name: Record immutable image digest
+      env:
+        IMAGE: sre-lab-${{ matrix.service }}
+      run: |
+        set -euo pipefail
+        scanned_id=$(docker image inspect "$IMAGE_REF" --format '{{.Id}}')
+        docker pull "$IMAGE_REF"
+        published_id=$(docker image inspect "$IMAGE_REF" --format '{{.Id}}')
+        [[ "$scanned_id" == "$published_id" ]] || { echo 'Published image differs from scanned image'; exit 1; }
+        revision=$(docker image inspect "$IMAGE_REF" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+        [[ "$revision" == "$GITHUB_SHA" ]] || { echo 'Image revision does not match tested source'; exit 1; }
+        export DIGEST="$(docker image inspect "$IMAGE_REF" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)"
+        python - <<'PY'
+        import json,os,re
+        assert re.fullmatch(r'sha256:[0-9a-f]{64}', os.environ['DIGEST'])
+        with open(os.environ['IMAGE']+'.json','w') as f:
+            json.dump({'source_sha':os.environ['GITHUB_SHA'],'image':os.environ['IMAGE'],'digest':os.environ['DIGEST']},f)
+        PY
+        echo "$IMAGE_REF@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: lab-digest-${{ matrix.service }}
+        path: sre-lab-${{ matrix.service }}.json
+        if-no-files-found: error
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      if: always()
+      with:
+        name: lab-scan-${{ matrix.service }}
+        path: image-scan.json
+        if-no-files-found: error
+  update-lab-gitops:
+    name: Commit Lab dev desired state
+    needs:
+    - build-lab-images
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    concurrency:
+      group: gitops-lab-dev
+      cancel-in-progress: false
+    env:
+      DEPLOY_REPOSITORY: ${{ vars.GITOPS_REPOSITORY }}
+      DEPLOY_BRANCH: ${{ vars.GITOPS_BRANCH || 'main' }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+    - name: Require explicit deployment repository
+      env:
+        TOKEN: ${{ secrets.GITOPS_TOKEN }}
+      run: '[[ "$DEPLOY_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && test -n "$TOKEN" || { echo ''Configure GITOPS_REPOSITORY and scoped
+        GITOPS_TOKEN''; exit 1; }'
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: ${{ env.DEPLOY_REPOSITORY }}
+        ref: ${{ env.DEPLOY_BRANCH }}
+        token: ${{ secrets.GITOPS_TOKEN }}
+        path: gitops-checkout
+        fetch-depth: 0
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.12'
+    - run: python -m pip install PyYAML==6.0.2
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        pattern: lab-digest-*
+        path: .cache/digests
+        merge-multiple: true
+    - name: Commit and push without force; reject stale CI runs
+      env:
+        OWNER: ${{ github.repository_owner }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
+        git -C gitops-checkout config user.name 'sre-release-bot'
+        git -C gitops-checkout config user.email 'sre-release-bot@users.noreply.github.com'
+        for attempt in 1 2 3; do
+          newest=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          if [[ "$newest" != "$GITHUB_SHA" ]]; then
+            echo 'Superseded by a newer main commit; no environment change.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git -C gitops-checkout fetch origin "$DEPLOY_BRANCH"
+          git -C gitops-checkout reset --hard FETCH_HEAD
+          python scripts/ci/update_gitops.py --repo gitops-checkout --component-group lab --environment dev --sha "$GITHUB_SHA" --registry "ghcr.io/${OWNER,,}" --digests .cache/digests
+          git -C gitops-checkout add environments/dev/lab-values.yaml
+          if git -C gitops-checkout diff --cached --quiet; then exit 0; fi
+          git -C gitops-checkout commit -m "chore(deploy): update Lab images to $GITHUB_SHA"
+          if git -C gitops-checkout push origin "HEAD:$DEPLOY_BRANCH"; then
+            revision=$(git -C gitops-checkout rev-parse HEAD)
+            echo "Source: $GITHUB_SHA → GitOps: $DEPLOY_REPOSITORY@$revision → Argo CD sre-lab-dev" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
         done

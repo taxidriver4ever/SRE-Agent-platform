@@ -1,49 +1,116 @@
-"""CI/CD configuration contract tests.
-
-These tests intentionally inspect declarative files.  They make security and
-traceability constraints reviewable in pull requests instead of relying only on
-someone remembering the deployment rules.
-"""
-
-from __future__ import annotations
-
+"""Contracts for the current CI / Helm / Argo CD delivery architecture."""
 from pathlib import Path
-
 import yaml
-
 from app.core.config import get_settings
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
-WORKFLOW_DIR = REPOSITORY_ROOT / ".github" / "workflows"
-K8S_DIR = REPOSITORY_ROOT / "deploy" / "k8s"
+WORKFLOW_DIR = REPOSITORY_ROOT / ".github/workflows"
+GITOPS_DIR = REPOSITORY_ROOT / "deploy/gitops-template"
+QUALITY_JOBS = {"agent-test", "gateway-test", "frontend-build", "agent-regression",
+                "delivery-contracts", "dependency-scan"}
 
 
-def _load_yaml(path: Path) -> dict:
+def _load_yaml(path):
     return yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
 
 
-def _load_yaml_documents(path: Path) -> list[dict]:
-    return [
-        item
-        for item in yaml.load_all(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
-        if item
-    ]
-
-
-def test_ci_has_three_independent_github_hosted_jobs() -> None:
+def test_ci_retains_independent_quality_gates_on_pinned_hosted_runners():
     workflow = _load_yaml(WORKFLOW_DIR / "ci.yml")
-    triggers = workflow["on"]
+    assert "pull_request" in workflow["on"]
+    assert workflow["on"]["push"]["branches"] == ["main"]
+    assert "pull_request_target" not in workflow["on"]
+    assert QUALITY_JOBS <= set(workflow["jobs"])
+    assert all(job["runs-on"] == "ubuntu-24.04" for job in workflow["jobs"].values())
+    assert all(not workflow["jobs"][name].get("needs") for name in QUALITY_JOBS)
+    assert workflow["permissions"] == {"contents": "read"}
 
-    assert "pull_request" in triggers
-    assert triggers["push"]["branches"] == ["main"]
-    assert set(workflow["jobs"]) == {"agent-test", "gateway-test", "frontend-build"}
-    assert all(job["runs-on"] == "ubuntu-latest" for job in workflow["jobs"].values())
 
-    workflow_text = (WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")
-    assert "python -m pytest" in workflow_text
-    assert "npm run build" in workflow_text
-    assert "self-hosted" not in workflow_text
+def test_publication_requires_all_quality_gates_and_trusted_main_push():
+    workflow = _load_yaml(WORKFLOW_DIR / "ci.yml")
+    assert not (WORKFLOW_DIR / "cd.yml").exists()
+    build = workflow["jobs"]["build-images"]
+    deploy = workflow["jobs"]["update-gitops"]
+    assert set(build["needs"]) == QUALITY_JOBS
+    assert deploy["needs"] == ["build-images"]
+    for job in (build, deploy):
+        assert job["if"] == "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+    assert build["permissions"] == {"contents": "read", "packages": "write"}
+    assert deploy["permissions"] == {"contents": "read"}
+    assert deploy["concurrency"]["cancel-in-progress"] == "false"
+    commands = "\n".join(step.get("run", "") for step in deploy["steps"])
+    assert "scripts/ci/update_gitops.py" in commands and '--environment dev' in commands
+    assert '"$newest" != "$GITHUB_SHA"' in commands
+    assert "--force" not in commands
+    text = (WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")
+    assert "kubectl" not in text and "self-hosted" not in text
+
+
+def test_all_sha_images_are_scanned_before_push_and_digests_are_recorded():
+    job = _load_yaml(WORKFLOW_DIR / "ci.yml")["jobs"]["build-images"]
+    assert {x["image"] for x in job["strategy"]["matrix"]["include"]} == {
+        "sre-agent", "sre-gateway", "sre-agent-frontend"}
+    steps = job["steps"]
+    build = next(s for s in steps if s.get("uses", "").startswith("docker/build-push-action@"))
+    scan = next(s for s in steps if s.get("uses", "").startswith("aquasecurity/trivy-action@"))
+    push = next(s for s in steps if s.get("run", "").startswith('docker push'))
+    assert build["with"]["push"] == "false" and build["with"]["load"] == "true"
+    assert scan["with"]["severity"] == "CRITICAL"
+    assert scan["with"]["exit-code"] == "1" and scan["with"]["ignore-unfixed"] == "false"
+    assert steps.index(build) < steps.index(scan) < steps.index(push)
+    commands = "\n".join(s.get("run", "") for s in steps)
+    for fragment in (':$GITHUB_SHA', 'docker manifest inspect', 'org.opencontainers.image.revision', '.RepoDigests'):
+        assert fragment in commands
+    assert not any(s.get("continue-on-error") == "true" for s in steps)
+
+
+def test_helm_environments_preserve_probes_rollout_and_prod_availability():
+    # Full rendering is exercised separately by the delivery-contracts job.
+    values = _load_yaml(GITOPS_DIR / "charts/sre-platform/values.yaml")
+    for component in ("agent", "gateway", "frontend"):
+        config = values[component]
+        assert config["strategy"] == {"type": "RollingUpdate", "rollingUpdate": {
+            "maxUnavailable": "0", "maxSurge": "1"}}
+        for probe in ("startupProbe", "readinessProbe", "livenessProbe"):
+            assert config[probe]["httpGet"]["path"] in {"/health", "/healthz"}
+        assert config["resources"]["requests"] and config["resources"]["limits"]
+    for environment in ("dev", "staging", "prod"):
+        overlay = _load_yaml(GITOPS_DIR / f"environments/{environment}/values.yaml")
+        app = _load_yaml(GITOPS_DIR / f"argocd/{environment}-application.yaml")["spec"]
+        assert app["destination"]["namespace"] == f"sre-{environment}"
+        assert app["source"]["path"] == "charts/sre-platform"
+        assert app["syncPolicy"]["automated"] == {"prune": "true", "selfHeal": "true", "allowEmpty": "false"}
+        if environment == "prod":
+            for component in ("agent", "gateway", "frontend"):
+                assert int(overlay[component]["replicaCount"]) >= 2
+                assert overlay[component]["pdb"]["enabled"] == "true"
+
+
+def test_helm_references_external_secrets_instead_of_committing_credentials():
+    values = _load_yaml(GITOPS_DIR / "charts/sre-platform/values.yaml")
+    assert values["agent"]["existingSecret"] == "sre-agent-secrets"
+    assert values["gateway"]["existingSecret"] == "sre-gateway-secrets"
+    for component in ("agent", "gateway"):
+        assert not any("PASSWORD" in key or "API_KEY" in key for key in values[component]["config"])
+    templates = GITOPS_DIR / "charts/sre-platform/templates"
+    assert not any("kind: Secret" in p.read_text(encoding="utf-8") for p in templates.glob("*.yaml"))
+    assert "secretRef:" in (templates / "workloads.yaml").read_text(encoding="utf-8")
+
+
+def test_legacy_deploy_entrypoint_fails_closed_and_directs_to_git_revert():
+    script = (REPOSITORY_ROOT / "scripts/deploy-local-k8s.sh").read_text(encoding="utf-8")
+    assert "exit 1" in script and "git revert" in script
+    assert "kubectl" not in script and "rollout undo" not in script
+
+
+def test_local_setup_prepares_kind_without_releasing_application_resources():
+    script = (REPOSITORY_ROOT / "scripts/setup-local-k8s.sh").read_text(encoding="utf-8")
+    assert "set -Eeuo pipefail" in script
+    assert 'CLUSTER_NAME="${CLUSTER_NAME:-sre-lab}"' in script
+    assert 'kind get clusters' in script
+    assert 'kind create cluster --name "$CLUSTER_NAME" --config' in script
+    assert "sre-lab-infra/k8s/kind-config.yaml" in script
+    assert "apply -f" not in script and "set image" not in script
+    assert "k3d" not in script.lower()
 
 
 def test_agent_ci_uses_linux_workspace_paths_for_repository_catalog() -> None:
@@ -74,83 +141,6 @@ def test_default_repository_paths_are_anchored_to_checkout(
     )
 
 
-def test_cd_is_gated_by_successful_trusted_main_ci() -> None:
-    workflow = _load_yaml(WORKFLOW_DIR / "cd.yml")
-    triggers = workflow["on"]
-
-    assert set(triggers) == {"workflow_run"}
-    assert triggers["workflow_run"]["workflows"] == ["CI"]
-    assert triggers["workflow_run"]["branches"] == ["main"]
-
-    build_job = workflow["jobs"]["build-images"]
-    deploy_job = workflow["jobs"]["deploy-local"]
-    required_condition_fragments = (
-        "conclusion == 'success'",
-        "event == 'push'",
-        "head_branch == 'main'",
-        "head_repository.full_name == github.repository",
-    )
-    assert all(fragment in build_job["if"] for fragment in required_condition_fragments)
-    assert all(fragment in deploy_job["if"] for fragment in required_condition_fragments)
-    assert deploy_job["needs"] == ["build-images"]
-    assert set(deploy_job["runs-on"]) == {"self-hosted", "linux", "x64", "sre-local-deploy"}
-
-
-def test_cd_builds_all_images_with_full_sha_tag() -> None:
-    workflow = _load_yaml(WORKFLOW_DIR / "cd.yml")
-    build_job = workflow["jobs"]["build-images"]
-    image_names = {item["image"] for item in build_job["strategy"]["matrix"]["include"]}
-    assert image_names == {"sre-agent", "sre-gateway", "sre-agent-frontend"}
-
-    workflow_text = (WORKFLOW_DIR / "cd.yml").read_text(encoding="utf-8")
-    assert "docker/login-action@v4" in workflow_text
-    assert "docker/setup-buildx-action@v4" in workflow_text
-    assert "docker/build-push-action@v7" in workflow_text
-    assert ":sha-${{ github.event.workflow_run.head_sha }}" in workflow_text
-    assert "bash scripts/deploy-local-k8s.sh" in workflow_text
-
-
-def test_kubernetes_deployments_have_rollout_and_probe_contracts() -> None:
-    expected_replicas = {
-        "sre-agent": "2",
-        "sre-gateway": "2",
-        "sre-agent-frontend": "1",
-    }
-    deployment_files = sorted(K8S_DIR.glob("*-deployment.yaml"))
-    assert len(deployment_files) == 3
-
-    for path in deployment_files:
-        deployment = _load_yaml(path)
-        name = deployment["metadata"]["name"]
-        container = deployment["spec"]["template"]["spec"]["containers"][0]
-        strategy = deployment["spec"]["strategy"]
-
-        assert deployment["kind"] == "Deployment"
-        assert deployment["metadata"]["namespace"] == "sre"
-        assert deployment["spec"]["replicas"] == expected_replicas[name]
-        assert strategy["type"] == "RollingUpdate"
-        assert strategy["rollingUpdate"] == {"maxUnavailable": "0", "maxSurge": "1"}
-        assert "readinessProbe" in container
-        assert "livenessProbe" in container
-        assert container["image"].endswith(":IMAGE_TAG_PLACEHOLDER")
-        assert deployment["spec"]["template"]["metadata"]["annotations"][
-            "sre.agent/git-commit"
-        ] == "GIT_SHA_PLACEHOLDER"
-
-
-def test_secret_example_contains_placeholders_only() -> None:
-    documents = _load_yaml_documents(K8S_DIR / "secret.example.yaml")
-    allowed_values = {"CHANGE_ME", "YOUR_GATEWAY_API_KEY", "YOUR_VLLM_API_KEY"}
-
-    assert {document["metadata"]["name"] for document in documents} == {
-        "sre-agent-secrets",
-        "sre-gateway-secrets",
-    }
-    for document in documents:
-        assert document["kind"] == "Secret"
-        assert set(document["stringData"].values()) <= allowed_values
-
-
 def test_dockerfiles_are_production_oriented_and_exclude_dotenv() -> None:
     dockerfiles = {
         "agent": REPOSITORY_ROOT / "sre-agent-backend" / "sre-agent" / "Dockerfile",
@@ -178,26 +168,3 @@ def test_dockerfiles_are_production_oriented_and_exclude_dotenv() -> None:
     ):
         ignore_text = dockerignore.read_text(encoding="utf-8")
         assert ".env" in ignore_text
-
-
-def test_deploy_script_rolls_back_but_preserves_failure() -> None:
-    script = (REPOSITORY_ROOT / "scripts" / "deploy-local-k8s.sh").read_text(encoding="utf-8")
-
-    assert "set -Eeuo pipefail" in script
-    assert 'IMAGE_TAG}" != "sha-${GIT_SHA}' in script
-    assert "kubectl" in script and "set image" in script
-    assert "rollout status" in script
-    assert "get --raw" in script
-    assert "rollout undo" in script
-    assert 'exit "${original_status}"' in script
-
-
-def test_local_setup_reuses_the_existing_kind_cluster() -> None:
-    script = (REPOSITORY_ROOT / "scripts" / "setup-local-k8s.sh").read_text(encoding="utf-8")
-
-    assert "set -Eeuo pipefail" in script
-    assert 'CLUSTER_NAME="${CLUSTER_NAME:-sre-lab}"' in script
-    assert "kind create cluster --config" in script
-    assert 'LAB_NAMESPACE="sre-lab"' in script
-    assert "k3d" not in script.lower()
-    assert "secret.example.yaml unchanged" in script

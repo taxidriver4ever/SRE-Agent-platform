@@ -1,0 +1,33 @@
+# First release is initialized atomically by all six scanned digest artifacts.
+releaseReady: false
+services:
+  order-service:
+    image:
+      repository: ''
+      tag: ''
+      digest: ''
+  inventory-service:
+    image:
+      repository: ''
+      tag: ''
+      digest: ''
+  user-service:
+    image:
+      repository: ''
+      tag: ''
+      digest: ''
+  payment-service:
+    image:
+      repository: ''
+      tag: ''
+      digest: ''
+  notification-service:
+    image:
+      repository: ''
+      tag: ''
+      digest: ''
+  recommendation-service:
+    image:
+      repository: ''
+      tag: ''
+      digest: ''

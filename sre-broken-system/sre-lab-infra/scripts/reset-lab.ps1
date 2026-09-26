@@ -1,4 +1,10 @@
+param([switch]$RuntimeOnly)
 $ErrorActionPreference = "Stop"
+$PSNativeCommandUseErrorActionPreference = $true
+if (-not $RuntimeOnly) {
+    . (Join-Path $PSScriptRoot 'gitops-guard.ps1')
+    Assert-LabNotGitOpsManaged
+}
 $infraRoot = Split-Path $PSScriptRoot -Parent
 $serviceRoot = Join-Path $infraRoot "k8s\services"
 $canary = Join-Path $infraRoot "k8s\scenarios\order-canary-bad.yaml"
@@ -11,9 +17,11 @@ function Get-FreeTcpPort {
 }
 
 # Reapplying canonical manifests reverses image, probe, replica and annotation mutations.
-Get-ChildItem $serviceRoot -Recurse -Filter deployment.yaml | ForEach-Object { kubectl apply -f $_.FullName | Out-Null }
-kubectl apply -f $canary | Out-Null
-kubectl -n sre-lab scale deployment/order-service-canary --replicas=0 | Out-Null
+if (-not $RuntimeOnly) {
+    Get-ChildItem $serviceRoot -Recurse -Filter deployment.yaml | ForEach-Object { kubectl apply -f $_.FullName | Out-Null }
+    kubectl apply -f $canary | Out-Null
+    kubectl -n sre-lab scale deployment/order-service-canary --replicas=0 | Out-Null
+}
 
 function Set-PodFaultNormal {
     param([string]$Service, [int]$RemotePort, [string]$FaultPath)
@@ -39,7 +47,7 @@ function Set-PodFaultNormal {
             }
             if (-not $reset) { throw "reset endpoint not ready after 10 seconds" }
         } catch {
-            Write-Warning "Could not reset $Service/${pod}: $($_.Exception.Message)"
+            throw "Could not reset $Service/${pod}: $($_.Exception.Message)"
         } finally {
             if (-not $forward.HasExited) { Stop-Process -Id $forward.Id }
         }
@@ -49,12 +57,15 @@ function Set-PodFaultNormal {
 kubectl -n sre-lab rollout status deployment/order-service --timeout=240s | Out-Null
 # SQL 回归场景可能临时收紧慢查询阈值；恢复基线时必须同步还原，避免后续
 # 非数据库 Case 被普通 SQL 的 slow_log 记录污染。
+if (-not $RuntimeOnly) {
 kubectl -n sre-lab exec deployment/mysql -- sh -lc `
     'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "SET GLOBAL long_query_time=0.05;"' | Out-Null
+}
 Set-PodFaultNormal order-service 8080 '/debug/fault/normal'
 Set-PodFaultNormal inventory-service 8081 '/debug/fault?mode=normal'
 Set-PodFaultNormal user-service 8082 '/debug/fault?mode=normal'
 Set-PodFaultNormal payment-service 8083 '/debug/fault?mode=normal'
 Set-PodFaultNormal notification-service 8084 '/debug/fault?mode=normal'
 Set-PodFaultNormal recommendation-service 8085 '/debug/fault?mode=normal'
-Write-Host "Canonical GOOD versions, replicas, probes and all reachable Pod fault modes restored."
+if ($RuntimeOnly) { Write-Host 'Reachable Pod fault modes reset; GitOps desired state unchanged.' }
+else { Write-Host 'Canonical GOOD versions, replicas, probes and all reachable Pod fault modes restored.' }

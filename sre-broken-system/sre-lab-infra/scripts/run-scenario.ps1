@@ -5,6 +5,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'gitops-guard.ps1')
+Assert-LabNotGitOpsManaged
 $infraRoot = Split-Path $PSScriptRoot -Parent
 $workspaceRoot = Split-Path $infraRoot -Parent
 $orderBad = (git -C (Join-Path $workspaceRoot "order-service") rev-parse bad).Trim()

@@ -1807,6 +1807,34 @@ Workspace 执行后删除；完整 stdout/stderr/test JSON 作为 Artifact 保�
 
 ## CI/CD 与本地 Kind 部署
 
+现在包含两个独立发布单元：`sre-platform`（Agent、Gateway、Frontend）与
+`sre-lab`（六个故障服务）。平台沿用 `environments/dev/values.yaml` 和现有
+Argo Application `sre-dev`，Lab 使用 `lab-values.yaml` 和 `sre-lab-dev`，分别同步
+`sre-dev` 与 `sre-lab` namespace。为兼容已部署环境，不重命名平台 Application。
+
+```text
+                        GitHub Actions
+                       /              \
+              Platform Pipeline    Lab Pipeline
+              3 platform images    6 lab images (path filter)
+                       \              /
+                   GHCR: source SHA + digest
+                       /              \
+              dev/values.yaml     dev/lab-values.yaml
+                       \              /
+                  Independent GitOps Repo
+                       /              \
+                 Argo: sre-dev     Argo: sre-lab-dev
+                       |              |
+                namespace sre-dev  namespace sre-lab
+```
+
+**Local mode** 继续使用根目录 Docker Compose 做开发、故障复现和观测调试。
+**Kubernetes mode** 使用 GitHub Actions → GHCR → GitOps → Argo CD；CI 不持有集群凭据。
+Lab 的 MySQL、Prometheus、ELK、SkyWalking、OTel Collector 沿用 `sre-lab` 现有基础设施。
+Lab 首次发布、既有 GitOps 仓库接入、Secret、故障注入和回滚步骤见
+[Lab GitOps 交付说明](docs/lab-gitops.md)。
+
 交付流程已迁移至 **GitHub Actions + GHCR + 独立 GitOps Repository + Helm + Argo CD**。
 PR 运行测试、真实 MySQL/ES 集成、固定 Agent Base/Candidate 回归、前端构建与依赖扫描。
 main 通过后构建并扫描镜像，发布完整 Git SHA Tag，记录 digest，再只更新部署仓库 dev values。

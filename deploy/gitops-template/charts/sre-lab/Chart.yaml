@@ -1,0 +1,6 @@
+apiVersion: v2
+name: sre-lab
+description: Six diagnostic fault services, independently released from the Agent platform
+type: application
+version: 0.1.0
+appVersion: "git-sha"

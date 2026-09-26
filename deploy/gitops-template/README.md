@@ -1,5 +1,19 @@
 # SRE Platform deployment repository
 
+The repository now also contains an independent `charts/sre-lab` release,
+`environments/dev/lab-values.yaml` and `argocd/sre-lab-dev.yaml`. Platform files
+and its existing `sre-dev` Application remain unchanged. The Lab starts with
+`releaseReady: false`; do not register its Application until CI has published
+all six scanned images and initialized their full source SHA/digests.
+
+Lab prerequisites in `sre-lab`: existing MySQL (`mysql:3306`, database `sre_lab`),
+the existing observability stack, and Secret `sre-lab-database` with
+`order-password` and `user-database-url`. The Lab chart never manages database
+volumes or observability resources. Private GHCR requires `imagePullSecrets`.
+Follow `docs/lab-gitops.md` in the application repository for migration, runtime
+fault injection, canary experiments and Git revert. `scripts/promote.py` continues
+to promote platform images only; Lab delivery is scoped to dev.
+
 This directory is a **bootstrap template**, not active production desired state.
 Export it using `scripts/export_gitops.py` in the application repository. From
 then on, this independent repository owns charts, environment configuration,

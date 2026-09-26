@@ -1,0 +1,109 @@
+{{- if not .Values.releaseReady }}
+{{- fail "Lab release not initialized: publish all six scanned images before registering sre-lab-dev" }}
+{{- end }}
+{{- $root := . }}
+{{- $workloads := deepCopy .Values.services }}
+{{- if .Values.orderCanary.enabled }}
+{{- $canary := deepCopy (index .Values.services "order-service") }}
+{{- $_ := set $canary "image" .Values.orderCanary.image }}
+{{- $_ := set $canary "replicas" .Values.orderCanary.replicas }}
+{{- $_ := set $canary "previousSourceSha" (index .Values.services "order-service").image.tag }}
+{{- $_ := set $workloads "order-service-canary" $canary }}
+{{- end }}
+{{- range $name, $svc := $workloads }}
+{{- $service := $name }}
+{{- if eq $name "order-service-canary" }}{{- $service = "order-service" }}{{- end }}
+{{- $track := "stable" }}
+{{- if eq $name "order-service-canary" }}{{- $track = "canary" }}{{- end }}
+{{- if not (regexMatch "^[0-9a-f]{40}$" $svc.image.tag) }}{{ fail (printf "%s requires full source SHA" $name) }}{{ end }}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" $svc.image.digest) }}{{ fail (printf "%s requires scanned digest" $name) }}{{ end }}
+{{- if not (regexMatch (printf "^ghcr[.]io/[a-z0-9_.-]+/sre-lab-%s$" $service) $svc.image.repository) }}{{ fail "invalid Lab image repository" }}{{ end }}
+{{- $annotations := dict "sre.agent/repository" $service "sre.agent/repository-url" $root.Values.sourceRepository "sre.agent/source-path" $svc.sourcePath "sre.agent/language" $svc.language "sre.agent/git-sha" $svc.image.tag "sre-agent/source-sha" $svc.image.tag "sre.agent/image-digest" $svc.image.digest "sre.agent/previous-git-sha" $svc.previousSourceSha "sre.agent/managed-by" "gitops" }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    app: {{ $service }}
+    service: {{ $service }}
+    app.kubernetes.io/version: {{ $svc.image.tag | quote }}
+  annotations:
+    {{- toYaml $annotations | nindent 4 }}
+spec:
+  replicas: {{ $svc.replicas }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels:
+      app: {{ $service }}
+      {{- if eq $service "order-service" }}
+      track: {{ $track }}
+      {{- end }}
+  template:
+    metadata:
+      labels:
+        app: {{ $service }}
+        service: {{ $service }}
+        version: {{ $svc.image.tag | quote }}
+        app.kubernetes.io/version: {{ $svc.image.tag | quote }}
+        {{- if eq $service "order-service" }}
+        track: {{ $track }}
+        {{- end }}
+      annotations:
+        {{- toYaml $annotations | nindent 8 }}
+        prometheus.io/scrape: "true"
+        prometheus.io/path: {{ $svc.metricsPath | quote }}
+        prometheus.io/port: {{ $svc.port | quote }}
+    spec:
+      serviceAccountName: sre-lab
+      automountServiceAccountToken: false
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ $service }}
+          image: {{ printf "%s:%s@%s" $svc.image.repository $svc.image.tag $svc.image.digest | quote }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: {{ $svc.port }}}
+          env:
+            - {name: SERVICE_VERSION, value: {{ $svc.image.tag | quote }}}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            {{- range $key, $value := $svc.config }}
+            {{- if has $key (list "DB_PASSWORD" "DATABASE_URL" "SERVICE_VERSION" "POD_NAME") }}{{ fail "reserved or secret configuration must use chart-managed references" }}{{ end }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- if eq $service "order-service" }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: {{ $root.Values.databaseSecret }}, key: order-password}
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: {{ printf "service.version=%s,deployment.environment=%s" $svc.image.tag $root.Release.Namespace | quote }}
+            {{- end }}
+            {{- if eq $service "user-service" }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: {{ $root.Values.databaseSecret }}, key: user-database-url}
+            {{- end }}
+          startupProbe:
+            httpGet: {path: {{ $svc.livenessPath }}, port: http}
+            periodSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            httpGet: {path: {{ $svc.readinessPath }}, port: http}
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet: {path: {{ $svc.livenessPath }}, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 2
+          resources:
+            {{- toYaml $svc.resources | nindent 12 }}
+{{- end }}

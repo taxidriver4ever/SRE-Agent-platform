@@ -94,7 +94,8 @@ class RepositoryRegistry:
                 # 代替运行版本而产生 Source Reference 漂移。
                 await run_fixed_command(
                     "git",
-                    ["-C", str(target), "fetch", "--depth=1", "origin", commit],
+                    # Keep the immediate parent for first-release regression diffs.
+                    ["-C", str(target), "fetch", "--depth=2", "origin", commit],
                     timeout=max(self.timeout, 60),
                 )
         return target

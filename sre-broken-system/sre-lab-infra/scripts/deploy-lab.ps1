@@ -1,4 +1,4 @@
-param([switch]$SkipBuild)
+param([switch]$SkipBuild, [switch]$InfrastructureOnly)
 
 $ErrorActionPreference = "Stop"
 # PowerShell 默认不会把 kubectl/docker 等原生命令的非零退出码当作异常。
@@ -14,7 +14,11 @@ if (-not (Test-Path $kindExe)) { throw "kind executable not found; set KIND_EXE 
 if (-not (& $kindExe get clusters | Select-String -SimpleMatch "sre-lab")) {
     & $kindExe create cluster --name sre-lab --config (Join-Path $k8s "kind-config.yaml")
 }
-if (-not $SkipBuild) { & (Join-Path $PSScriptRoot "build-images.ps1") -Service all -Version both }
+if (-not $InfrastructureOnly) {
+    . (Join-Path $PSScriptRoot 'gitops-guard.ps1')
+    Assert-LabNotGitOpsManaged
+}
+if (-not $SkipBuild -and -not $InfrastructureOnly) { & (Join-Path $PSScriptRoot "build-images.ps1") -Service all -Version both }
 
 kubectl apply -f (Join-Path $k8s "namespace\namespace.yaml")
 # ConfigMaps are generated from source files so SQL and observability configuration have one canonical copy.
@@ -65,8 +69,10 @@ foreach ($deployment in @("prometheus", "elasticsearch", "logstash", "kibana", "
 kubectl -n sre-lab rollout restart daemonset/filebeat
 kubectl -n sre-lab rollout status daemonset/filebeat --timeout=240s
 
-Get-ChildItem (Join-Path $k8s "services") -Recurse -Filter deployment.yaml | ForEach-Object { kubectl apply -f $_.FullName }
-kubectl apply -f (Join-Path $k8s "scenarios\order-canary-bad.yaml")
-Get-ChildItem (Join-Path $k8s "services") -Directory | ForEach-Object { kubectl -n sre-lab rollout status "deployment/$($_.Name)" --timeout=240s }
+if (-not $InfrastructureOnly) {
+    Get-ChildItem (Join-Path $k8s "services") -Recurse -Filter deployment.yaml | ForEach-Object { kubectl apply -f $_.FullName }
+    kubectl apply -f (Join-Path $k8s "scenarios\order-canary-bad.yaml")
+    Get-ChildItem (Join-Path $k8s "services") -Directory | ForEach-Object { kubectl -n sre-lab rollout status "deployment/$($_.Name)" --timeout=240s }
+}
 
 kubectl get deployments,pods,services -n sre-lab -o wide
