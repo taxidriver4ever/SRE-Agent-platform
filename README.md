@@ -4,6 +4,10 @@
 
 > 当前定位是本地开发、教学与评测平台。Agent 只执行读取和分析，不自动修改集群、数据库或业务仓库。
 
+当前架构使用 **MySQL + Elasticsearch / Logstash / Kibana + Prometheus + SkyWalking**。MySQL 可靠保存任务、Checkpoint、Evidence、原始历史与 Short Context；ES 负责日志和历史案例检索；Logstash 清洗日志与事件。History Top-K 只提供有界历史参考，检索失败不影响核心诊断，历史案例不能替代当前 Evidence Gate。
+
+根目录 `docker compose up -d --build` 启动开发栈。已有 Kind 用户继续使用 Infra 部署脚本，两种环境端口有重叠。最新架构图、逐文件说明、History 调用链、Mapping、同步重试、重建与验证方法见 [History Search 架构报告](docs/history-search-architecture.md)。[上一阶段观测迁移记录](docs/observability-migration.md) 和下方旧评测保留为历史基线。
+
 ## 目录
 
 - [推荐阅读路径](#推荐阅读路径)
@@ -57,7 +61,7 @@ README 同时服务于体验者、开发者和运维者，不需要第一次就�
 - 前置 Intent Router 使用 Structured Output 将请求限定为具体故障、整体巡检、需要澄清或非运维问题；合法意图确认前不调用任何诊断工具。
 - 统一 LLM Gateway，默认使用 vLLM，并支持 Ollama 回滚、OpenAI、Claude 和 DeepSeek，业务 Agent 不依赖厂商 SDK。
 - Agent 调用层使用 LangChain Core 管理 Prompt、模型和结构化输出，通过官方 MCP Adapter 调用只读工具；业务诊断阶段、Evidence Gate 与 MySQL 任务恢复独立保留。详见[架构分析与迁移说明](docs/langchain-mcp-refactor.md)。
-- Prometheus、Loki、Tempo、MySQL、Kubernetes 和 Git 多源证据交叉验证。
+- Prometheus、Elasticsearch、SkyWalking、MySQL、Kubernetes 和 Git 多源证据交叉验证。
 - MySQL 持久化会话；上下文达到约 80% 预算后生成短 Summary、State、Evidence Reference，再让旧消息退出 Active Context，原始消息永久保留。
 - Code State 只保存模块、symbol、路径、行号和 commit SHA 等导航信息；源码始终按 Git 版本精确读取。
 - 10 个可重复的真实故障场景，覆盖慢 SQL、连接池耗尽、依赖超时、CPU、OOM、重试风暴和发布异常。
@@ -132,7 +136,7 @@ flowchart LR
     A --> PL["Evidence Planner"]
     PL --> T["只读 MCP 工具"]
     T --> K["Kind / Kubernetes"]
-    T --> OBS["Prometheus / Loki / Tempo"]
+    T --> OBS["Prometheus / Elasticsearch / SkyWalking"]
     T --> DB[("Lab MySQL :13307")]
     T --> R["Git 仓库与精确 commit"]
     T --> E[("Evidence Chain")]
@@ -305,7 +309,7 @@ FastAPI graceful shutdown 会取消本进程 Task，但不会把业务状态改�
 
 ### Crash Window 的准确语义
 
-平台不宣称真实外部 Tool Exactly Once。Tool 全部是 Kubernetes/Prometheus/Loki/Tempo/MySQL/Git 只读查询：如果外部调用成功后、MySQL 提交前进程崩溃，新 Executor 无法判断调用是否发生，允许再次读取。因此语义是：
+平台不宣称真实外部 Tool Exactly Once。Tool 全部是 Kubernetes/Prometheus/Elasticsearch/SkyWalking/MySQL/Git 只读查询：如果外部调用成功后、MySQL 提交前进程崩溃，新 Executor 无法判断调用是否发生，允许再次读取。因此语义是：
 
 ```text
 External read-only Tool = at-least-once in crash window
@@ -316,7 +320,7 @@ Logical persisted Step / Evidence / Event = idempotent, exactly-once effect
 
 ## Diagnosis Runtime Self-Check
 
-`GET /api/system/self-check?level=1|2|3` 是必须登录的只读 Runtime 自检。它只读取 Application MySQL、当前 Executor 状态和配置，不调用 LLM、Kubernetes、Prometheus、Loki、Tempo、Git 或 Lab MySQL，不消耗 Token，也不会创建或修改 Diagnosis。普通 `/health` 仍只返回 `{"status":"ok"}`，供 liveness probe 使用。
+`GET /api/system/self-check?level=1|2|3` 是必须登录的只读 Runtime 自检。它只读取 Application MySQL、当前 Executor 状态和配置，不调用 LLM、Kubernetes、Prometheus、Elasticsearch、SkyWalking、Git 或 Lab MySQL，不消耗 Token，也不会创建或修改 Diagnosis。普通 `/health` 仍只返回 `{"status":"ok"}`，供 liveness probe 使用。
 
 | Level | 检查范围 | 主要内容 |
 | --- | --- | --- |
@@ -472,7 +476,7 @@ Incident
 
 ## 意图识别与工作流分流
 
-所有聊天请求先经过只使用 LLM 的 Intent Router。分类结果必须通过 Structured Output 和 Pydantic Schema 校验；在分类成功以前，系统不会调用 Kubernetes、Prometheus、Loki、Tempo、MySQL 或 Git 工具。
+所有聊天请求先经过只使用 LLM 的 Intent Router。分类结果必须通过 Structured Output 和 Pydantic Schema 校验；在分类成功以前，系统不会调用 Kubernetes、Prometheus、Elasticsearch、SkyWalking、MySQL 或 Git 工具。
 
 ```json
 {
@@ -552,7 +556,7 @@ SRE-Agent-platform/
 | vLLM | `http://127.0.0.1:18000` |
 | Ollama（迁移期回滚） | `http://127.0.0.1:11434` |
 | 实验服务 | `18080`～`18083`；其余服务在集群内访问 |
-| Prometheus / Loki / Tempo | `19090` / `13100` / `13200` |
+| Prometheus / Elasticsearch / SkyWalking | `19090` / `19200` / `12800` |
 | Lab MySQL / Agent MySQL | `13307` / `13308` |
 
 ## 快速开始
@@ -566,7 +570,7 @@ Docker Desktop
 └── Kind SRE Lab
     ├── 六个 Broken Services
     ├── Lab MySQL :13307
-    └── Prometheus / Loki / Tempo
+    └── Prometheus / Elasticsearch / SkyWalking
 
 Gateway :8000
 └── Agent :8001
@@ -813,8 +817,8 @@ docker run --rm `
 | `AGENT_MAX_ITERATIONS` | `8` | 通用 ReAct API 最大轮数 |
 | `KUBERNETES_NAMESPACE` | `sre-lab` | 允许读取的实验 Namespace |
 | `PROMETHEUS_BASE_URL` | `http://127.0.0.1:19090` | Metrics 数据源 |
-| `LOKI_BASE_URL` | `http://127.0.0.1:13100` | Logs 数据源 |
-| `TEMPO_BASE_URL` | `http://127.0.0.1:13200` | Trace 数据源 |
+| `ELASTICSEARCH_URL` | `http://127.0.0.1:19200` | Elasticsearch Logs 数据源 |
+| `SKYWALKING_OAP_URL` | `http://127.0.0.1:12800` | SkyWalking GraphQL 数据源 |
 | `MYSQL_HOST` / `MYSQL_PORT` | `127.0.0.1:13307` | 实验业务 MySQL，只读 |
 | `APPLICATION_MYSQL_HOST` / `PORT` | `127.0.0.1:13308` | Agent 与 Gateway 的应用 MySQL |
 | `SRE_INITIAL_USERNAME` | 无默认值 | 前端初始登录用户名，必填 |
@@ -835,7 +839,7 @@ docker run --rm `
 | `SRE_REPOSITORY_PATH` | `D:\SRE-Agent-platform\sre-broken-system` | 本地只读业务仓库根目录 |
 | `SRE_REPOSITORY_CACHE_PATH` | `.repository-cache` | 远程只读仓库缓存目录 |
 | `PROMETHEUS_BEARER_TOKEN` | 空 | 可选，只由服务端注入 Metrics 请求头 |
-| `LOKI_BEARER_TOKEN` | 空 | 可选，只由服务端注入 Logs 请求头 |
+| `ELASTICSEARCH_PASSWORD` | 空 | 可选，与 ELASTICSEARCH_USERNAME 配合配置只读账号 |
 | `SRE_VALIDATION_WORKSPACE_ROOT` | 系统临时目录 | Validation 临时工作区父目录；API 不可覆盖 |
 | `SRE_VALIDATION_ARTIFACT_ROOT` | 系统临时目录 | 完整 stdout/stderr/test JSON 的服务端保存位置 |
 | `SRE_VALIDATION_MAVEN_IMAGE` | `maven:3.9.9-eclipse-temurin-21` | Maven 固定 Runner 镜像 |
@@ -906,11 +910,11 @@ Invoke-RestMethod http://127.0.0.1:11434/api/tags
 # 4. SRE Lab 与可观测性
 kubectl --context kind-sre-lab -n sre-lab get pods
 Invoke-RestMethod http://127.0.0.1:19090/-/healthy
-Invoke-RestMethod http://127.0.0.1:13100/ready
-Invoke-RestMethod http://127.0.0.1:13200/ready
+Invoke-RestMethod http://127.0.0.1:19200/ready
+Invoke-RestMethod http://127.0.0.1:12800/ready
 ```
 
-Kubernetes 输出中业务服务、MySQL、Alloy、Prometheus、Loki、Tempo 和 OTel Collector 应为 `Running` 且 `READY` 列为 `1/1`。刚执行故障场景时，某些 Pod Restart 或短暂 NotReady 是预期现象；执行 `reset-lab.ps1` 后应重新恢复。
+Kubernetes 输出中业务服务、MySQL、Filebeat、Prometheus、Elasticsearch、SkyWalking 和 OTel Collector 应为 `Running` 且 `READY` 列为 `1/1`。刚执行故障场景时，某些 Pod Restart 或短暂 NotReady 是预期现象；执行 `reset-lab.ps1` 后应重新恢复。
 
 随后验证认证与模型链路：
 
@@ -1486,7 +1490,7 @@ flowchart TD
     EV --> RC["Evidence-grounded Root Cause"]
 ```
 
-这里的核心是同一测试套件、同一环境、不同不可变 Commit。Validation 与 Runtime Diagnosis 共用 Evidence 思想，但不强制 CI 环境部署 Kubernetes、Prometheus、Loki 或 Tempo；运行时证据只有在对应测试环境确实存在时才作为补充。
+这里的核心是同一测试套件、同一环境、不同不可变 Commit。Validation 与 Runtime Diagnosis 共用 Evidence 思想，但不强制 CI 环境部署 Kubernetes、Prometheus、Elasticsearch 或 SkyWalking；运行时证据只有在对应测试环境确实存在时才作为补充。
 
 ### 状态、结果与失败语义
 
@@ -1805,7 +1809,7 @@ Workspace 执行后删除；完整 stdout/stderr/test JSON 作为 Artifact 保�
 
 本仓库为 `sre-agent`、`sre-gateway` 和 `sre-agent-frontend` 提供了一条轻量但真实的 CI/CD 链路。开发方式仍然是原有的 Docker Compose、本地 Python 和 Vite；Kubernetes 只用于发布演示，两种模式互不替代。
 
-现有故障实验环境已经使用名为 `sre-lab` 的 Kind 集群，因此发布方案继续复用 Kind，不额外引入 k3d。CI/CD 不负责部署或改造 vLLM、Ollama、应用 MySQL、Prometheus、Loki、Tempo 和 `sre-broken-system`。
+现有故障实验环境已经使用名为 `sre-lab` 的 Kind 集群，因此发布方案继续复用 Kind，不额外引入 k3d。CI/CD 不负责部署或改造 vLLM、Ollama、应用 MySQL、Prometheus、Elasticsearch、SkyWalking 和 `sre-broken-system`。
 
 ### 架构与安全边界
 
@@ -1906,14 +1910,14 @@ GHCR 登录使用仓库自带的 `GITHUB_TOKEN` 与最小权限：Build Job 只�
 ```text
 sre Namespace
   Agent -------> Gateway.sre.svc.cluster.local
-    |----------> Prometheus/Loki/Tempo/MySQL.sre-lab.svc.cluster.local
+    |----------> Prometheus/Elasticsearch/SkyWalking/MySQL.sre-lab.svc.cluster.local
     |----------> 应用 MySQL: host.docker.internal:13308
   Gateway -----> vLLM:  host.docker.internal:18000
     |----------> Ollama: host.docker.internal:11434
     |----------> 应用 MySQL: host.docker.internal:13308
 ```
 
-Prometheus、Loki、Tempo 和故障实验 MySQL 已经属于现有 `sre-lab` Kind 环境，所以使用集群 DNS；Compose 中的应用 MySQL、vLLM 和 Ollama 仍在 Docker Desktop/宿主机，通过 `host.docker.internal` 访问。没有写死个人机器 IP。若不是 Windows + Docker Desktop，请先确认 Kind Node 内能够解析该名称，再自行提供等价的主机网关映射。
+Prometheus、Elasticsearch、SkyWalking 和故障实验 MySQL 已经属于现有 `sre-lab` Kind 环境，所以使用集群 DNS；Compose 中的应用 MySQL、vLLM 和 Ollama 仍在 Docker Desktop/宿主机，通过 `host.docker.internal` 访问。没有写死个人机器 IP。若不是 Windows + Docker Desktop，请先确认 Kind Node 内能够解析该名称，再自行提供等价的主机网关映射。
 
 ### 第一次初始化
 
@@ -2119,7 +2123,7 @@ Agent 的 `GATEWAY_API_KEY` 不是登录 Token，也不是 `VLLM_API_KEY`。重�
 
 ### 8. 服务卡片有数据，但 Pod、Metrics 或 Trace 为空
 
-Service Catalog 描述的是可信服务拓扑，Pod 和可观测数据来自实际运行环境。检查 Kind 集群、端口转发、Prometheus/Loki/Tempo 以及 `sre-lab` Namespace。数据源为空时 Workflow 会记录 Evidence 缺失，并尝试其他来源，而不是伪造结果。
+Service Catalog 描述的是可信服务拓扑，Pod 和可观测数据来自实际运行环境。检查 Kind 集群、端口转发、Prometheus/Elasticsearch/SkyWalking 以及 `sre-lab` Namespace。数据源为空时 Workflow 会记录 Evidence 缺失，并尝试其他来源，而不是伪造结果。
 
 ### 9. 事件诊断一直要求补充信息
 

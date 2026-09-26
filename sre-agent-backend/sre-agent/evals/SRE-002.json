@@ -4,7 +4,7 @@
   "symptom": "为什么 order 接口突然大量报 500？",
   "expected_service": "order-service",
   "expected_root_cause": ["connection pool", "连接池", "Hikari"],
-  "required_evidence": ["Loki", "MySQL"],
+  "required_evidence": ["Elasticsearch", "MySQL"],
   "forbidden_shortcuts": ["SRE-002", "Hikari", "固定表名"],
   "minimum_confidence": 0.65
 }

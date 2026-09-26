@@ -52,7 +52,7 @@ ALTER TABLE diagnosis_investigation_steps COMMENT = 'Diagnosis Investigation Tim
 CREATE TABLE IF NOT EXISTS diagnosis_evidence (
     diagnosis_id CHAR(32) NOT NULL COMMENT '所属诊断标识',
     id VARCHAR(64) NOT NULL COMMENT 'Evidence 唯一标识，可复用 Conversation Tool Result ID',
-    source_type VARCHAR(40) NOT NULL COMMENT 'KUBERNETES、PROMETHEUS、LOKI、TEMPO、MYSQL、GIT 或 CODE',
+    source_type VARCHAR(40) NOT NULL COMMENT 'KUBERNETES、PROMETHEUS、ELASTICSEARCH、SKYWALKING、MYSQL、GIT 或 CODE',
     source_name VARCHAR(120) NOT NULL COMMENT '具体 Tool 或数据源名称',
     resource_type VARCHAR(40) NULL COMMENT 'SERVICE、POD、DATABASE 等资源类型',
     resource_id VARCHAR(255) NULL COMMENT '证据关联资源名称',

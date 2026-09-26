@@ -62,7 +62,7 @@ def evidence_driven_decision(state: DiagnosisState) -> PlannerDecision | None:
         return PlannerDecision(action="tool", tool_name="query_slow_queries",
             arguments={"time_range_minutes": state.time_range_minutes, "limit": 10},
             title="检查近期数据库慢查询", reason="延迟或错误基线需要排除数据库等待",
-            parent_evidence_ids=parents(lambda item: item.source in {"Prometheus", "Loki", "Tempo"}))
+            parent_evidence_ids=parents(lambda item: item.source in {"Prometheus", "Elasticsearch", "SkyWalking"}))
 
     for sql in dict.fromkeys(sql_statements):
         if not is_explainable_sql(sql):
@@ -98,7 +98,7 @@ def evidence_driven_decision(state: DiagnosisState) -> PlannerDecision | None:
     if state.symptom in {"latency", "dependency_timeout"} and not called("query_trace"):
         return PlannerDecision(action="tool", tool_name="query_trace", arguments={"service": state.service, "limit": 10},
             title="搜索目标服务近期 Trace", reason="需要把请求耗时归属到具体 Span",
-            parent_evidence_ids=parents(lambda item: item.source in {"Prometheus", "Loki"}))
+            parent_evidence_ids=parents(lambda item: item.source in {"Prometheus", "Elasticsearch"}))
 
     downstream = next((service for service in dict.fromkeys(discovered_services) if service != state.service), None)
     downstream_arguments = {"service": downstream, "time_range_minutes": state.time_range_minutes, "limit": 20} if downstream else None

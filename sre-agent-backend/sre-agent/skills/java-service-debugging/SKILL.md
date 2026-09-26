@@ -16,8 +16,8 @@ description: Diagnose Java service incidents involving HikariCP, GC, JVM heap, O
 ## 推荐诊断顺序
 
 1. 查询 HTTP 延迟、错误率、JVM heap、GC pause 和 process CPU。
-2. 用 Loki 检索 Hikari timeout、SQLTimeout、OOM、RejectedExecution 和 timeout。
-3. 用 Tempo 比较入口 Span、JDBC Span 与 HTTP client Span。
+2. 用 Elasticsearch 检索 Hikari timeout、SQLTimeout、OOM、RejectedExecution 和 timeout。
+3. 用 SkyWalking 比较入口 Span、JDBC Span 与 HTTP client Span。
 4. 若 JDBC 慢，转入 database-troubleshooting；若 HTTP client 慢，转入 dependency-timeout。
 5. 查询运行镜像和 Git SHA，再读取对应提交源码。
 

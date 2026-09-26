@@ -120,12 +120,12 @@ def test_planner_expands_new_trace_search_after_historical_slowest_trace_was_rea
     state = DiagnosisState(query="排查重试风暴", service="order-service", symptom="latency")
     state.evidence = [
         Evidence(
-            source="Tempo", tool_name="query_trace", title="订单 Trace 搜索", detail="search",
+            source="SkyWalking", tool_name="query_trace", title="订单 Trace 搜索", detail="search",
             timestamp=now, evidence_id="ev_order_search",
             structured_data={"trace_candidates": [{"trace_id": "a" * 32, "name": "POST /orders", "duration_ms": 9000}]},
         ),
         Evidence(
-            source="Tempo", tool_name="query_trace", title="库存 Trace 搜索", detail="search",
+            source="SkyWalking", tool_name="query_trace", title="库存 Trace 搜索", detail="search",
             timestamp=now, evidence_id="ev_inventory_search",
             structured_data={"trace_candidates": [{"trace_id": "b" * 32, "name": "GET /inventory", "duration_ms": 2000}]},
         ),
@@ -184,7 +184,7 @@ def test_evidence_gate_keeps_traceable_confirmed_finding():
     state = DiagnosisState(query="warehouse-v2 变慢", service="warehouse-v2")
     state.evidence = [
         Evidence(
-            source="Tempo",
+            source="SkyWalking",
             tool_name="query_trace",
             title="慢 Trace",
             detail="database span 1800ms",
@@ -344,7 +344,7 @@ def test_structured_slow_query_and_full_scan_form_deterministic_synthesis():
     now = datetime.now(timezone.utc)
     state = DiagnosisState(query="某接口变慢", service="unknown-service", symptom="latency")
     state.evidence = [
-        Evidence(source="Tempo", tool_name="query_trace", title="Trace", detail="db span", timestamp=now,
+        Evidence(source="SkyWalking", tool_name="query_trace", title="Trace", detail="db span", timestamp=now,
                  evidence_id="ev_trace", direct_evidence=True, supports_conclusion=True),
         Evidence(source="MySQL", tool_name="query_slow_queries", title="慢查询", detail="slow", timestamp=now,
                  evidence_id="ev_slow", direct_evidence=True, supports_conclusion=True,
@@ -366,7 +366,7 @@ def test_connection_pool_logs_and_mysql_evidence_form_deterministic_synthesis():
     now = datetime.now(timezone.utc)
     state = DiagnosisState(query="接口大量 500", service="unknown-service", symptom="5xx")
     state.evidence = [
-        Evidence(source="Loki", tool_name="query_logs", title="错误日志",
+        Evidence(source="Elasticsearch", tool_name="query_logs", title="错误日志",
                  detail="CannotGetJdbcConnectionException: Failed to obtain JDBC Connection",
                  timestamp=now, evidence_id="ev_log", direct_evidence=True, supports_conclusion=True),
         Evidence(source="MySQL", tool_name="query_slow_queries", title="数据库运行记录",
@@ -387,7 +387,7 @@ def test_release_diff_and_full_scan_form_regression_synthesis_before_incidental_
     state.evidence = [
         Evidence(source="Kubernetes", tool_name="list_pods", title="Pods", detail="commit=abc1234",
                  timestamp=now, evidence_id="ev_pod", direct_evidence=True),
-        Evidence(source="Loki", tool_name="query_logs", title="Logs", detail="Hikari warning",
+        Evidence(source="Elasticsearch", tool_name="query_logs", title="Logs", detail="Hikari warning",
                  timestamp=now, evidence_id="ev_log", direct_evidence=True),
         Evidence(source="MySQL", tool_name="query_slow_queries", title="Slow", detail="rows",
                  timestamp=now, evidence_id="ev_slow", direct_evidence=True,

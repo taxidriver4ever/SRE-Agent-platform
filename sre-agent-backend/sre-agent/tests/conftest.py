@@ -8,4 +8,5 @@ from tests.mysql_support import mysql_test_database
 @pytest.fixture(autouse=True)
 def isolated_mysql_database(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("APPLICATION_MYSQL_DATABASE", "sre_agent_test")
+    monkeypatch.setenv("HISTORY_SEARCH_ENABLED", "false")
     mysql_test_database()

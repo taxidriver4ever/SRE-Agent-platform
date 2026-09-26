@@ -12,6 +12,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
 from app.mcp_servers.common import bounded
+from app.mcp_servers.observability.adapters import ElasticsearchTool, SkyWalkingTool
 
 _SAFE_LABEL = re.compile(r"^[a-zA-Z0-9_.:/-]{1,160}$")
 _FORBIDDEN_SQL = re.compile(
@@ -21,7 +22,7 @@ _FORBIDDEN_SQL = re.compile(
 
 
 class HttpObservabilityBackend:
-    """FastMCP 工具背后的 Prometheus、Loki、Tempo 只读执行器。"""
+    """FastMCP 工具背后的 Prometheus、Elasticsearch、SkyWalking 只读执行器。"""
 
     def __init__(
         self,
@@ -58,10 +59,6 @@ class HttpObservabilityBackend:
                         raise ToolError("get_service_health 必须提供 service")
                     query = f'up{{service="{service}"}}'
                     response = await client.get(f"{self.endpoints['prometheus']}/api/v1/query", params={"query": query}, headers=self._headers("prometheus"))
-                elif self.name == "query_logs":
-                    response = await self._query_logs(client, arguments, service, minutes, limit, now)
-                elif self.name == "query_trace":
-                    response = await self._query_trace(client, arguments, service, limit)
                 else:
                     raise ToolError(f"未审核的可观测操作: {self.name}")
                 response.raise_for_status()
@@ -78,57 +75,6 @@ class HttpObservabilityBackend:
         token = self.bearer_tokens.get(provider)
         return {"Authorization": f"Bearer {token}"} if token else {}
 
-    async def _query_logs(
-        self,
-        client: httpx.AsyncClient,
-        arguments: dict[str, Any],
-        service: str,
-        minutes: int,
-        limit: int,
-        now: datetime,
-    ) -> httpx.Response:
-        """从结构化过滤条件生成受控 LogQL，而不是接受任意写入端点。"""
-        selector = f'{{service_name="{service}"}}' if service else '{namespace="sre-lab"}'
-        level = str(arguments.get("level") or "").lower()
-        keyword = str(arguments.get("keyword") or "")[:120]
-        if level:
-            if not _SAFE_LABEL.fullmatch(level):
-                raise ToolError("level 含有不允许的字符")
-            selector += f' |= "\\\"level\\\":\\\"{level.upper()}\\\""'
-        if keyword:
-            # 双引号和反斜线转义，确保 keyword 只作为日志正文过滤值。
-            escaped = keyword.replace("\\", "\\\\").replace('"', '\\"')
-            selector += f' |= "{escaped}"'
-        return await client.get(
-            f"{self.endpoints['loki']}/loki/api/v1/query_range",
-            params={
-                "query": selector,
-                "start": str(int((now - timedelta(minutes=minutes)).timestamp() * 1_000_000_000)),
-                "end": str(int(now.timestamp() * 1_000_000_000)),
-                "limit": limit,
-                "direction": "backward",
-            }, headers=self._headers("loki"),
-        )
-
-    async def _query_trace(
-        self,
-        client: httpx.AsyncClient,
-        arguments: dict[str, Any],
-        service: str,
-        limit: int,
-    ) -> httpx.Response:
-        """优先按 trace_id 精确取 Trace，否则按运行服务名搜索最近 Trace。"""
-        trace_id = str(arguments.get("trace_id") or "")
-        if trace_id:
-            if not re.fullmatch(r"[0-9a-fA-F]{16,32}", trace_id):
-                raise ToolError("trace_id 必须是 16~32 位十六进制字符串")
-            return await client.get(f"{self.endpoints['tempo']}/api/traces/{trace_id}")
-        if not service:
-            raise ToolError("query_trace 必须提供 service 或 trace_id")
-        return await client.get(
-            f"{self.endpoints['tempo']}/api/search",
-            params={"tags": f"service.name={service}", "limit": limit},
-        )
 
 
 class MySQLReadBackend:
@@ -211,21 +157,18 @@ class MySQLReadBackend:
 
 
 def register_observability_tools(mcp: FastMCP, settings: Any) -> None:
-    """注册 Prometheus、Loki、Tempo 和 MySQL FastMCP 只读工具。"""
+    """注册 Prometheus、Elasticsearch、SkyWalking 和 MySQL FastMCP 只读工具。"""
     endpoints = {
         "prometheus": settings.prometheus_base_url,
-        "loki": settings.loki_base_url,
-        "tempo": settings.tempo_base_url,
     }
     bearer_tokens = {
         "prometheus": settings.prometheus_bearer_token,
-        "loki": settings.loki_bearer_token,
     }
     db = {
         "host": settings.mysql_host, "port": settings.mysql_port, "user": settings.mysql_user,
         "password": settings.mysql_password, "database": settings.mysql_database,
     }
-    http_names = ["query_metrics", "query_logs", "query_trace", "get_service_health"]
+    http_names = ["query_metrics", "get_service_health"]
     mysql_names = ["query_slow_queries", "query_sql_digest", "explain_sql"]
     for operation in http_names:
         handler = HttpObservabilityBackend(
@@ -243,7 +186,7 @@ def register_observability_tools(mcp: FastMCP, settings: Any) -> None:
                 limit: int = 20,
                 trace_id: str | None = None,
             ) -> dict[str, Any]:
-                """执行受约束的 Prometheus、Loki 或 Tempo 查询。"""
+                """执行受约束的 Prometheus Metrics 查询。"""
                 return await current_handler.execute({
                     "query": query,
                     "service": service,
@@ -261,6 +204,38 @@ def register_observability_tools(mcp: FastMCP, settings: Any) -> None:
             annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True},
             tags={"observability", "readonly"},
         )(create_http_tool(handler))
+
+    logs = ElasticsearchTool(settings.elasticsearch_url, settings.tool_timeout_seconds,
+                             settings.tool_output_limit, settings.elasticsearch_index_pattern,
+                             settings.elasticsearch_username, settings.elasticsearch_password)
+
+    async def search_logs(service_name: str | None = None, start_time: str | None = None,
+                          end_time: str | None = None, level: str | None = None,
+                          keyword: str | None = None, trace_id: str | None = None,
+                          exception_type: str | None = None, limit: int = 100,
+                          service: str | None = None, time_range_minutes: int = 30) -> dict[str, Any]:
+        return await logs.execute(locals())
+
+    annotations = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+    for name in ("query_logs", "search_logs"):
+        mcp.tool(name=name, description="Elasticsearch structured log search; timezone-aware ISO timestamps, default last 30 minutes, max 24h/100 rows; no DSL/index parameters",
+                 annotations=annotations, tags={"elasticsearch", "readonly"})(search_logs)
+
+    for operation in ("query_trace", "search_traces", "get_trace", "get_service_metrics"):
+        adapter = SkyWalkingTool(operation, settings.skywalking_oap_url, settings.tool_timeout_seconds,
+                                 settings.tool_output_limit, settings.skywalking_zipkin_url,
+                                 settings.skywalking_bearer_token)
+        def create_trace_tool(current: SkyWalkingTool):
+            async def trace_read(service_name: str | None = None, start_time: str | None = None,
+                                 end_time: str | None = None, min_duration_ms: int | None = None,
+                                 error_only: bool = False, limit: int = 20, trace_id: str | None = None,
+                                 service: str | None = None, time_range_minutes: int = 30) -> dict[str, Any]:
+                arguments = dict(locals())
+                arguments.pop("current", None)
+                return await current.execute(arguments)
+            return trace_read
+        mcp.tool(name=operation, description=f"SkyWalking read-only {operation}: trace search, exact ID details or native APM; ISO timestamps, max 24h/100 results",
+                 annotations=annotations, tags={"skywalking", "readonly"})(create_trace_tool(adapter))
 
     for operation in mysql_names:
         handler = MySQLReadBackend(

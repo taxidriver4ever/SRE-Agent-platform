@@ -20,10 +20,10 @@ kubectl apply -f (Join-Path $k8s "namespace\namespace.yaml")
 # ConfigMaps are generated from source files so SQL and observability configuration have one canonical copy.
 $mysqlSql = Join-Path $infraRoot "mysql\init\001-schema.sql"
 $prometheusConfig = Join-Path $infraRoot "observability\prometheus.yml"
-$lokiConfig = Join-Path $infraRoot "observability\loki.yaml"
-$tempoConfig = Join-Path $infraRoot "observability\tempo.yaml"
+$filebeatConfig = Join-Path $infraRoot "observability\filebeat-kubernetes.yml"
+$templateConfig = Join-Path $infraRoot "observability\log-template.json"
+$logstashConfig = Join-Path $infraRoot "observability\logstash"
 $otelConfig = Join-Path $infraRoot "observability\otel-collector.yaml"
-$alloyConfig = Join-Path $infraRoot "observability\alloy.alloy"
 kubectl -n sre-lab create configmap mysql-init "--from-file=001-schema.sql=$mysqlSql" --dry-run=client -o yaml | kubectl apply -f -
 # MySQL 清单只引用 Secret，不在 Git 中保存密码。全新 Kind 集群没有该对象时，
 # 优先使用显式环境变量；本地未配置时生成随机值。已有 Secret 必须复用，否则
@@ -49,22 +49,21 @@ Get-Content -LiteralPath $mysqlSql -Raw |
 if ($LASTEXITCODE -ne 0) { throw "Failed to apply the idempotent MySQL schema and synthetic dataset" }
 
 kubectl -n sre-lab create configmap prometheus-config "--from-file=prometheus.yml=$prometheusConfig" --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n sre-lab create configmap loki-config "--from-file=loki.yaml=$lokiConfig" --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n sre-lab create configmap tempo-config "--from-file=tempo.yaml=$tempoConfig" --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n sre-lab create configmap filebeat-config "--from-file=filebeat.yml=$filebeatConfig" --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n sre-lab create configmap logstash-config "--from-file=pipeline.conf=$logstashConfig\pipeline.conf" "--from-file=normalize.rb=$logstashConfig\normalize.rb" "--from-file=logstash.yml=$logstashConfig\logstash.yml" --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n sre-lab create configmap logstash-templates "--from-file=log-template.json=$templateConfig" "--from-file=history-template.json=$logstashConfig\history-template.json" "--from-file=event-template.json=$logstashConfig\event-template.json" --dry-run=client -o yaml | kubectl apply -f -
 # 名称必须与 stack.yaml 的 volume.configMap.name 完全一致；否则 Pod 会继续挂载旧占位配置。
 kubectl -n sre-lab create configmap otel-collector-config "--from-file=otel-collector.yaml=$otelConfig" --dry-run=client -o yaml | kubectl apply -f -
-# Alloy 启动参数读取 /etc/alloy/config.alloy，因此 ConfigMap 的 key 必须命名为 config.alloy。
-kubectl -n sre-lab create configmap alloy-config "--from-file=config.alloy=$alloyConfig" --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -f (Join-Path $k8s "observability\stack.yaml")
 
-# ConfigMap 挂载文件最终会更新，但 Tempo、OTel Collector 等进程不会自动重读全部配置。
+# ConfigMap 挂载文件最终会更新，但 SkyWalking、OTel Collector 等进程不会自动重读全部配置。
 # 显式滚动这些无状态观测工作负载，保证运行中的配置与仓库唯一配置源完全一致。
-foreach ($deployment in @("prometheus", "loki", "tempo", "otel-collector")) {
+foreach ($deployment in @("prometheus", "elasticsearch", "logstash", "kibana", "skywalking-oap", "skywalking-ui", "otel-collector")) {
     kubectl -n sre-lab rollout restart "deployment/$deployment"
     kubectl -n sre-lab rollout status "deployment/$deployment" --timeout=240s
 }
-kubectl -n sre-lab rollout restart daemonset/alloy
-kubectl -n sre-lab rollout status daemonset/alloy --timeout=240s
+kubectl -n sre-lab rollout restart daemonset/filebeat
+kubectl -n sre-lab rollout status daemonset/filebeat --timeout=240s
 
 Get-ChildItem (Join-Path $k8s "services") -Recurse -Filter deployment.yaml | ForEach-Object { kubectl apply -f $_.FullName }
 kubectl apply -f (Join-Path $k8s "scenarios\order-canary-bad.yaml")

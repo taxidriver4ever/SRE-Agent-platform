@@ -1,5 +1,11 @@
 # SRE Agent Backend
 
+MySQL is the source of truth for diagnosis tasks and historical records. Elasticsearch acts as a search index for logs and historical diagnosis cases. History retrieval failures do not affect the core diagnosis workflow.
+
+新增 Logstash 统一清洗、MySQL History 快照与幂等同步、BM25 Top-K 历史 Context。最新职责、架构图与验证方法见 [History Search 架构](../../docs/history-search-architecture.md)。
+
+可观测性现已使用 Prometheus（Metrics）、Elasticsearch（Logs）和 SkyWalking（Trace/APM）。`query_logs` / `query_trace` 保留工作流接口，新增 `search_logs` / `search_traces` / `get_trace` / `get_service_metrics`。架构、环境变量、只读边界与部署步骤见[迁移报告](../../docs/observability-migration.md)。
+
 单 Agent 后端通过统一 `GatewayLLM` 连接 `sre-gateway → Docker vLLM`，实际模型由请求数据指定；迁移期仍可显式切回 Ollama。项目自有工具使用 FastMCP 3.4.5；Kubernetes 改为维护活跃的 `containers/kubernetes-mcp-server`，以只读、单集群、core 工具集模式直接调用 Kubernetes API。
 
 ## 模块
@@ -20,7 +26,7 @@ Evidence Gate 和 MySQL Task/Lease/CAS/Checkpoint 继续由原模块负责。
 - `app/audit/`：按 user/project/task 记录的 MySQL Tool Audit Log。
 - `app/sandbox/`：一次性 Task Workspace 与未来 CodeExecuteTool 的 Docker 隔离层。
 - `app/agent/`：通用 JSON-ReAct Runtime，不再保留 calculator/current_time 等凑框架工具。
-- `app/mcp_servers/`：项目自有 FastMCP Server，只注册 Prometheus/Loki/Tempo/MySQL 与 Git 只读工具。
+- `app/mcp_servers/`：项目自有 FastMCP Server，只注册 Prometheus/Elasticsearch/SkyWalking/MySQL 与 Git 只读工具。
 - `app/mcp_clients/`：FastMCP 官方 Client 聚合层，以及第三方 Kubernetes MCP 的只读语义适配；Client 不放在 tools 中。
 - `app/repositories/`：从 K8s `repository-url` 注解建立模块→远程仓库绑定，并按运行 SHA 创建浅克隆缓存。
 - `app/auth/`：PBKDF2 密码登录、随机 Bearer Token、数据库验证与注销撤销。
@@ -44,8 +50,13 @@ GATEWAY_API_KEY=gw_sk_...                 # 只保存 Gateway Token，不是 Pro
 GATEWAY_MODEL=vllm/qwen3-4b
 GATEWAY_MAX_TOKENS=512
 PROMETHEUS_BASE_URL=http://127.0.0.1:19090
-LOKI_BASE_URL=http://127.0.0.1:13100
-TEMPO_BASE_URL=http://127.0.0.1:13200
+ELASTICSEARCH_URL=http://127.0.0.1:19200
+ELASTICSEARCH_INDEX_PATTERN=sre-logs-*
+ELASTICSEARCH_USERNAME=
+ELASTICSEARCH_PASSWORD=
+SKYWALKING_OAP_URL=http://127.0.0.1:12800
+SKYWALKING_ZIPKIN_URL=http://127.0.0.1:19412/zipkin
+SKYWALKING_SERVICE_NAME=sre-agent
 MYSQL_HOST=127.0.0.1
 MYSQL_PORT=13307
 MYSQL_USER=sre_reader
@@ -84,7 +95,7 @@ AUTH_TOKEN_TTL_HOURS=24
 SRE_DEFAULT_PROJECT_ID=sre-lab
 SRE_TOOL_POLICY_PATH=D:\SRE-Agent-platform\sre-agent-backend\sre-agent\config\tool-policy.yaml
 PROMETHEUS_BEARER_TOKEN=                   # 可选，仅保留在后端
-LOKI_BEARER_TOKEN=                         # 可选，仅保留在后端
+SKYWALKING_BEARER_TOKEN=                         # 可选，仅保留在后端
 SRE_SANDBOX_WORKSPACE_ROOT=D:\SRE-Agent-platform\sre-agent-backend\sre-agent\.sandbox-tasks
 SRE_SANDBOX_IMAGE=python:3.12-alpine
 SRE_SANDBOX_CPUS=1.0
@@ -307,7 +318,7 @@ Logical Step/Evidence/Event   idempotent / exactly-once effect
 
 Self-Check 始终 read-only，只发现问题；Recovery 才会 claim、增加 attempt、恢复或在达到上限时失败。它不调用 SRE Tool、LLM 或 Lab 数据库，不消耗 Token，也不替换 `/health`。快照之后发生的并发变化和“外部 Tool 完成但数据库未 commit”的瞬间无法由一次检查完全观察，最终由 Lease/CAS 与 logical idempotency 收敛。
 
-每条请求先被分类为 `SPECIFIC_INCIDENT`、`GENERAL_DIAGNOSIS`、`NEED_CLARIFICATION` 或 `OUT_OF_SCOPE`。具体故障进入 Investigation Workflow；整体巡检先执行全局 System Scan；信息不足或非运维问题只返回普通消息，不允许调用 Kubernetes、Prometheus、Loki、Tempo、MySQL 或 Git 工具。
+每条请求先被分类为 `SPECIFIC_INCIDENT`、`GENERAL_DIAGNOSIS`、`NEED_CLARIFICATION` 或 `OUT_OF_SCOPE`。具体故障进入 Investigation Workflow；整体巡检先执行全局 System Scan；信息不足或非运维问题只返回普通消息，不允许调用 Kubernetes、Prometheus、Elasticsearch、SkyWalking、MySQL 或 Git 工具。
 
 ### Intent Schema
 
@@ -409,7 +420,7 @@ Validation 详情返回 `test_suite_versions[]`、`ai_reference_test_paths[]`、
 - 当前没有 Shell、`run_code`、`write_code`、Kubernetes 写入或 Git 写入 Tool。未来执行型 Tool 必须标为高风险并强制走 Sandbox，不得接入普通只读 Client。
 - `project_id` 只能选择服务端已配置项目。namespace、repo、path、user_id 和 task_id 均由服务端策略或 Scope 控制，浏览器和模型不能自由指定。
 - Git 路径先与仓库根目录组合并 `resolve()`，再检查真实路径仍位于项目 allowed paths 内，阻止 `../` 和软链接越界。
-- PromQL、LogQL 结构参数、label selector、trace ID、源码行范围、时间窗口和条数均有类型、字符、长度与范围限制；额外字段直接拒绝。
+- PromQL、Elasticsearch 结构化过滤参数、label selector、trace ID、源码行范围、时间窗口和条数均有类型、字符、长度与范围限制；额外字段直接拒绝。
 
 ### 凭证与 RBAC
 
@@ -418,7 +429,7 @@ Validation 详情返回 `test_suite_versions[]`、`ai_reference_test_paths[]`、
 - `deploy/kubernetes-mcp-reader.yaml` 创建独立 ServiceAccount、Role 和 RoleBinding，仅授予 `get/list/watch` 与 `pods/log`，不允许读取 Secret，也没有任何写动词。
 - MySQL 账号只读，代码仅放行单条 SELECT/EXPLAIN SELECT。
 - Git 远程地址必须为白名单主机上的无凭证 HTTPS URL；只读 Token 由后端 Git 凭证机制提供，不写入 URL、Tool 参数或模型上下文。
-- Prometheus/Loki Bearer Token 仅由后端 HTTP Client 注入 Authorization Header，不进入 Tool Schema、Audit 参数、前端或 LLM。
+- Prometheus/SkyWalking Bearer Token 与 Elasticsearch 只读账号密码 仅由后端 HTTP Client 注入 Authorization Header，不进入 Tool Schema、Audit 参数、前端或 LLM。
 - 用户密码使用独立随机盐和 60 万轮 PBKDF2-HMAC-SHA256；数据库不保存明文密码或明文 Token。
 - 诊断、会话与 Evidence API 强制 Bearer Token，Conversation 查询始终同时校验 user_id。
 - Git 仅 read/search/diff；`repository` 必须来自 Service Catalog 白名单，路径不能逃逸对应独立仓库，并优先读取 Pod 正在运行的 SHA。

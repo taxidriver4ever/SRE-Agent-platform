@@ -95,27 +95,12 @@ def test_kubernetes_adapter_exposes_no_write_semantics():
     assert names.isdisjoint({"delete_pod", "pods_exec", "resources_create_or_update", "resources_delete"})
 
 
-def test_extract_trace_id_from_loki_json_log():
-    """工作流应使用日志中的真实 trace_id 精确关联 Tempo，而不是猜测链路。"""
-    payload = {
-        "data": {
-            "source": "query_logs",
-            "result": {
-                "resultType": "streams",
-                "result": [
-                    {
-                        "values": [
-                            [
-                                "1720000000000000000",
-                                '{"service":"order-service","message":"mode=slow_sql",'
-                                '"trace_id":"f20b2ccf2b99608c2f8585ad9035866a"}',
-                            ]
-                        ]
-                    }
-                ],
-            },
-        }
-    }
+def test_extract_trace_id_from_elasticsearch_log():
+    """工作流应使用日志中的真实 trace_id 精确关联 SkyWalking，而不是猜测链路。"""
+    payload = {"data": {"source": "elasticsearch", "logs": [
+        {"service_name": "order-service", "message": "mode=slow_sql",
+         "trace_id": "f20b2ccf2b99608c2f8585ad9035866a"}
+    ]}}
 
     assert DiagnosisWorkflow._extract_trace_id(payload) == "f20b2ccf2b99608c2f8585ad9035866a"
 

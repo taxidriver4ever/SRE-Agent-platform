@@ -4,6 +4,8 @@ Kubernetes 新增 Pod 级 `get_pod_image`、`get_pod_version`、`get_events`、`
 
 Observability 提供 `query_metrics`、`query_logs`、`query_trace`、`query_slow_queries`、`query_sql_digest`、`explain_sql`、`get_service_health`。
 
+`query_logs` 通过 Elasticsearch 的固定 `_search` 端点查询；`search_logs` 提供相同结构化过滤能力。`query_trace` / `search_traces` / `get_trace` 由 SkyWalking Adapter 统一原生 GraphQL 与 OAP OTLP 兼容查询。`get_service_metrics` 查询原生 SkyWalking APM，不替代 Prometheus。日志、Trace 查询默认最近 30 分钟，最多 24 小时、100 条；Agent 无法指定索引、DSL 或任意 GraphQL。
+
 Git 支持 Catalog 白名单多仓库的 `get_repository`、`get_current_commit`、`get_commit`、`get_previous_commit`、`get_commit_diff`、`read_file`、`read_file_at_commit`、`search_code`、`list_changed_files`。所有代码读取都要求运行 SHA，不默认读取 HEAD。
 
 Tool 层仅允许 get/list/top、SELECT/EXPLAIN SELECT、Git read/search/diff；含参数校验、超时、结果截断和结构化错误。

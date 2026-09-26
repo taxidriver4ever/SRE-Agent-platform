@@ -1,5 +1,8 @@
 """FastAPI application factory with health, metrics and request instrumentation."""
 
+from app.observability.skywalking import start
+start()
+
 import secrets
 import time
 from fastapi import FastAPI, Request

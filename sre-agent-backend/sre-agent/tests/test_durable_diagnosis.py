@@ -138,7 +138,7 @@ async def test_completed_tool_is_loaded_without_second_external_call() -> None:
         state, WorkflowPhase.INVESTIGATE, "query_logs", arguments, "logs", [],
     )
     evidence = Evidence(
-        source="LOKI", source_type="LOKI", tool_name="query_logs", title="logs",
+        source="ELASTICSEARCH", source_type="ELASTICSEARCH", tool_name="query_logs", title="logs",
         detail="timeout", summary="timeout", structured_data={"services": ["order-service"]},
         timestamp=datetime.now(timezone.utc), evidence_id=claim.evidence_id,
     )
@@ -326,7 +326,7 @@ def test_event_and_evidence_upserts_are_logically_idempotent() -> None:
         event_key="phase.completed:TRIAGE",
     ) == event_id
     evidence = DiagnosisEvidence(
-        id="stable-evidence", diagnosis_id=session.id, source_type="LOKI",
+        id="stable-evidence", diagnosis_id=session.id, source_type="ELASTICSEARCH",
         source_name="query_logs", title="logs", summary="first", timestamp=_now(),
     )
     repository.upsert_evidence(evidence)
@@ -607,7 +607,7 @@ async def test_final_report_projection_and_completion_are_idempotent() -> None:
         catalog = _Catalog()
 
     evidence = Evidence(
-        source="LOKI", source_type="LOKI", tool_name="query_logs", title="logs",
+        source="ELASTICSEARCH", source_type="ELASTICSEARCH", tool_name="query_logs", title="logs",
         detail="timeout", summary="timeout", structured_data={"services": ["order-service"]},
         timestamp=datetime.now(timezone.utc), evidence_id="final-evidence",
     )

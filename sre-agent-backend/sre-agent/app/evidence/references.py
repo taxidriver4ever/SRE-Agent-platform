@@ -44,12 +44,12 @@ def build_source_references(
     if tool_name in {"query_metrics", "get_service_health"}:
         query = str(arguments.get("query") or arguments.get("service") or "health")
         return [SourceReference(kind="metrics", uri=f"prometheus://query/{quote(query, safe='')}", label="Prometheus query")]
-    if tool_name == "query_logs":
-        service = str(arguments.get("service") or "all")
-        return [SourceReference(kind="logs", uri=f"loki://service/{quote(service)}", label=f"Loki {service}")]
-    if tool_name == "query_trace":
-        trace = str(arguments.get("trace_id") or arguments.get("service") or "search")
-        return [SourceReference(kind="trace", uri=f"tempo://trace/{quote(trace)}", label=f"Tempo {trace}")]
+    if tool_name in {"query_logs", "search_logs"}:
+        service = str(arguments.get("service_name") or arguments.get("service") or "all")
+        return [SourceReference(kind="logs", uri=f"elasticsearch://service/{quote(service)}", label=f"Elasticsearch {service}")]
+    if tool_name in {"query_trace", "search_traces", "get_trace", "get_service_metrics"}:
+        trace = str(arguments.get("trace_id") or arguments.get("service_name") or arguments.get("service") or "search")
+        return [SourceReference(kind="trace", uri=f"skywalking://{tool_name}/{quote(trace)}", label=f"SkyWalking {trace}")]
     if tool_name in {"query_slow_queries", "query_sql_digest", "explain_sql"}:
         return [SourceReference(kind="database", uri=f"mysql://sre_lab/{quote(tool_name)}", label=f"MySQL {tool_name}")]
     return []

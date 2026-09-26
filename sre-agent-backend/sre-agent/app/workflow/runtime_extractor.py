@@ -64,17 +64,15 @@ def extract_pod_runtime(
 
 
 def extract_trace_id(payload: Any) -> str | None:
-    """从 Loki bounded 结果中提取最近一条合法 trace_id。"""
-    try:
-        streams = payload["data"]["result"]["result"]
-        for stream in streams:
-            for value in reversed(stream.get("values", [])):
-                if not isinstance(value, list) or len(value) < 2:
-                    continue
-                record = json.loads(value[1])
-                trace_id = str(record.get("trace_id", ""))
-                if len(trace_id) in {16, 32} and all(char in "0123456789abcdefABCDEF" for char in trace_id):
-                    return trace_id
-    except (AttributeError, KeyError, TypeError, json.JSONDecodeError):
+    """Read a normalized log's actual trace ID (native or W3C)."""
+    from app.mcp_servers.observability.adapters import TRACE_ID
+    if not isinstance(payload, dict):
         return None
+    data = payload.get("data", payload)
+    if not isinstance(data, dict):
+        return None
+    for record in data.get("logs", []):
+        identifier = str(record.get("trace_id") or "")
+        if TRACE_ID.fullmatch(identifier):
+            return identifier
     return None

@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from app.evidence.references import SourceReference
 
 
-_TRACE_ID = re.compile(r"^[0-9a-fA-F]{16,32}$")
+_TRACE_ID = re.compile(r"^[a-zA-Z0-9_.:-]{1,256}$")
 _SQL_START = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
 
 
@@ -73,6 +73,29 @@ def normalize_tool_result(
     # MySQL 工具返回的执行统计与 EXPLAIN 行本身就是稳定结构化证据。保留有界
     # rows，避免综合器只能从被截断的 summary 文本再次猜测字段。
     payload = raw_result.get("data", raw_result) if isinstance(raw_result, dict) else {}
+    if isinstance(payload, dict) and payload.get("source") in {"elasticsearch", "skywalking"}:
+        structured["source"] = payload["source"]
+        structured["empty"] = payload.get("empty", False)
+        for key in ("logs", "spans", "traces", "metrics"):
+            if isinstance(payload.get(key), list):
+                structured[key] = payload[key][:100]
+        structured["trace_duration_ms"] = payload.get("duration_ms")
+        for span in payload.get("spans", []):
+            tags = span.get("tags", {})
+            peer = span.get("peer") or tags.get("peer.service") or ""
+            url = tags.get("url.full") or tags.get("http.url") or ""
+            host = urlparse(url).hostname if url else None
+            dependency = "mysql" if span.get("layer") == "Database" else (host or peer)
+            if dependency and span.get("kind") in {"Exit", "CLIENT"}:
+                structured.setdefault("dependency_candidates", []).append({
+                    "service": dependency, "duration_ms": span.get("duration_ms", 0),
+                    "span_id": span.get("span_id"), "status": span.get("status"),
+                })
+        for candidate in payload.get("traces", []):
+            structured.setdefault("trace_candidates", []).append({
+                "trace_id": candidate.get("trace_id"), "name": candidate.get("name", ""),
+                "duration_ms": candidate.get("duration_ms"),
+            })
     if tool_name in {"query_slow_queries", "query_sql_digest", "explain_sql"} and isinstance(payload, dict):
         rows = payload.get("rows")
         if isinstance(rows, list):
@@ -98,6 +121,7 @@ def normalize_tool_result(
                 structured["metric_samples"] = samples[:50]
     return UnifiedToolResult(
         tool=tool_name,
+        status="error" if isinstance(payload, dict) and payload.get("success") is False else "success",
         summary=summary,
         data=raw_result,
         structured_data=structured,

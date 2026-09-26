@@ -4,7 +4,7 @@
   "symptom": "为什么订单模块最近这么慢？",
   "expected_service": "order-service",
   "expected_root_cause": ["慢 SQL", "全表扫描", "索引", "LIKE"],
-  "required_evidence": ["Prometheus", "Tempo", "MySQL"],
+  "required_evidence": ["Prometheus", "SkyWalking", "MySQL"],
   "forbidden_shortcuts": ["SRE-001", "slow.example.com", "固定 SQL"],
   "minimum_confidence": 0.75
 }

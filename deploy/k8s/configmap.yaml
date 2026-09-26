@@ -10,8 +10,11 @@ data:
   GATEWAY_MAX_TOKENS: "512"
   KUBERNETES_NAMESPACE: sre-lab
   PROMETHEUS_BASE_URL: http://prometheus.sre-lab.svc.cluster.local:9090
-  LOKI_BASE_URL: http://loki.sre-lab.svc.cluster.local:3100
-  TEMPO_BASE_URL: http://tempo.sre-lab.svc.cluster.local:3200
+  ELASTICSEARCH_URL: http://elasticsearch.sre-lab.svc.cluster.local:9200
+  SKYWALKING_OAP_URL: http://skywalking-oap.sre-lab.svc.cluster.local:12800
+  SKYWALKING_ZIPKIN_URL: http://skywalking-oap.sre-lab.svc.cluster.local:9412/zipkin
+  ELASTICSEARCH_INDEX_PATTERN: sre-logs-*
+  SKYWALKING_SERVICE_NAME: sre-agent
   MYSQL_HOST: mysql.sre-lab.svc.cluster.local
   MYSQL_PORT: "3306"
   MYSQL_USER: sre_reader
@@ -35,6 +38,11 @@ data:
   DIAGNOSIS_LEASE_TTL_SECONDS: "60"
   DIAGNOSIS_HEARTBEAT_INTERVAL_SECONDS: "10"
   DIAGNOSIS_RECOVERY_SCAN_INTERVAL_SECONDS: "15"
+  HISTORY_SEARCH_ENABLED: "true"
+  ELASTICSEARCH_HISTORY_INDEX: sre-agent-history-v1
+  HISTORY_TIMEOUT_SECONDS: "2"
+  HISTORY_TOP_K: "5"
+  LOGSTASH_URL: http://logstash.sre-lab.svc.cluster.local:8080
 ---
 apiVersion: v1
 kind: ConfigMap

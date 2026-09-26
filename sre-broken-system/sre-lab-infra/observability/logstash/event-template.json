@@ -1,0 +1,12 @@
+{
+  "index_patterns": ["sre-agent-events-*"], "priority": 200,
+  "template": {
+    "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+    "mappings": {"dynamic": "strict", "properties": {
+      "@timestamp": {"type": "date"}, "event_id": {"type": "keyword"},
+      "task_id": {"type": "keyword"}, "user_id": {"type": "keyword"}, "project_id": {"type": "keyword"},
+      "event_type": {"type": "keyword"}, "service": {"type": "keyword"}, "service_name": {"type": "keyword"},
+      "source": {"type": "keyword"}, "message": {"type": "text"}, "severity": {"type": "keyword"}, "tags": {"type": "keyword"}
+    }}
+  }
+}

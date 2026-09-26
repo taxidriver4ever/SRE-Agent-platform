@@ -8,10 +8,10 @@ from app.workflow.models import (
 def source_for_tool(tool_name: str) -> str:
     if tool_name.startswith("query_metric") or tool_name == "get_service_health":
         return "Prometheus"
-    if tool_name == "query_logs":
-        return "Loki"
-    if tool_name == "query_trace":
-        return "Tempo"
+    if tool_name in {"query_logs", "search_logs"}:
+        return "Elasticsearch"
+    if tool_name in {"query_trace", "search_traces", "get_trace", "get_service_metrics"}:
+        return "SkyWalking"
     if tool_name in {"query_slow_queries", "query_sql_digest", "explain_sql"}:
         return "MySQL"
     if (tool_name in {"get_repository", "get_current_commit", "get_commit_diff", "list_changed_files"}
@@ -22,6 +22,8 @@ def source_for_tool(tool_name: str) -> str:
 
 
 def supports_conclusion(tool_name: str, summary: str) -> bool:
+    if '"success": false' in summary or '"empty": true' in summary:
+        return False
     if tool_name.startswith("query_") or tool_name == "get_service_health":
         return not any(marker in summary for marker in ('"result": []', '"traces": []', '"row_count": 0'))
     return True
@@ -30,10 +32,10 @@ def supports_conclusion(tool_name: str, summary: str) -> bool:
 def is_direct_evidence(tool_name: str, arguments: dict, summary: str) -> bool:
     if not supports_conclusion(tool_name, summary):
         return False
-    if tool_name == "query_trace":
+    if tool_name in {"query_trace", "get_trace"}:
         return bool(arguments.get("trace_id"))
     return tool_name in {
-        "query_metrics", "get_service_health", "query_logs", "query_slow_queries",
+        "query_metrics", "get_service_health", "query_logs", "search_logs", "get_service_metrics", "query_slow_queries",
         "query_sql_digest", "explain_sql", "get_pod", "get_pod_events",
         "get_restart_count", "get_deployment", "get_container_image",
     }

@@ -1,0 +1,19 @@
+filebeat.inputs:
+- type: filestream
+  id: sre-docker
+  paths:
+  - /var/lib/docker/containers/*/*.log
+  prospector.scanner.symlinks: true
+  parsers:
+  - container:
+      stream: all
+      format: docker
+processors:
+- decode_json_fields:
+    fields:
+    - message
+    target: app
+    overwrite_keys: false
+    add_error_key: true
+output.logstash:
+  hosts: ["${LOGSTASH_HOST:logstash}:${LOGSTASH_PORT:5044}"]

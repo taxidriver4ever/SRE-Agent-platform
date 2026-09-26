@@ -41,6 +41,11 @@ class Evidence(BaseModel):
 
     source: str
     source_type: str = ""
+    evidence_type: str = ""
+    service_name: str | None = None
+    trace_id: str | None = None
+    severity: str | None = None
+    raw_reference: str | None = None
     tool_name: str
     title: str
     detail: str
@@ -124,6 +129,9 @@ class DiagnosisState(BaseModel):
 
     query: str
     # Conversation ID 把多次诊断汇入同一组持久化 Summary、State 和 Memory。
+    short_context: str = ""
+    long_term_history: str = "[]"
+    history_retrieved: bool = False
     conversation_id: str = ""
     user_id: str | None = None
     run_id: str = ""

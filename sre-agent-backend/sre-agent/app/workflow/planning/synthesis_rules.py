@@ -91,7 +91,7 @@ def cpu_saturation_rule(state: DiagnosisState) -> DiagnosisSynthesis | None:
     return DiagnosisSynthesis(
         status="confirmed", root_cause="CPU saturation：CPU 密集型计算阻塞服务工作线程，导致接口延迟升高",
         evidence_ids=[logs[-1].evidence_id, metrics[-1].evidence_id],
-        root_cause_chain=["Loki 记录 cpu_saturation 故障模式下的业务请求", "Prometheus 记录 Pod CPU 与请求延迟运行指标", "CPU 密集计算导致可用工作线程下降"],
+        root_cause_chain=["Elasticsearch 记录 cpu_saturation 故障模式下的业务请求", "Prometheus 记录 Pod CPU 与请求延迟运行指标", "CPU 密集计算导致可用工作线程下降"],
         recommended_fix=["把 CPU 密集计算移出请求线程或拆分到独立 Worker", "设置 CPU 限额、并发保护并复测 Pod CPU 与 P95"],
         confidence=0.9,
     )
@@ -116,7 +116,7 @@ def retry_storm_rule(state: DiagnosisState) -> DiagnosisSynthesis | None:
         return DiagnosisSynthesis(
             status="confirmed", root_cause=f"无退避重试风暴：单次请求连续调用下游 {repeated_service} {len(repeated_calls)} 次，放大请求量并导致 timeout",
             evidence_ids=[trace.evidence_id, logs[-1].evidence_id, metrics[-1].evidence_id],
-            root_cause_chain=["Loki 记录故障窗口内业务请求", f"Tempo 同一请求中发现 {len(repeated_calls)} 个 {repeated_service} 调用 Span", "Prometheus 记录重试期间的请求与资源指标"],
+            root_cause_chain=["Elasticsearch 记录故障窗口内业务请求", f"SkyWalking 同一请求中发现 {len(repeated_calls)} 个 {repeated_service} 调用 Span", "Prometheus 记录重试期间的请求与资源指标"],
             recommended_fix=["设置总重试预算并使用指数退避、抖动和熔断", "复测单请求下游 Span 数和放大后的 QPS"], confidence=0.93)
     repeated_log: Evidence | None = None
     repeated_trace_id = ""
@@ -129,7 +129,7 @@ def retry_storm_rule(state: DiagnosisState) -> DiagnosisSynthesis | None:
         return DiagnosisSynthesis(
             status="confirmed", root_cause=f"无退避重试风暴：同一 trace_id 在末端下游日志重复出现 {repeated_count} 次，放大请求量并导致 timeout",
             evidence_ids=[traces[-1].evidence_id, repeated_log.evidence_id, metrics[-1].evidence_id],
-            root_cause_chain=["Tempo 确认故障请求的跨服务 Trace", f"Loki 显示 trace_id {repeated_trace_id[:8]}… 在下游重复出现 {repeated_count} 次", "Prometheus 记录故障窗口内的请求与资源指标"],
+            root_cause_chain=["SkyWalking 确认故障请求的跨服务 Trace", f"Elasticsearch 显示 trace_id {repeated_trace_id[:8]}… 在下游重复出现 {repeated_count} 次", "Prometheus 记录故障窗口内的请求与资源指标"],
             recommended_fix=["设置总重试预算并使用指数退避、抖动和熔断", "复测单请求的同 trace_id 下游日志条数与整体 QPS"], confidence=0.91)
     return None
 
@@ -152,7 +152,7 @@ def dependency_timeout_rule(state: DiagnosisState) -> DiagnosisSynthesis | None:
     return DiagnosisSynthesis(
         status="confirmed", root_cause=f"{downstream} 下游依赖调用耗时 {duration:.0f}ms 并发生 timeout，导致上游请求变慢",
         evidence_ids=[trace.evidence_id, logs[-1].evidence_id],
-        root_cause_chain=["Loki 记录上游请求运行上下文", f"Tempo 显示到 {downstream} 的客户端 Span 最慢", "下游超时传播为上游延迟"],
+        root_cause_chain=["Elasticsearch 记录上游请求运行上下文", f"SkyWalking 显示到 {downstream} 的客户端 Span 最慢", "下游超时传播为上游延迟"],
         recommended_fix=["检查下游服务处理时延并设置分层超时预算", "增加有限重试、退避和熔断，复测跨服务 Trace"], confidence=0.9)
 
 
@@ -192,7 +192,7 @@ def connection_pool_rule(state: DiagnosisState) -> DiagnosisSynthesis | None:
     return DiagnosisSynthesis(
         status="confirmed", root_cause="Hikari connection pool（连接池）耗尽，业务请求无法及时获得 JDBC Connection 并返回 500",
         evidence_ids=[logs[-1].evidence_id, slow.evidence_id],
-        root_cause_chain=["Loki 记录 Failed to obtain JDBC Connection", "并发请求持续占用数据库连接", "Hikari 连接池等待超时并触发 5xx"],
+        root_cause_chain=["Elasticsearch 记录 Failed to obtain JDBC Connection", "并发请求持续占用数据库连接", "Hikari 连接池等待超时并触发 5xx"],
         recommended_fix=["先优化占用连接时间长的查询，再按数据库容量校准连接池上限与超时", "复测 Hikari active/pending、5xx 和数据库查询耗时"], confidence=0.92)
 
 
@@ -220,6 +220,33 @@ def slow_query_rule(state: DiagnosisState) -> DiagnosisSynthesis | None:
     return None
 
 
+def database_span_rule(state: DiagnosisState) -> DiagnosisSynthesis | None:
+    """Confirm the latency source, without claiming an unobserved SQL mechanism."""
+    metrics = _direct(state, source="Prometheus")
+    logs = _direct(state, source="Elasticsearch")
+    if state.symptom not in {"latency", "dependency_timeout"} or not metrics:
+        return None
+    for trace in _direct(state, source="SkyWalking"):
+        ids = set(trace.structured_data.get("trace_ids", []))
+        related = next((item for item in logs if ids.intersection(item.structured_data.get("trace_ids", []))
+                        and any("timeout" in str(message).lower() for message in item.structured_data.get("runtime_messages", []))), None)
+        total = float(trace.structured_data.get("trace_duration_ms") or 0)
+        spans = [span for span in trace.structured_data.get("spans", []) if span.get("layer") == "Database"]
+        if not related or not spans or total <= 0:
+            continue
+        slowest = max(spans, key=lambda span: float(span.get("duration_ms") or 0))
+        duration = float(slowest.get("duration_ms") or 0)
+        if duration < 1000 or duration / total < 0.5:
+            continue
+        return DiagnosisSynthesis(
+            status="confirmed", root_cause=f"数据库调用是主要延迟来源：数据库 Span {duration:.0f}ms，占该请求 {total:.0f}ms 的 {duration / total:.0%}",
+            evidence_ids=[metrics[-1].evidence_id, related.evidence_id, trace.evidence_id],
+            root_cause_chain=["Prometheus 记录延迟指标", "Elasticsearch 超时日志与 TraceId 精确关联", "SkyWalking 数据库 Span 占据主要请求时间"],
+            recommended_fix=["继续用 MySQL 慢查询和 EXPLAIN 区分锁等待、索引问题与数据库负载；当前证据不直接证明索引失效"], confidence=0.9,
+        )
+    return None
+
+
 SYNTHESIS_RULES: tuple[SynthesisRule, ...] = (
     kubernetes_restart_rule,
     single_pod_degradation_rule,
@@ -230,6 +257,7 @@ SYNTHESIS_RULES: tuple[SynthesisRule, ...] = (
     deployment_regression_rule,
     connection_pool_rule,
     slow_query_rule,
+    database_span_rule,
 )
 
 

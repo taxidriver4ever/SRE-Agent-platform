@@ -99,7 +99,7 @@ func randomHex(size int) string {
 	return hex.EncodeToString(buffer)
 }
 
-// Log emits the common cross-language envelope consumed by Alloy and Loki.
+// Log emits the common cross-language envelope consumed by Filebeat and Elasticsearch.
 func (t *Telemetry) Log(level, traceID, message string, fields map[string]any) {
 	record := map[string]any{"timestamp": time.Now().UTC().Format(time.RFC3339Nano), "service": "inventory-service",
 		"version": t.Version, "pod": t.PodName, "level": level, "trace_id": traceID, "message": message}

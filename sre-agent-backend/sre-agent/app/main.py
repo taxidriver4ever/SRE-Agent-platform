@@ -23,6 +23,11 @@ from app.conversation_memory import (
 from app.code_state import CodeStateRepository, CodeStateService, initialize_code_state_schema
 from app.core.config import get_settings
 from app.core.database import ApplicationDatabase
+from app.history.schema import initialize_history_schema
+from app.history.repository import HistoryRepository
+from app.history.elasticsearch import ElasticsearchHistoryIndex
+from app.history.service import HistoryRetrievalService
+from app.history.worker import HistorySyncWorker
 from app.diagnosis import (
     DiagnosisExecutionManager, DiagnosisOrchestrator, DiagnosisRepository,
     DiagnosisSelfCheckService, DiagnosisService,
@@ -78,6 +83,7 @@ def create_app() -> FastAPI:
     initialize_audit_schema(application_database)
     # Diagnosis 表依赖 users 与 conversations，必须在这两个模块之后初始化。
     initialize_diagnosis_schema(application_database)
+    initialize_history_schema(application_database)
     # Validation 是独立聚合，但其可选 Diagnosis 外键依赖 Diagnosis Schema。
     initialize_validation_schema(application_database)
     auth_service = AuthService(application_database, settings.auth_token_ttl_hours)
@@ -146,6 +152,21 @@ def create_app() -> FastAPI:
         compaction_ratio=settings.context_compaction_ratio,
         reserved_output_tokens=settings.context_reserved_output_tokens,
     )
+    history_source = HistoryRepository(application_database)
+    history_index = ElasticsearchHistoryIndex(
+        settings.elasticsearch_url, settings.elasticsearch_history_index,
+        username=settings.elasticsearch_username, password=settings.elasticsearch_password,
+        timeout=settings.history_timeout_seconds,
+    )
+    history_retrieval = HistoryRetrievalService(
+        history_source, history_index, timeout=settings.history_timeout_seconds,
+        top_k=settings.history_top_k, lookback_days=settings.history_lookback_days,
+        budget=settings.history_context_chars,
+    )
+    history_worker = HistorySyncWorker(
+        history_source, history_index, interval=settings.history_sync_interval_seconds,
+        batch_size=settings.history_sync_batch_size, logstash_url=settings.logstash_url,
+    )
     diagnosis_workflow = DiagnosisWorkflow(
         tools=tools,
         catalog_path=settings.service_catalog_path,
@@ -157,6 +178,8 @@ def create_app() -> FastAPI:
         code_state_service=code_state_service,
         kubernetes_namespace=settings.kubernetes_namespace,
         deadline_seconds=settings.diagnosis_deadline_seconds,
+        history_retrieval=history_retrieval if settings.history_search_enabled else None,
+        default_project_id=settings.default_project_id,
     )
     diagnosis_repository = DiagnosisRepository(application_database)
     diagnosis_service = DiagnosisService(diagnosis_repository, conversation_service)
@@ -254,11 +277,16 @@ def create_app() -> FastAPI:
         if recovered:
             logger.warning("Recovered %s stale Diagnosis Session(s)", recovered)
         diagnosis_execution_manager.start_recovery_loop()
+        application.state.history_retrieval = history_retrieval
+        application.state.history_worker = history_worker
+        if settings.history_search_enabled:
+            history_worker.start()
         try:
             yield
         finally:
             # Redeploy/shutdown 只 interrupt 并释放 Lease；CANCELLED 只留给业务取消。
             await diagnosis_execution_manager.shutdown()
+            await history_worker.close()
             await validation_service.manager.shutdown()
             # 只有 GatewayLLM 自己创建的客户端会被关闭，注入客户端的所有权规则
             # 由 GatewayLLM.close() 内部负责判断。

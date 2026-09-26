@@ -1,0 +1,21 @@
+filebeat.inputs:
+- type: filestream
+  id: sre-kubernetes
+  paths:
+  - /var/log/containers/*_sre-lab_*.log
+  prospector.scanner.symlinks: true
+  parsers:
+  - container:
+      stream: all
+      format: cri
+processors:
+- add_kubernetes_metadata:
+    host: ${NODE_NAME}
+- decode_json_fields:
+    fields:
+    - message
+    target: app
+    overwrite_keys: false
+    add_error_key: true
+output.logstash:
+  hosts: ["${LOGSTASH_HOST:logstash}:${LOGSTASH_PORT:5044}"]

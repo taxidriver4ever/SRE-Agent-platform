@@ -1,174 +1,644 @@
 apiVersion: v1
 kind: ServiceAccount
-metadata: {name: observability, namespace: sre-lab}
+metadata:
+  name: observability
+  namespace: sre-lab
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
-metadata: {name: sre-lab-observability-readonly}
+metadata:
+  name: sre-lab-observability-readonly
 rules:
-  - apiGroups: [""]
-    # nodes/metrics 是通过 API Server 代理读取 kubelet/cAdvisor 指标所需的子资源。
-    # 权限只有 get/list/watch，不授予 create/update/delete，保证观测组件保持只读。
-    resources: [nodes, nodes/proxy, nodes/metrics, services, endpoints, pods]
-    verbs: [get, list, watch]
-  - nonResourceURLs: ["/metrics", "/metrics/cadvisor"]
-    verbs: [get]
+- apiGroups:
+  - ''
+  resources:
+  - nodes
+  - nodes/proxy
+  - nodes/metrics
+  - services
+  - endpoints
+  - pods
+  - namespaces
+  verbs:
+  - get
+  - list
+  - watch
+- nonResourceURLs:
+  - /metrics
+  - /metrics/cadvisor
+  verbs:
+  - get
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
-metadata: {name: sre-lab-observability-readonly}
-roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: sre-lab-observability-readonly}
-subjects: [{kind: ServiceAccount, name: observability, namespace: sre-lab}]
+metadata:
+  name: sre-lab-observability-readonly
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sre-lab-observability-readonly
+subjects:
+- kind: ServiceAccount
+  name: observability
+  namespace: sre-lab
 ---
 apiVersion: apps/v1
 kind: Deployment
-metadata: {name: prometheus, namespace: sre-lab, labels: {app: prometheus}}
+metadata:
+  name: prometheus
+  namespace: sre-lab
+  labels:
+    app: prometheus
 spec:
   replicas: 1
-  selector: {matchLabels: {app: prometheus}}
+  selector:
+    matchLabels:
+      app: prometheus
   template:
-    metadata: {labels: {app: prometheus, service: prometheus}}
+    metadata:
+      labels:
+        app: prometheus
+        service: prometheus
     spec:
       serviceAccountName: observability
       containers:
-        - name: prometheus
-          image: prom/prometheus:v3.5.0
-          args: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus", "--storage.tsdb.retention.time=24h"]
-          ports: [{name: http, containerPort: 9090}]
-          readinessProbe: {httpGet: {path: /-/ready, port: http}, initialDelaySeconds: 5, periodSeconds: 5}
-          livenessProbe: {httpGet: {path: /-/healthy, port: http}, initialDelaySeconds: 15, periodSeconds: 10}
-          resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: "1", memory: 512Mi}}
-          volumeMounts: [{name: config, mountPath: /etc/prometheus}]
-      volumes: [{name: config, configMap: {name: prometheus-config}}]
+      - name: prometheus
+        image: prom/prometheus:v3.5.0
+        args:
+        - --config.file=/etc/prometheus/prometheus.yml
+        - --storage.tsdb.path=/prometheus
+        - --storage.tsdb.retention.time=24h
+        ports:
+        - name: http
+          containerPort: 9090
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /-/healthy
+            port: http
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: '1'
+            memory: 512Mi
+        volumeMounts:
+        - name: config
+          mountPath: /etc/prometheus
+      volumes:
+      - name: config
+        configMap:
+          name: prometheus-config
 ---
 apiVersion: v1
 kind: Service
-metadata: {name: prometheus, namespace: sre-lab}
-spec: {selector: {app: prometheus}, type: NodePort, ports: [{name: http, port: 9090, targetPort: http, nodePort: 30090}]}
----
-apiVersion: apps/v1
-kind: Deployment
-metadata: {name: loki, namespace: sre-lab, labels: {app: loki}}
+metadata:
+  name: prometheus
+  namespace: sre-lab
 spec:
-  replicas: 1
-  selector: {matchLabels: {app: loki}}
-  template:
-    metadata: {labels: {app: loki, service: loki}}
-    spec:
-      containers:
-        - name: loki
-          image: grafana/loki:3.5.1
-          args: ["-config.file=/etc/loki/loki.yaml"]
-          ports: [{name: http, containerPort: 3100}]
-          resources: {requests: {cpu: 50m, memory: 96Mi}, limits: {cpu: 500m, memory: 384Mi}}
-          volumeMounts: [{name: config, mountPath: /etc/loki}]
-      volumes: [{name: config, configMap: {name: loki-config}}]
----
-apiVersion: v1
-kind: Service
-metadata: {name: loki, namespace: sre-lab}
-spec: {selector: {app: loki}, type: NodePort, ports: [{name: http, port: 3100, targetPort: http, nodePort: 30100}]}
----
-apiVersion: apps/v1
-kind: Deployment
-metadata: {name: tempo, namespace: sre-lab, labels: {app: tempo}}
-spec:
-  replicas: 1
-  selector: {matchLabels: {app: tempo}}
-  template:
-    metadata: {labels: {app: tempo, service: tempo}}
-    spec:
-      containers:
-        - name: tempo
-          image: grafana/tempo:2.8.1
-          args: ["-config.file=/etc/tempo/tempo.yaml"]
-          ports: [{name: query, containerPort: 3200}, {name: otlp-grpc, containerPort: 4317}, {name: otlp-http, containerPort: 4318}]
-          resources: {requests: {cpu: 50m, memory: 96Mi}, limits: {cpu: 500m, memory: 384Mi}}
-          volumeMounts: [{name: config, mountPath: /etc/tempo}]
-      volumes: [{name: config, configMap: {name: tempo-config}}]
----
-apiVersion: v1
-kind: Service
-metadata: {name: tempo, namespace: sre-lab}
-spec:
-  selector: {app: tempo}
+  selector:
+    app: prometheus
   type: NodePort
   ports:
-    - {name: query, port: 3200, targetPort: query, nodePort: 30200}
-    - {name: otlp-grpc, port: 4317, targetPort: otlp-grpc}
-    - {name: otlp-http, port: 4318, targetPort: otlp-http}
+  - name: http
+    port: 9090
+    targetPort: http
+    nodePort: 30090
 ---
 apiVersion: apps/v1
 kind: Deployment
-metadata: {name: otel-collector, namespace: sre-lab, labels: {app: otel-collector}}
+metadata:
+  name: kube-state-metrics
+  namespace: sre-lab
+  labels:
+    app: kube-state-metrics
 spec:
   replicas: 1
-  selector: {matchLabels: {app: otel-collector}}
+  selector:
+    matchLabels:
+      app: kube-state-metrics
   template:
-    metadata: {labels: {app: otel-collector, service: otel-collector}}
-    spec:
-      containers:
-        - name: otel-collector
-          image: otel/opentelemetry-collector-contrib:0.130.1
-          args: ["--config=/etc/otel/otel-collector.yaml"]
-          ports: [{name: grpc, containerPort: 4317}, {name: http, containerPort: 4318}, {name: health, containerPort: 13133}]
-          # health_check 扩展只有在完整 pipeline 配置成功加载后才监听 13133。
-          # 探针可阻止 Collector 启动后立即崩溃却被 rollout 短暂视为成功的假阳性。
-          readinessProbe: {httpGet: {path: /, port: health}, initialDelaySeconds: 3, periodSeconds: 3}
-          livenessProbe: {httpGet: {path: /, port: health}, initialDelaySeconds: 10, periodSeconds: 10}
-          resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 500m, memory: 256Mi}}
-          volumeMounts: [{name: config, mountPath: /etc/otel}]
-      volumes: [{name: config, configMap: {name: otel-collector-config}}]
----
-apiVersion: v1
-kind: Service
-metadata: {name: otel-collector, namespace: sre-lab}
-spec:
-  selector: {app: otel-collector}
-  ports: [{name: grpc, port: 4317, targetPort: grpc}, {name: http, port: 4318, targetPort: http}, {name: health, port: 13133, targetPort: health}]
----
-apiVersion: apps/v1
-kind: Deployment
-metadata: {name: kube-state-metrics, namespace: sre-lab, labels: {app: kube-state-metrics}}
-spec:
-  replicas: 1
-  selector: {matchLabels: {app: kube-state-metrics}}
-  template:
-    metadata: {labels: {app: kube-state-metrics}}
+    metadata:
+      labels:
+        app: kube-state-metrics
     spec:
       serviceAccountName: observability
       containers:
-        - name: kube-state-metrics
-          image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.16.0
-          ports: [{name: http, containerPort: 8080}]
-          resources: {requests: {cpu: 20m, memory: 32Mi}, limits: {cpu: 200m, memory: 128Mi}}
+      - name: kube-state-metrics
+        image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.16.0
+        ports:
+        - name: http
+          containerPort: 8080
+        resources:
+          requests:
+            cpu: 20m
+            memory: 32Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
 ---
 apiVersion: v1
 kind: Service
-metadata: {name: kube-state-metrics, namespace: sre-lab}
-spec: {selector: {app: kube-state-metrics}, ports: [{name: http, port: 8080, targetPort: http}]}
+metadata:
+  name: kube-state-metrics
+  namespace: sre-lab
+spec:
+  selector:
+    app: kube-state-metrics
+  ports:
+  - name: http
+    port: 8080
+    targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: elasticsearch
+  namespace: sre-lab
+spec:
+  selector:
+    matchLabels:
+      app: elasticsearch
+  template:
+    metadata:
+      labels:
+        app: elasticsearch
+        service: elasticsearch
+    spec:
+      serviceAccountName: observability
+      containers:
+      - name: elasticsearch
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.17.3
+        ports:
+        - name: http
+          containerPort: 9200
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: '1'
+            memory: 1Gi
+        env:
+        - name: discovery.type
+          value: single-node
+        - name: xpack.security.enabled
+          value: 'false'
+        - name: ES_JAVA_OPTS
+          value: -Xms512m -Xmx512m
+        volumeMounts:
+        - name: data
+          mountPath: /usr/share/elasticsearch/data
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 15
+          periodSeconds: 5
+      volumes:
+      - name: data
+        emptyDir: {}
+  replicas: 1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch
+  namespace: sre-lab
+spec:
+  selector:
+    app: elasticsearch
+  type: NodePort
+  ports:
+  - name: http
+    port: 9200
+    targetPort: 9200
+    nodePort: 30201
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kibana
+  namespace: sre-lab
+spec:
+  selector:
+    matchLabels:
+      app: kibana
+  template:
+    metadata:
+      labels:
+        app: kibana
+        service: kibana
+    spec:
+      serviceAccountName: observability
+      containers:
+      - name: kibana
+        image: docker.elastic.co/kibana/kibana:8.17.3
+        ports:
+        - name: http
+          containerPort: 5601
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: '1'
+            memory: 768Mi
+        env:
+        - name: ELASTICSEARCH_HOSTS
+          value: http://elasticsearch:9200
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 15
+          periodSeconds: 5
+  replicas: 1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kibana
+  namespace: sre-lab
+spec:
+  selector:
+    app: kibana
+  type: NodePort
+  ports:
+  - name: http
+    port: 5601
+    targetPort: 5601
+    nodePort: 30601
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: skywalking-oap
+  namespace: sre-lab
+spec:
+  selector:
+    matchLabels:
+      app: skywalking-oap
+  template:
+    metadata:
+      labels:
+        app: skywalking-oap
+        service: skywalking-oap
+    spec:
+      serviceAccountName: observability
+      containers:
+      - name: skywalking-oap
+        image: apache/skywalking-oap-server:10.2.0
+        ports:
+        - name: query
+          containerPort: 12800
+        - name: grpc
+          containerPort: 11800
+        - name: zipkin
+          containerPort: 9412
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: '1'
+            memory: 1Gi
+        env:
+        - name: SW_STORAGE
+          value: elasticsearch
+        - name: SW_STORAGE_ES_CLUSTER_NODES
+          value: elasticsearch:9200
+        - name: SW_NAMESPACE
+          value: sw
+        - name: SW_STORAGE_ES_INDEX_REPLICAS_NUMBER
+          value: '0'
+        - name: SW_STORAGE_ES_SUPER_DATASET_INDEX_SHARDS_FACTOR
+          value: '1'
+        - name: SW_CORE_RECORD_DATA_TTL
+          value: '2'
+        - name: SW_CORE_METRICS_DATA_TTL
+          value: '2'
+        - name: SW_OTEL_RECEIVER_ENABLED_HANDLERS
+          value: otlp-traces
+        - name: SW_RECEIVER_ZIPKIN
+          value: default
+        - name: SW_QUERY_ZIPKIN
+          value: default
+        - name: SW_HEALTH_CHECKER
+          value: default
+        - name: JAVA_OPTS
+          value: -Xms256m -Xmx512m
+        readinessProbe:
+          tcpSocket:
+            port: query
+          initialDelaySeconds: 15
+          periodSeconds: 5
+  replicas: 1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: skywalking-oap
+  namespace: sre-lab
+spec:
+  selector:
+    app: skywalking-oap
+  type: NodePort
+  ports:
+  - name: query
+    port: 12800
+    targetPort: 12800
+    nodePort: 30800
+  - name: grpc
+    port: 11800
+    targetPort: 11800
+    nodePort: 30801
+  - name: zipkin
+    port: 9412
+    targetPort: 9412
+    nodePort: 30912
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: skywalking-ui
+  namespace: sre-lab
+spec:
+  selector:
+    matchLabels:
+      app: skywalking-ui
+  template:
+    metadata:
+      labels:
+        app: skywalking-ui
+        service: skywalking-ui
+    spec:
+      serviceAccountName: observability
+      containers:
+      - name: skywalking-ui
+        image: apache/skywalking-ui:10.2.0
+        ports:
+        - name: http
+          containerPort: 8080
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: '1'
+            memory: 512Mi
+        env:
+        - name: SW_OAP_ADDRESS
+          value: http://skywalking-oap:12800
+        - name: SW_ZIPKIN_ADDRESS
+          value: http://skywalking-oap:9412
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 15
+          periodSeconds: 5
+  replicas: 1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: skywalking-ui
+  namespace: sre-lab
+spec:
+  selector:
+    app: skywalking-ui
+  type: NodePort
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+    nodePort: 30808
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: sre-lab
+spec:
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+        service: otel-collector
+    spec:
+      serviceAccountName: observability
+      containers:
+      - name: otel-collector
+        image: otel/opentelemetry-collector-contrib:0.130.1
+        ports:
+        - name: grpc
+          containerPort: 4317
+        - name: http
+          containerPort: 4318
+        - name: health
+          containerPort: 13133
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: '1'
+            memory: 512Mi
+        args:
+        - --config=/etc/otel/otel-collector.yaml
+        volumeMounts:
+        - name: config
+          mountPath: /etc/otel
+        readinessProbe:
+          tcpSocket:
+            port: grpc
+          initialDelaySeconds: 15
+          periodSeconds: 5
+      volumes:
+      - name: config
+        configMap:
+          name: otel-collector-config
+  replicas: 1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: sre-lab
+spec:
+  selector:
+    app: otel-collector
+  type: ClusterIP
+  ports:
+  - name: grpc
+    port: 4317
+    targetPort: 4317
+  - name: http
+    port: 4318
+    targetPort: 4318
 ---
 apiVersion: apps/v1
 kind: DaemonSet
-metadata: {name: alloy, namespace: sre-lab, labels: {app: alloy}}
+metadata:
+  name: filebeat
+  namespace: sre-lab
 spec:
-  # 容器至少稳定运行 5 秒才算 Available，避免“启动后立即崩溃”骗过 rollout status。
-  minReadySeconds: 5
-  selector: {matchLabels: {app: alloy}}
+  selector:
+    matchLabels:
+      app: filebeat
   template:
-    metadata: {labels: {app: alloy, service: alloy}}
+    metadata:
+      labels:
+        app: filebeat
+        service: filebeat
     spec:
       serviceAccountName: observability
       containers:
-        - name: alloy
-          image: grafana/alloy:v1.10.0
-          args: ["run", "/etc/alloy/config.alloy", "--storage.path=/var/lib/alloy/data"]
-          resources: {requests: {cpu: 25m, memory: 64Mi}, limits: {cpu: 300m, memory: 256Mi}}
-          volumeMounts:
-            - {name: config, mountPath: /etc/alloy}
-            - {name: pod-logs, mountPath: /var/log/pods, readOnly: true}
-      volumes:
+      - name: filebeat
+        image: docker.elastic.co/beats/filebeat:8.17.3
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        ports: []
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: '1'
+            memory: 512Mi
+        args:
+        - -e
+        - --strict.perms=false
+        volumeMounts:
         - name: config
-          configMap: {name: alloy-config}
-        - name: pod-logs
-          hostPath: {path: /var/log/pods}
+          mountPath: /usr/share/filebeat/filebeat.yml
+          subPath: filebeat.yml
+          readOnly: true
+        - name: logs
+          mountPath: /var/log/containers
+          readOnly: true
+        - name: pods
+          mountPath: /var/log/pods
+          readOnly: true
+        - name: data
+          mountPath: /usr/share/filebeat/data
+        securityContext:
+          runAsUser: 0
+      volumes:
+      - name: config
+        configMap:
+          name: filebeat-config
+      - name: logs
+        hostPath:
+          path: /var/log/containers
+      - name: pods
+        hostPath:
+          path: /var/log/pods
+      - name: data
+        hostPath:
+          path: /var/lib/sre-filebeat
+          type: DirectoryOrCreate
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logstash
+  namespace: sre-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: logstash
+  template:
+    metadata:
+      labels:
+        app: logstash
+    spec:
+      containers:
+      - name: logstash
+        image: docker.elastic.co/logstash/logstash:8.17.3
+        args:
+        - -f
+        - /usr/share/logstash/pipeline/pipeline.conf
+        env:
+        - name: LS_JAVA_OPTS
+          value: -Xms256m -Xmx256m
+        - name: ELASTICSEARCH_URL
+          value: http://elasticsearch:9200
+        ports:
+        - name: beats
+          containerPort: 5044
+        - name: http
+          containerPort: 8080
+        resources:
+          requests:
+            cpu: 100m
+            memory: 384Mi
+          limits:
+            cpu: '1'
+            memory: 768Mi
+        volumeMounts:
+        - name: config
+          mountPath: /usr/share/logstash/pipeline
+        - name: config
+          mountPath: /usr/share/logstash/config/logstash.yml
+          subPath: logstash.yml
+        - name: templates
+          mountPath: /usr/share/logstash/templates
+        - name: data
+          mountPath: /usr/share/logstash/data
+        readinessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: config
+        configMap:
+          name: logstash-config
+      - name: templates
+        configMap:
+          name: logstash-templates
+      - name: data
+        persistentVolumeClaim:
+          claimName: logstash-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: logstash-data
+  namespace: sre-lab
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: logstash
+  namespace: sre-lab
+spec:
+  selector:
+    app: logstash
+  ports:
+  - name: beats
+    port: 5044
+    targetPort: 5044
+  - name: http
+    port: 8080
+    targetPort: 8080

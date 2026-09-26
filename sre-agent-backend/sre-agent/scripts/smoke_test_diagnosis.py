@@ -1,4 +1,4 @@
-"""对真实 Kind/Prometheus/Loki/Tempo/MySQL/Git 执行一次无 LLM 的诊断冒烟。"""
+"""对真实 Kind/Prometheus/Elasticsearch/SkyWalking/MySQL/Git 执行一次无 LLM 的诊断冒烟。"""
 
 import asyncio
 import json

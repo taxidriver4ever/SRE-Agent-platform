@@ -1,0 +1,63 @@
+{
+  "index_patterns": [
+    "sre-agent-history-*"
+  ],
+  "priority": 200,
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "dynamic": "strict",
+      "properties": {
+        "history_id": {
+          "type": "keyword"
+        },
+        "task_id": {
+          "type": "keyword"
+        },
+        "user_id": {
+          "type": "keyword"
+        },
+        "project_id": {
+          "type": "keyword"
+        },
+        "service": {
+          "type": "keyword"
+        },
+        "timestamp": {
+          "type": "date"
+        },
+        "category": {
+          "type": "keyword"
+        },
+        "severity": {
+          "type": "keyword"
+        },
+        "tags": {
+          "type": "keyword"
+        },
+        "conclusion_status": {
+          "type": "keyword"
+        },
+        "symptom": {
+          "type": "text"
+        },
+        "root_cause": {
+          "type": "text"
+        },
+        "summary": {
+          "type": "text"
+        },
+        "evidence_summary": {
+          "type": "text",
+          "index": false
+        },
+        "evidence_ids": {
+          "type": "keyword"
+        }
+      }
+    }
+  }
+}

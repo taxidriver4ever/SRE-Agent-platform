@@ -56,6 +56,8 @@ class DiagnosisWorkflow:
         code_state_service: CodeStateService | None = None,
         kubernetes_namespace: str = "sre-lab",
         deadline_seconds: float = 240,
+        history_retrieval: Any = None,
+        default_project_id: str = "sre-lab",
     ) -> None:
         self.tools = tools
         self.catalog = ServiceCatalog(catalog_path)
@@ -64,6 +66,8 @@ class DiagnosisWorkflow:
         self.llm = llm
         self.repository_registry = repository_registry
         self.context_service = context_service
+        self.history_retrieval = history_retrieval
+        self.default_project_id = default_project_id
         self.conversation_service = conversation_service
         self.code_state_service = code_state_service
         self.kubernetes_namespace = kubernetes_namespace
@@ -173,6 +177,7 @@ class DiagnosisWorkflow:
             await self._triage(state, on_event, system_scan=system_scan, runtime=runtime)
             await runtime.phase_completed(state, WorkflowPhase.TRIAGE)
         if not runtime.should_skip_phase(WorkflowPhase.BASELINE_OBSERVATION):
+            await self._history_context(state)
             await self._baseline(state, on_event, system_scan=system_scan, runtime=runtime)
             await runtime.phase_completed(state, WorkflowPhase.BASELINE_OBSERVATION)
         if not runtime.should_skip_phase(WorkflowPhase.ANALYZE):
@@ -202,6 +207,34 @@ class DiagnosisWorkflow:
             await runtime.phase_completed(state, WorkflowPhase.END)
         report.workflow_phases = state.phases
         return report
+
+    async def _history_context(self, state: DiagnosisState) -> None:
+        """Historical cases are advisory context, never current-runtime evidence."""
+        if state.history_retrieved:
+            return
+        state.history_retrieved = True
+        if not state.user_id:
+            return
+        if self.context_service:
+            try:
+                snapshot = await asyncio.to_thread(
+                    self.context_service.repository.active_snapshot, state.user_id, state.conversation_id)
+                state.short_context = json.dumps({"summary": snapshot.summary[:1200],
+                    "context_state": snapshot.state.model_dump(mode="json")}, ensure_ascii=False)
+            except Exception as exc:
+                logger.warning("Short context unavailable: reason=%s", type(exc).__name__)
+        if self.history_retrieval is not None:
+            from app.security.scope import current_task_scope
+            scope = current_task_scope()
+            if scope is not None and scope.user_id != state.user_id:
+                return
+            try:
+                state.long_term_history = await self.history_retrieval.for_incident(
+                    state.user_id, scope.project_id if scope else self.default_project_id,
+                    state.service, state.query, scope.task_id if scope else None)
+            except Exception as exc:
+                logger.warning("History Retrieval skipped: reason=%s", type(exc).__name__)
+                state.long_term_history = "[]"
 
     async def _phase(
         self, state: DiagnosisState, phase: WorkflowPhase, callback: EventCallback | None,
@@ -587,14 +620,19 @@ class DiagnosisWorkflow:
             summary = normalized.summary
             evidence = Evidence(
                 source=self._source(tool_name), source_type=self._source(tool_name),
+                evidence_type={"Prometheus": "metric", "Elasticsearch": "log", "SkyWalking": "trace"}.get(self._source(tool_name), "runtime"),
+                service_name=arguments.get("service_name") or arguments.get("service") or state.service,
+                trace_id=next(iter(normalized.structured_data.get("trace_ids", [])), None),
+                severity=next((row.get("level") for row in normalized.structured_data.get("logs", []) if row.get("level")), None),
+                raw_reference=references[0].uri if references else None,
                 tool_name=tool_name, title=title, detail=summary, summary=summary,
                 timestamp=started_at, evidence_id=evidence_id,
                 structured_data=normalized.structured_data,
                 source_references=references, reference=references,
                 parent_evidence_ids=parent_evidence_ids or [],
                 next_hints=normalized.next_hints,
-                supports_conclusion=self._supports_conclusion(tool_name, summary),
-                direct_evidence=self._is_direct_evidence(tool_name, arguments, summary),
+                supports_conclusion=normalized.status == "success" and not normalized.structured_data.get("empty", False) and self._supports_conclusion(tool_name, summary),
+                direct_evidence=normalized.status == "success" and not normalized.structured_data.get("empty", False) and self._is_direct_evidence(tool_name, arguments, summary),
             )
             state.evidence.append(evidence)
         except TaskOwnershipLostError:

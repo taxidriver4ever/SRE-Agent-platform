@@ -161,6 +161,8 @@ class DiagnosisOrchestrator:
                     "structured_data": item.structured_data,
                 },
                 metadata={
+                    "observability": {key: getattr(item, key) for key in (
+                        "evidence_type", "service_name", "trace_id", "severity", "raw_reference")},
                     "source_references": references,
                     "parent_evidence_ids": item.parent_evidence_ids,
                     "next_hints": item.next_hints,

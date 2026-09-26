@@ -50,8 +50,8 @@ class Settings:
     # 以下配置均指向本机 Kind 实验平台；使用环境变量后也能连接到远端只读端点。
     kubernetes_namespace: str
     prometheus_base_url: str
-    loki_base_url: str
-    tempo_base_url: str
+    elasticsearch_url: str
+    skywalking_oap_url: str
     mysql_host: str
     mysql_port: int
     mysql_user: str
@@ -83,7 +83,6 @@ class Settings:
     default_project_id: str
     tool_policy_path: str
     prometheus_bearer_token: str | None
-    loki_bearer_token: str | None
     sandbox_workspace_root: str
     sandbox_image: str
     sandbox_cpus: float
@@ -104,6 +103,21 @@ class Settings:
     validation_allow_build_network: bool
     # One process uses one backend; rollback never double-executes a request.
     agent_backend: str = "langchain"
+    elasticsearch_username: str | None = None
+    elasticsearch_password: str | None = None
+    elasticsearch_index_pattern: str = "sre-logs-*"
+    skywalking_zipkin_url: str = ""
+    skywalking_bearer_token: str | None = None
+    skywalking_service_name: str = "sre-agent"
+    history_search_enabled: bool = True
+    elasticsearch_history_index: str = "sre-agent-history-v1"
+    history_timeout_seconds: float = 2.0
+    history_top_k: int = 5
+    history_lookback_days: int = 365
+    history_context_chars: int = 4000
+    history_sync_interval_seconds: float = 30
+    history_sync_batch_size: int = 20
+    logstash_url: str = ""
 
 
 def get_settings() -> Settings:
@@ -128,9 +142,24 @@ def get_settings() -> Settings:
         gateway_max_tokens=max(256, min(1200, int(os.getenv("GATEWAY_MAX_TOKENS", "512")))),
         agent_max_iterations=int(os.getenv("AGENT_MAX_ITERATIONS", "8")),
         kubernetes_namespace=os.getenv("KUBERNETES_NAMESPACE", "sre-lab"),
-        prometheus_base_url=os.getenv("PROMETHEUS_BASE_URL", "http://127.0.0.1:19090").rstrip("/"),
-        loki_base_url=os.getenv("LOKI_BASE_URL", "http://127.0.0.1:13100").rstrip("/"),
-        tempo_base_url=os.getenv("TEMPO_BASE_URL", "http://127.0.0.1:13200").rstrip("/"),
+        prometheus_base_url=os.getenv("PROMETHEUS_URL", os.getenv("PROMETHEUS_BASE_URL", "http://127.0.0.1:19090")).rstrip("/"),
+        elasticsearch_url=os.getenv("ELASTICSEARCH_URL", "http://127.0.0.1:19200").rstrip("/"),
+        skywalking_oap_url=os.getenv("SKYWALKING_OAP_URL", "http://127.0.0.1:12800").rstrip("/"),
+        elasticsearch_username=os.getenv("ELASTICSEARCH_USERNAME") or None,
+        elasticsearch_password=os.getenv("ELASTICSEARCH_PASSWORD") or None,
+        elasticsearch_index_pattern=os.getenv("ELASTICSEARCH_LOG_INDEX", os.getenv("ELASTICSEARCH_INDEX_PATTERN", "sre-logs-*")),
+        history_search_enabled=os.getenv("HISTORY_SEARCH_ENABLED", "true").lower() == "true",
+        elasticsearch_history_index=os.getenv("ELASTICSEARCH_HISTORY_INDEX", "sre-agent-history-v1"),
+        history_timeout_seconds=float(os.getenv("HISTORY_TIMEOUT_SECONDS", "2")),
+        history_top_k=int(os.getenv("HISTORY_TOP_K", "5")),
+        history_lookback_days=int(os.getenv("HISTORY_LOOKBACK_DAYS", "365")),
+        history_context_chars=int(os.getenv("HISTORY_CONTEXT_CHARS", "4000")),
+        history_sync_interval_seconds=float(os.getenv("HISTORY_SYNC_INTERVAL_SECONDS", "30")),
+        history_sync_batch_size=int(os.getenv("HISTORY_SYNC_BATCH_SIZE", "20")),
+        logstash_url=os.getenv("LOGSTASH_URL", ""),
+        skywalking_zipkin_url=os.getenv("SKYWALKING_ZIPKIN_URL", "http://127.0.0.1:19412/zipkin").rstrip("/"),
+        skywalking_bearer_token=os.getenv("SKYWALKING_BEARER_TOKEN") or None,
+        skywalking_service_name=os.getenv("SKYWALKING_SERVICE_NAME", "sre-agent"),
         mysql_host=os.getenv("MYSQL_HOST", "127.0.0.1"),
         mysql_port=int(os.getenv("MYSQL_PORT", "13307")),
         mysql_user=os.getenv("MYSQL_USER", "sre_reader"),
@@ -191,7 +220,6 @@ def get_settings() -> Settings:
         ),
         # 真实观测凭证仅由后端 HTTP Client 使用，不会进入 Tool Schema 或 LLM 上下文。
         prometheus_bearer_token=os.getenv("PROMETHEUS_BEARER_TOKEN") or None,
-        loki_bearer_token=os.getenv("LOKI_BEARER_TOKEN") or None,
         sandbox_workspace_root=os.getenv(
             "SRE_SANDBOX_WORKSPACE_ROOT",
             str(Path(tempfile.gettempdir()) / "sre-agent-sandbox-tasks"),

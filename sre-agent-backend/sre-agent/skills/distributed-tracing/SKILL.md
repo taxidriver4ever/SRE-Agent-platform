@@ -1,6 +1,6 @@
 ---
 name: distributed-tracing
-description: Trace one request across Java, Go, Python, Node.js, HTTP, and MySQL using W3C trace context and Tempo. Use for intermittent latency, dependency timeout, retry amplification, cross-service errors, or when identifying the exact causal span and running service version.
+description: Trace one request across Java, Go, Python, Node.js, HTTP, and MySQL using W3C trace context and SkyWalking. Use for intermittent latency, dependency timeout, retry amplification, cross-service errors, or when identifying the exact causal span and running service version.
 ---
 
 # Distributed Tracing
@@ -11,7 +11,7 @@ description: Trace one request across Java, Go, Python, Node.js, HTTP, and MySQL
 
 ## 调查顺序
 
-1. 从 Loki 业务日志或响应头取得合法 32 位 `trace_id`。
+1. 从 Elasticsearch 业务日志或响应头取得合法 32 位 `trace_id`。
 2. 使用 `query_trace(trace_id=...)` 精确读取 Trace，避免健康检查和无关请求。
 3. 按父子关系计算 critical path，标记 server/client/database Span。
 4. 检查同一 Trace 是否保持 `service.name`、`service.version`、environment 和 Pod 身份。

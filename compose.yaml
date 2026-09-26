@@ -1,0 +1,244 @@
+# Development stack. Model inference remains behind the existing Gateway.
+name: sre-platform
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.3
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    mem_limit: 1g
+    ports: ["127.0.0.1:19200:9200"]
+    volumes: ["elasticsearch-data:/usr/share/elasticsearch/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=3s'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.17.3
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    mem_limit: 768m
+    ports: ["127.0.0.1:15601:5601"]
+    depends_on:
+      elasticsearch: {condition: service_healthy}
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.17.3
+    command: ["-f", "/usr/share/logstash/pipeline/pipeline.conf"]
+    environment:
+      LS_JAVA_OPTS: -Xms256m -Xmx256m
+      ELASTICSEARCH_URL: ${ELASTICSEARCH_URL:-http://elasticsearch:9200}
+      ELASTICSEARCH_USERNAME: ${ELASTICSEARCH_USERNAME:-}
+      ELASTICSEARCH_PASSWORD: ${ELASTICSEARCH_PASSWORD:-}
+      ELASTICSEARCH_HISTORY_INDEX: ${ELASTICSEARCH_HISTORY_INDEX:-sre-agent-history-v1}
+      ELASTICSEARCH_EVENT_INDEX: ${ELASTICSEARCH_EVENT_INDEX:-sre-agent-events}
+      ELASTICSEARCH_LOG_PREFIX: ${ELASTICSEARCH_LOG_PREFIX:-sre-logs}
+    mem_limit: 768m
+    volumes:
+      - ./sre-broken-system/sre-lab-infra/observability/logstash/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+      - ./sre-broken-system/sre-lab-infra/observability/logstash:/usr/share/logstash/pipeline:ro
+      - ./sre-broken-system/sre-lab-infra/observability/logstash/history-template.json:/usr/share/logstash/templates/history-template.json:ro
+      - ./sre-broken-system/sre-lab-infra/observability/logstash/event-template.json:/usr/share/logstash/templates/event-template.json:ro
+      - ./sre-broken-system/sre-lab-infra/observability/log-template.json:/usr/share/logstash/templates/log-template.json:ro
+      - logstash-data:/usr/share/logstash/data
+    ports: ["127.0.0.1:15044:5044", "127.0.0.1:18090:8080"]
+    depends_on:
+      elasticsearch: {condition: service_healthy}
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.17.3
+    user: root
+    command: ["-e", "--strict.perms=false"]
+    mem_limit: 256m
+    volumes:
+      - ./sre-broken-system/sre-lab-infra/observability/filebeat-docker.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - filebeat-data:/usr/share/filebeat/data
+    depends_on: [logstash]
+  skywalking-oap:
+    image: apache/skywalking-oap-server:10.2.0
+    environment:
+      SW_STORAGE: elasticsearch
+      SW_STORAGE_ES_CLUSTER_NODES: elasticsearch:9200
+      SW_NAMESPACE: sw
+      SW_STORAGE_ES_INDEX_REPLICAS_NUMBER: "0"
+      SW_STORAGE_ES_SUPER_DATASET_INDEX_SHARDS_FACTOR: "1"
+      SW_CORE_RECORD_DATA_TTL: "2"
+      SW_CORE_METRICS_DATA_TTL: "2"
+      SW_OTEL_RECEIVER_ENABLED_HANDLERS: otlp-traces
+      SW_RECEIVER_ZIPKIN: default
+      SW_QUERY_ZIPKIN: default
+      SW_HEALTH_CHECKER: default
+      JAVA_OPTS: -Xms256m -Xmx512m
+    mem_limit: 1g
+    ports: ["127.0.0.1:12800:12800", "127.0.0.1:11800:11800", "127.0.0.1:19412:9412"]
+    depends_on:
+      elasticsearch: {condition: service_healthy}
+  skywalking-ui:
+    image: apache/skywalking-ui:10.2.0
+    environment:
+      SW_OAP_ADDRESS: http://skywalking-oap:12800
+      SW_ZIPKIN_ADDRESS: http://skywalking-oap:9412
+    mem_limit: 512m
+    ports: ["127.0.0.1:18088:8080"]
+    depends_on: [skywalking-oap]
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.130.1
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      - ./sre-broken-system/sre-lab-infra/observability/otel-collector.yaml:/etc/otel/config.yaml:ro
+    mem_limit: 256m
+    depends_on: [skywalking-oap]
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=24h"]
+    volumes:
+      - ./sre-broken-system/sre-lab-infra/observability/prometheus-compose.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["127.0.0.1:19090:9090"]
+    mem_limit: 512m
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${APPLICATION_MYSQL_ROOT_PASSWORD:-local_root_change_me}
+      MYSQL_DATABASE: sre_agent
+      MYSQL_USER: sre_agent
+      MYSQL_PASSWORD: ${APPLICATION_MYSQL_PASSWORD:-local_agent_change_me}
+    ports: ["127.0.0.1:13308:3306"]
+    volumes: ["application-mysql:/var/lib/mysql"]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  lab-mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${LAB_MYSQL_ROOT_PASSWORD:-local_lab_change_me}
+    command: ["--slow-query-log=ON", "--log-output=TABLE", "--long-query-time=0.5", "--performance-schema=ON"]
+    volumes:
+      - lab-mysql:/var/lib/mysql
+      - ./sre-broken-system/sre-lab-infra/mysql/init:/docker-entrypoint-initdb.d:ro
+    ports: ["127.0.0.1:13307:3306"]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+  redis:
+    image: redis:7.4-alpine
+    mem_limit: 128m
+    command: ["redis-server", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
+  sre-gateway:
+    build: ./sre-agent-backend/sre-gateway
+    environment:
+      GATEWAY_MYSQL_HOST: mysql
+      GATEWAY_MYSQL_PORT: "3306"
+      GATEWAY_MYSQL_USER: sre_agent
+      GATEWAY_MYSQL_PASSWORD: ${APPLICATION_MYSQL_PASSWORD:-local_agent_change_me}
+      GATEWAY_MYSQL_DATABASE: sre_agent
+      VLLM_BASE_URL: ${VLLM_BASE_URL:-http://host.docker.internal:18000/v1}
+      VLLM_API_KEY: ${VLLM_API_KEY:-EMPTY}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      mysql: {condition: service_healthy}
+  sre-agent:
+    build:
+      context: .
+      dockerfile: sre-agent-backend/sre-agent/Dockerfile
+    environment:
+      APPLICATION_MYSQL_HOST: mysql
+      APPLICATION_MYSQL_PORT: "3306"
+      APPLICATION_MYSQL_USER: sre_agent
+      APPLICATION_MYSQL_PASSWORD: ${APPLICATION_MYSQL_PASSWORD:-local_agent_change_me}
+      APPLICATION_MYSQL_DATABASE: sre_agent
+      SRE_INITIAL_USERNAME: ${SRE_INITIAL_USERNAME:-admin}
+      SRE_INITIAL_PASSWORD: ${SRE_INITIAL_PASSWORD:-local_login_change_me}
+      GATEWAY_BASE_URL: http://sre-gateway:8000
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY:-}
+      GATEWAY_MODEL: ${GATEWAY_MODEL:-vllm/qwen3-4b}
+      PROMETHEUS_URL: http://prometheus:9090
+      ELASTICSEARCH_URL: ${ELASTICSEARCH_URL:-http://elasticsearch:9200}
+      ELASTICSEARCH_LOG_INDEX: ${ELASTICSEARCH_LOG_INDEX:-sre-logs-*}
+      ELASTICSEARCH_USERNAME: ${ELASTICSEARCH_USERNAME:-}
+      ELASTICSEARCH_PASSWORD: ${ELASTICSEARCH_PASSWORD:-}
+      ELASTICSEARCH_HISTORY_INDEX: ${ELASTICSEARCH_HISTORY_INDEX:-sre-agent-history-v1}
+      HISTORY_SEARCH_ENABLED: ${HISTORY_SEARCH_ENABLED:-true}
+      HISTORY_TIMEOUT_SECONDS: ${HISTORY_TIMEOUT_SECONDS:-2}
+      HISTORY_TOP_K: ${HISTORY_TOP_K:-5}
+      LOGSTASH_URL: http://logstash:8080
+      SKYWALKING_OAP_URL: http://skywalking-oap:12800
+      SKYWALKING_ZIPKIN_URL: http://skywalking-oap:9412/zipkin
+      SKYWALKING_SERVICE_NAME: sre-agent
+      SKYWALKING_AGENT_ENABLED: "true"
+      SKYWALKING_AGENT_COLLECTOR: skywalking-oap:11800
+      MYSQL_HOST: lab-mysql
+      MYSQL_PORT: "3306"
+      SRE_REPOSITORY_PATH: /opt/sre-broken-system
+      SERVICE_CATALOG_PATH: /opt/sre-broken-system/sre-lab-infra/service-catalog.yaml
+    volumes: ["./sre-broken-system:/opt/sre-broken-system:ro"]
+    logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}
+    ports: ["127.0.0.1:8001:8001"]
+    depends_on:
+      mysql: {condition: service_healthy}
+      skywalking-oap: {condition: service_started}
+  frontend:
+    build: ./sre-agent-frontend
+    ports: ["127.0.0.1:3000:8080"]
+    depends_on: [sre-agent]
+  order-service:
+    build: ./sre-broken-system/order-service
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://lab-mysql:3306/sre_lab?useSSL=false&allowPublicKeyRetrieval=true
+      SPRING_DATASOURCE_USERNAME: sre_app
+      SPRING_DATASOURCE_PASSWORD: sre_app_dev_only
+      INVENTORY_BASE_URL: http://inventory-service:8081
+      USER_BASE_URL: http://user-service:8082
+      PAYMENT_BASE_URL: http://payment-service:8083
+      NOTIFICATION_BASE_URL: http://notification-service:8084
+      OTEL_SERVICE_NAME: order-service
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+    logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}
+    ports: ["127.0.0.1:18080:8080"]
+    depends_on:
+      lab-mysql: {condition: service_healthy}
+  inventory-service:
+    build: ./sre-broken-system/inventory-service
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      RECOMMENDATION_BASE_URL: http://recommendation-service:8085
+    logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}
+  user-service:
+    build: ./sre-broken-system/user-service
+    environment:
+      DATABASE_URL: mysql+pymysql://sre_app:sre_app_dev_only@lab-mysql:3306/sre_lab
+      SKYWALKING_AGENT_ENABLED: "true"
+      SKYWALKING_AGENT_COLLECTOR: skywalking-oap:11800
+      SKYWALKING_SERVICE_NAME: user-service
+    logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}
+    depends_on:
+      lab-mysql: {condition: service_healthy}
+  payment-service:
+    build: ./sre-broken-system/payment-service
+    logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}
+  notification-service:
+    build: ./sre-broken-system/notification-service
+    logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}
+  recommendation-service:
+    build: ./sre-broken-system/recommendation-service
+    environment:
+      NOTIFICATION_BASE_URL: http://notification-service:8084
+      SKYWALKING_AGENT_ENABLED: "true"
+      SKYWALKING_AGENT_COLLECTOR: skywalking-oap:11800
+      SKYWALKING_SERVICE_NAME: recommendation-service
+    logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}
+volumes:
+  logstash-data:
+  elasticsearch-data:
+  filebeat-data:
+  application-mysql:
+  lab-mysql:

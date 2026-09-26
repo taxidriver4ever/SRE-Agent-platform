@@ -12,9 +12,9 @@ $inventoryBad = (git -C (Join-Path $workspaceRoot "inventory-service") rev-parse
 
 & (Join-Path $PSScriptRoot "reset-lab.ps1") | Out-Null
 
-# 每个 Case 使用新的 Prometheus/Loki/Tempo 空间，避免上一个场景在最近 30 分钟
+# 每个 Case 使用新的 Prometheus/Elasticsearch/SkyWalking 空间，避免上一个场景在最近 30 分钟
 # 窗口内留下的指标、日志和 Trace 污染本次 Evidence。
-foreach ($deployment in @('prometheus', 'loki', 'tempo')) {
+foreach ($deployment in @('prometheus', 'elasticsearch', 'skywalking-oap')) {
     kubectl -n sre-lab rollout restart "deployment/$deployment" | Out-Null
     kubectl -n sre-lab rollout status "deployment/$deployment" --timeout=180s | Out-Null
 }

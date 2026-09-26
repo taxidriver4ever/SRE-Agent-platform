@@ -19,6 +19,10 @@ projects:
       - query_metrics
       - get_service_health
       - query_logs
+      - search_logs
+      - search_traces
+      - get_trace
+      - get_service_metrics
       - query_trace
       - query_slow_queries
       - query_sql_digest

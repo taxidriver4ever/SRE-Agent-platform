@@ -1,6 +1,8 @@
 # SRE Lab Infra
 
-故障实验系统的基础设施与操作入口，统一管理 Kind Kubernetes、MySQL、Prometheus、Loki、Tempo、OpenTelemetry Collector、Alloy、六个业务服务、十个场景和 PowerShell 自动化。
+当前日志链路为 Filebeat → Logstash → Elasticsearch。Logstash 也接收 Diagnosis Event 和可选 History JSON，三类索引分离；完整架构图、部署与验证见 [History Search 架构报告](../../docs/history-search-architecture.md)。
+
+故障实验系统的基础设施与操作入口，统一管理 Kind Kubernetes、MySQL、Prometheus、Elasticsearch、Kibana、SkyWalking OAP/UI、OpenTelemetry Collector、Filebeat、六个业务服务、十个场景和 PowerShell 自动化。完整容器开发环境也可通过仓库根目录 `docker compose up -d --build` 启动，详见[迁移报告](../../docs/observability-migration.md)。
 
 ## 为什么采用 Polyglot + Multi-Repo
 
@@ -32,7 +34,8 @@ Java、Go、Python、Node.js 具有不同的 runtime、连接池、GC、Event Lo
 | 组件 | 地址 |
 | --- | --- |
 | order / inventory / user / payment | `127.0.0.1:18080` / `18081` / `18082` / `18083` |
-| Prometheus / Loki / Tempo | `127.0.0.1:19090` / `13100` / `13200` |
+| Prometheus / Elasticsearch / SkyWalking OAP | `127.0.0.1:19090` / `19200` / `12800` |
+| Kibana / SkyWalking UI / OAP Zipkin Query | `15601` / `18088` / `19412` |
 | Lab MySQL | `127.0.0.1:13307` |
 
 notification 和 recommendation 默认仅在集群内使用 `8084`、`8085`，可通过 `kubectl port-forward` 临时访问。

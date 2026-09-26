@@ -4,7 +4,7 @@
   "symptom": "用户模块响应变慢，CPU 是否已经打满？",
   "expected_service": "user-service",
   "expected_root_cause": ["CPU", "计算", "saturation"],
-  "required_evidence": ["Prometheus", "Loki"],
+  "required_evidence": ["Prometheus", "Elasticsearch"],
   "forbidden_shortcuts": ["SRE-004", "cpu_saturation", "质数计算"],
   "minimum_confidence": 0.65
 }

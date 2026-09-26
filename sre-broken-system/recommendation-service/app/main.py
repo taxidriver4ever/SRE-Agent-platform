@@ -1,4 +1,7 @@
 """FastAPI composition root and request metrics middleware."""
+from app.observability.skywalking import start
+start()
+
 import secrets
 import time
 from fastapi import FastAPI,Request

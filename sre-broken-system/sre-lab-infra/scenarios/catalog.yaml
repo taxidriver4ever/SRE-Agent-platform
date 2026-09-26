@@ -1,5 +1,5 @@
 scenarios:
-  SRE-001: {title: "Real slow SQL", service: order-service, mechanism: "BAD leading-wildcard LIKE bypasses B-Tree index", evidence: [Prometheus P95, Tempo JDBC span, MySQL slow_log, EXPLAIN type ALL, Git diff]}
+  SRE-001: {title: "Real slow SQL", service: order-service, mechanism: "BAD leading-wildcard LIKE bypasses B-Tree index", evidence: [Prometheus P95, SkyWalking JDBC span, MySQL slow_log, EXPLAIN type ALL, Git diff]}
   SRE-002: {title: "DB pool exhaustion", service: order-service, mechanism: "small Hikari pool plus CPU-expensive MySQL statement and concurrency", evidence: [Hikari active/pending/max, connection timeout logs, HTTP 5xx, MySQL]}
   SRE-003: {title: "Dependency timeout", service: inventory-service, mechanism: "inventory reservation exceeds order client read timeout", evidence: [cross-service Trace, timeout logs, dependency latency]}
   SRE-004: {title: "CPU saturation", service: user-service, mechanism: "real prime calculation blocks workers", evidence: [Pod CPU, Python blocking gauge, HTTP P95]}

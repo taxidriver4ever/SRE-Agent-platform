@@ -15,7 +15,7 @@
 - `kubectl get pods -n sre-lab`
 - `http://127.0.0.1:18080/actuator/health`
 - `http://127.0.0.1:18081/health`、`:18082/health`、`:18083/health`
-- `http://127.0.0.1:19090/-/ready`、`:13100/ready`、`:13200/ready`
+- `http://127.0.0.1:19090/-/ready`、`http://127.0.0.1:19200/_cluster/health`；SkyWalking 使用 `:12800/graphql` POST 查询 `{ version }`
 - `http://127.0.0.1:8001/health`
 
 ## 场景与恢复
@@ -27,6 +27,6 @@ SRE-008 只劣化一个稳定 Pod；SRE-009 让同一个 Service 同时路由到
 ## 排障
 
 - rollout 失败：查看 `kubectl -n sre-lab get pods` 和 Events；部署脚本遇非零退出会立即停止。
-- Loki 空结果：检查 Alloy DaemonSet 是否挂载 `/var/log/pods`。
-- Trace 空结果：检查 otel-collector 和 Tempo ready。
+- Elasticsearch 空结果：检查 Filebeat DaemonSet 是否挂载 `/var/log/pods`。
+- Trace 空结果：检查 otel-collector 和 SkyWalking ready。
 - Agent 503：缺少 `GATEWAY_API_KEY`；502：Gateway/vLLM 上游失败。迁移期可临时把 `GATEWAY_MODEL` 切回 `ollama/...` 验证是否为 vLLM 故障。

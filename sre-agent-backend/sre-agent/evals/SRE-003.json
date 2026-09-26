@@ -4,7 +4,7 @@
   "symptom": "为什么 order 很慢，但是 CPU 又不高？库存依赖是否超时？",
   "expected_service": "order-service",
   "expected_root_cause": ["inventory-service", "下游", "超时", "timeout"],
-  "required_evidence": ["Tempo", "Loki"],
+  "required_evidence": ["SkyWalking", "Elasticsearch"],
   "forbidden_shortcuts": ["SRE-003", "固定 Trace ID", "inventory-service 正确答案"],
   "minimum_confidence": 0.65
 }

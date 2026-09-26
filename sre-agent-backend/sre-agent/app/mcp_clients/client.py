@@ -90,7 +90,10 @@ class FastMCPToolClient:
                 value = result.data if result.data is not None else {
                     "content": [block.model_dump(mode="json") for block in result.content]
                 }
-            self._audit(scope, name, arguments, "success", started)
+            payload = value.get("data", value) if isinstance(value, dict) else {}
+            failed = isinstance(payload, dict) and payload.get("success") is False
+            self._audit(scope, name, arguments, "failed" if failed else "success", started,
+                        payload.get("error_type") if failed else None)
             return value
         except TaskOwnershipLostError:
             raise

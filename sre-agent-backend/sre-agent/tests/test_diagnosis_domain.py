@@ -33,7 +33,7 @@ class _Workflow:
 
 def _report() -> DiagnosisReport:
     evidence = Evidence(
-        source="TEMPO", source_type="TEMPO", tool_name="query_trace", title="Trace",
+        source="SKYWALKING", source_type="SKYWALKING", tool_name="query_trace", title="Trace",
         detail="payment span slow", summary="payment span slow",
         structured_data={
             "services": ["payment-service"],

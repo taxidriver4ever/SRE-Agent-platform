@@ -3,6 +3,9 @@
 import json
 import logging
 import time
+import os
+import socket
+from app.observability.skywalking import correlation
 from prometheus_client import Counter, Gauge, Histogram
 
 from app.core.config import settings
@@ -17,9 +20,16 @@ BLOCKING = Gauge("sre_python_blocking_operation", "Whether a blocking experiment
 
 def log_event(level: str, message: str, trace_id: str = "", **fields: object) -> None:
     """Emit the same JSON envelope used by Java, Go and Node services."""
+    native_trace, span = correlation()
     payload = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "service": "user-service", "version": settings.version, "pod": settings.pod_name,
-        "level": level, "trace_id": trace_id, "message": message, **fields,
+        "level": level, "message": message, **fields,
+        "@timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "service_name": "user-service", "environment": os.getenv("ENVIRONMENT", "development"),
+        "trace_id": native_trace or trace_id or None, "span_id": span,
+        "request_id": fields.get("request_id"), "host": socket.gethostname(),
+        "pod_name": settings.pod_name, "namespace": os.getenv("KUBERNETES_NAMESPACE", "sre-lab"),
+        "exception_type": fields.get("exception_type"), "stack_trace": fields.get("stack_trace"),
     }
     logger.log(getattr(logging, level, logging.INFO), json.dumps(payload, ensure_ascii=False))

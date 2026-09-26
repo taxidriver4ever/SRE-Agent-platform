@@ -47,8 +47,15 @@ def _rules() -> dict[str, ToolRule]:
         },
         "query_metrics": ("prometheus", _object({"query": _STRING, "time_range_minutes": _MINUTES}, ["query"])),
         "get_service_health": ("prometheus", _object({"service": _STRING, "time_range_minutes": _MINUTES}, ["service"])),
-        "query_logs": ("loki", _object({"service": _STRING, "level": _STRING, "keyword": _STRING, "time_range_minutes": _MINUTES, "limit": _LIMIT})),
-        "query_trace": ("tempo", _object({"service": _STRING, "trace_id": _STRING, "limit": _LIMIT})),
+        **{name: ("elasticsearch", _object({"service": _STRING, "service_name": _STRING,
+            "start_time": _STRING, "end_time": _STRING, "level": _STRING, "keyword": _STRING,
+            "trace_id": _STRING, "exception_type": _STRING, "time_range_minutes": _MINUTES, "limit": _LIMIT}))
+            for name in ("query_logs", "search_logs")},
+        **{name: ("skywalking", _object({"service": _STRING, "service_name": _STRING,
+            "start_time": _STRING, "end_time": _STRING, "trace_id": _STRING,
+            "time_range_minutes": _MINUTES, "limit": _LIMIT,
+            "min_duration_ms": {"type": "integer", "minimum": 0}, "error_only": {"type": "boolean"}}))
+            for name in ("query_trace", "search_traces", "get_trace", "get_service_metrics")},
         "query_slow_queries": ("mysql", _object({"time_range_minutes": _MINUTES, "limit": _LIMIT})),
         "query_sql_digest": ("mysql", _object({"limit": _LIMIT})),
         "explain_sql": ("mysql", _object({"sql": _STRING}, ["sql"])),
@@ -140,7 +147,7 @@ class ToolPolicy:
         namespace = arguments.get("namespace")
         if namespace is not None and namespace != project.namespace:
             raise ToolPolicyError("namespace is outside the project scope")
-        for key in ("name", "service", "repository"):
+        for key in ("name", "service", "service_name", "repository"):
             value = arguments.get(key)
             if value and not _SAFE_NAME.fullmatch(str(value)):
                 raise ToolPolicyError(f"invalid {key}")
@@ -159,10 +166,12 @@ class ToolPolicy:
             not isinstance(query, str) or not query.strip() or len(query) > 2000 or "\n" in query
         ):
             raise ToolPolicyError("PromQL must be a single line with 1-2000 characters")
-        if name == "query_trace" and not arguments.get("service") and not arguments.get("trace_id"):
+        if name in {"query_trace", "search_traces", "get_service_metrics"} and not arguments.get("service") and not arguments.get("service_name") and not arguments.get("trace_id"):
             raise ToolPolicyError("query_trace requires service or trace_id")
         trace_id = arguments.get("trace_id")
-        if trace_id and not re.fullmatch(r"[0-9a-fA-F]{16,32}", str(trace_id)):
+        if name == "get_trace" and not trace_id:
+            raise ToolPolicyError("get_trace requires trace_id")
+        if trace_id and not re.fullmatch(r"[a-zA-Z0-9_.:-]{1,256}", str(trace_id)):
             raise ToolPolicyError("invalid trace_id")
         keyword = arguments.get("keyword")
         if keyword is not None and len(str(keyword)) > 120:

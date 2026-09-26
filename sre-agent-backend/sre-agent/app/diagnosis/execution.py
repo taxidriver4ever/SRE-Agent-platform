@@ -260,6 +260,8 @@ class DurableWorkflowRuntime(WorkflowRuntime):
             title=evidence.title, summary=evidence.summary or evidence.detail,
             raw_data={"result": result, "structured_data": structured},
             metadata={
+                "observability": {key: getattr(evidence, key) for key in (
+                    "evidence_type", "service_name", "trace_id", "severity", "raw_reference")},
                 "logical_step_key": idempotency_key,
                 "parent_evidence_ids": evidence.parent_evidence_ids,
                 "source_references": [item.model_dump(mode="json") for item in evidence.source_references],
@@ -275,14 +277,18 @@ class DurableWorkflowRuntime(WorkflowRuntime):
         raw_data = evidence.raw_data if isinstance(evidence.raw_data, dict) else {}
         structured = raw_data.get("structured_data", {})
         metadata = evidence.metadata
+        from app.workflow.evidence_gate import source_for_tool
         return Evidence(
-            source=evidence.source_type.lower(), source_type=evidence.source_type,
+            source=source_for_tool(evidence.source_name), source_type=evidence.source_type,
+            **{key: value for key, value in metadata.get("observability", {}).items()
+               if key in {"evidence_type", "service_name", "trace_id", "severity", "raw_reference"}},
             tool_name=evidence.source_name, title=evidence.title,
             detail=evidence.summary, summary=evidence.summary,
             structured_data=structured if isinstance(structured, dict) else {},
             timestamp=datetime.fromisoformat(evidence.timestamp.replace("Z", "+00:00")),
             evidence_id=evidence.id,
             parent_evidence_ids=[str(item) for item in metadata.get("parent_evidence_ids", [])],
+            source_references=metadata.get("source_references", []),
             supports_conclusion=evidence.supports_conclusion,
             direct_evidence=bool(metadata.get("direct_evidence", False)),
         )

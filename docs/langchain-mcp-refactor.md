@@ -72,7 +72,7 @@ FastAPI
                     /                  \
            本地进程内工具服务       Kubernetes stdio MCP
           /      |      |    \                 |
-     Prometheus Loki  MySQL   Git/Tempo       Kubernetes
+     Prometheus ES    MySQL   Git/SkyWalking       Kubernetes
 ```
 
 本地服务已有职责明确的工具模块，本轮维持聚合部署和原工具名；不为了展示多 Server 而增加端口和进程。未来可独立部署各模块，Agent 接口无需变化。
