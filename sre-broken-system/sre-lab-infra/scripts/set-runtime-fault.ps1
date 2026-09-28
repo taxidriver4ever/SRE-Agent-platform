@@ -2,7 +2,10 @@ param(
     [Parameter(Mandatory=$true)]
     [ValidateSet('order-service','inventory-service','user-service','payment-service','notification-service','recommendation-service')]
     [string]$Service,
-    [Parameter(Mandatory=$true)] [ValidatePattern('^[a-z0-9_-]+$')] [string]$Mode
+    [Parameter(Mandatory=$true)] [ValidatePattern('^[a-z0-9_-]+$')] [string]$Mode,
+    [ValidateRange(1,300)] [int]$DurationSeconds = 120,
+    [ValidateRange(0,10000)] [int]$DelayMs = 3000,
+    [ValidateRange(0,1)] [double]$ErrorRate = 1
 )
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
@@ -18,7 +21,7 @@ foreach ($pod in $pods) {
     $listener.Stop()
     $forward = Start-Process kubectl -ArgumentList '-n','sre-lab','port-forward',"pod/$($pod.metadata.name)","${localPort}:$($ports[$Service])" -WindowStyle Hidden -PassThru
     try {
-        $path = if ($Service -eq 'order-service') { "/debug/fault/$Mode" } else { "/debug/fault?mode=$Mode" }
+        $path = "/internal/faults"
         $ready = $false
         foreach ($attempt in 1..20) {
             if ($forward.HasExited) { throw 'Port forward exited' }
@@ -26,7 +29,8 @@ foreach ($pod in $pods) {
             catch { Start-Sleep -Milliseconds 500 }
         }
         if (-not $ready) { throw 'Fault endpoint unavailable' }
-        Invoke-RestMethod -Method Post "http://127.0.0.1:$localPort$path" -TimeoutSec 5
+        $body = @{fault=$Mode; duration_seconds=$DurationSeconds; parameters=@{delay_ms=$DelayMs; error_rate=$ErrorRate}} | ConvertTo-Json -Compress
+        Invoke-RestMethod -Method Post "http://127.0.0.1:$localPort$path" -ContentType 'application/json' -Body $body -TimeoutSec 5
     } finally {
         if (-not $forward.HasExited) { Stop-Process -Id $forward.Id }
     }

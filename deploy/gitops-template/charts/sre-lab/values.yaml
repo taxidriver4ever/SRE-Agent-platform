@@ -13,8 +13,8 @@ services:
     language: Java 21
     sourcePath: sre-broken-system/order-service/src/main/java/local/srelab/order/repository/OrderRepository.java
     port: 8080
-    serviceType: NodePort
-    nodePort: 30080
+    serviceType: ClusterIP
+    nodePort: null
     readinessPath: /actuator/health/readiness
     livenessPath: /actuator/health/liveness
     metricsPath: /actuator/prometheus
@@ -43,13 +43,13 @@ services:
       tag: ''
       digest: ''
     previousSourceSha: ''
-    replicas: 2
+    replicas: 1
     language: Go 1.26
     sourcePath: sre-broken-system/inventory-service/internal/client/recommendation.go
     port: 8081
     serviceType: ClusterIP
     nodePort: null
-    readinessPath: /health
+    readinessPath: /ready
     livenessPath: /health
     metricsPath: /metrics
     resources:
@@ -62,6 +62,9 @@ services:
     config:
       RECOMMENDATION_BASE_URL: http://recommendation-service:8085
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+      INVENTORY_DATA_FILE: /data/inventory.json
   user-service:
     image:
       repository: ''
@@ -74,7 +77,7 @@ services:
     port: 8082
     serviceType: ClusterIP
     nodePort: null
-    readinessPath: /health
+    readinessPath: /ready
     livenessPath: /health
     metricsPath: /metrics
     resources:
@@ -86,9 +89,11 @@ services:
         memory: 256Mi
     config:
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
-      SKYWALKING_AGENT_ENABLED: 'true'
+      SKYWALKING_AGENT_ENABLED: 'false'
       SKYWALKING_AGENT_COLLECTOR: skywalking-oap:11800
       SKYWALKING_SERVICE_NAME: user-service
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
   payment-service:
     image:
       repository: ''
@@ -101,7 +106,7 @@ services:
     port: 8083
     serviceType: ClusterIP
     nodePort: null
-    readinessPath: /health
+    readinessPath: /ready
     livenessPath: /health
     metricsPath: /metrics
     resources:
@@ -110,10 +115,18 @@ services:
         memory: 64Mi
       limits:
         cpu: 600m
-        memory: 128Mi
+        memory: 256Mi
     config:
       NOTIFICATION_BASE_URL: http://notification-service:8084
-      NODE_OPTIONS: --max-old-space-size=96
+      NODE_OPTIONS: --max-old-space-size=192
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+      PAYMENT_DB_HOST: mysql
+      PAYMENT_DB_USER: payment_app
+      PAYMENT_DB_NAME: payment_db
+      PAYMENT_DB_POOL_MAX: '3'
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
   notification-service:
     image:
       repository: ''
@@ -126,7 +139,7 @@ services:
     port: 8084
     serviceType: ClusterIP
     nodePort: null
-    readinessPath: /health
+    readinessPath: /ready
     livenessPath: /health
     metricsPath: /metrics
     resources:
@@ -136,7 +149,10 @@ services:
       limits:
         cpu: 400m
         memory: 128Mi
-    config: {}
+    config:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
   recommendation-service:
     image:
       repository: ''
@@ -149,7 +165,7 @@ services:
     port: 8085
     serviceType: ClusterIP
     nodePort: null
-    readinessPath: /health
+    readinessPath: /ready
     livenessPath: /health
     metricsPath: /metrics
     resources:
@@ -160,9 +176,13 @@ services:
         cpu: 700m
         memory: 256Mi
     config:
-      SKYWALKING_AGENT_ENABLED: 'true'
+      SKYWALKING_AGENT_ENABLED: 'false'
       SKYWALKING_AGENT_COLLECTOR: skywalking-oap:11800
       SKYWALKING_SERVICE_NAME: recommendation-service
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+      USER_BASE_URL: http://user-service:8082
 orderCanary:
   enabled: false
   replicas: 1
@@ -170,3 +190,12 @@ orderCanary:
     repository: ''
     tag: ''
     digest: ''
+gateway:
+  enabled: true
+  className: sre-lab-envoy
+  requestTimeout: 5s
+  requestsPerSecond: 50
+  collectorService: otel-collector
+inventoryPersistence:
+  size: 1Gi
+  storageClassName: ''

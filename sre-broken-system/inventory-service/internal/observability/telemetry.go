@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"local/sre-lab/inventory-service/internal/repository"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -42,13 +43,9 @@ func (t *Telemetry) Observe(duration time.Duration, failed bool) {
 // Metrics writes version/pod labels so mixed-version degradation is directly queryable.
 func (t *Telemetry) Metrics(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	HTTPMetrics(w)
+	fmt.Fprintf(w, "inventory_lock_wait_seconds_total %g\n", float64(repository.LockWaitNanos.Load())/1e9)
 	labels := fmt.Sprintf("service=\"inventory-service\",version=\"%s\",pod=\"%s\"", t.Version, t.PodName)
-	fmt.Fprintf(w, "# TYPE sre_http_requests_total counter\nsre_http_requests_total{%s} %d\n", labels, t.Requests.Load())
-	fmt.Fprintf(w, "# TYPE sre_http_errors_total counter\nsre_http_errors_total{%s} %d\n", labels, t.Errors.Load())
-	for index, bound := range bounds {
-		fmt.Fprintf(w, "sre_http_request_duration_seconds_bucket{%s,le=\"%g\"} %d\n", labels, bound, t.LatencyBuckets[index].Load())
-	}
-	fmt.Fprintf(w, "sre_http_request_duration_seconds_bucket{%s,le=\"+Inf\"} %d\n", labels, t.Requests.Load())
 	fmt.Fprintf(w, "# TYPE sre_inventory_goroutine_leaks gauge\nsre_inventory_goroutine_leaks{%s} %d\n", labels, t.GoroutineLeaks.Load())
 }
 

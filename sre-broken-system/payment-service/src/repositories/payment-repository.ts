@@ -1,10 +1,22 @@
-import type{Payment}from"../models/payment.js";
-
-/** Repository supports idempotent lookup and state updates without coupling routes to storage. */
-export class PaymentRepository{private readonly byId=new Map<string,Payment>();private readonly idByKey=new Map<string,string>();
-  /** BAD: audit snapshots are retained forever instead of being emitted to a bounded external sink. */
-  private readonly auditSnapshots:Payment[]=[];
-  save(payment:Payment):Payment{this.byId.set(payment.id,payment);this.idByKey.set(payment.idempotencyKey,payment.id);this.auditSnapshots.push({...payment});return payment;}
-  findById(id:string):Payment|undefined{const payment=this.byId.get(id);if(payment)this.auditSnapshots.push({...payment});return payment;}
-  findByIdempotencyKey(key:string):Payment|undefined{const id=this.idByKey.get(key);return id?this.findById(id):undefined;}
-  update(payment:Payment):Payment{if(!this.byId.has(payment.id))throw new Error("payment not found");this.byId.set(payment.id,payment);this.auditSnapshots.push({...payment});return payment;}}
+import type {Payment} from "../models/payment.js";
+import {ApiError} from "../models/error.js";
+export interface PaymentStore {
+  save(payment: Payment): Payment | Promise<Payment>;
+  findById(id: string): Payment | undefined | Promise<Payment | undefined>;
+  update(payment: Payment): Payment | Promise<Payment>;
+}
+/** Unit-test adapter; HTTP processes use MySQL. */
+export class PaymentRepository implements PaymentStore {
+  private byId = new Map<string, Payment>(); private idByKey = new Map<string, string>();
+  save(p: Payment): Payment {
+    const existing = this.findByIdempotencyKey(p.idempotencyKey);
+    if (existing) {
+      if (existing.orderId !== p.orderId || existing.amount !== p.amount) throw new ApiError("IDEMPOTENCY_CONFLICT", "payment key conflict", 409);
+      return existing;
+    }
+    this.byId.set(p.id, p); this.idByKey.set(p.idempotencyKey, p.id); return p;
+  }
+  findById(id: string): Payment | undefined { return this.byId.get(id); }
+  findByIdempotencyKey(key: string): Payment | undefined { return this.byId.get(this.idByKey.get(key) ?? ""); }
+  update(p: Payment): Payment { if (!this.byId.has(p.id)) throw new ApiError("PAYMENT_NOT_FOUND", "payment not found", 404); this.byId.set(p.id, p); return p; }
+}

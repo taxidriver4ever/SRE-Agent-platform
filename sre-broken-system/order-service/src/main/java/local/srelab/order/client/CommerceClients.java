@@ -24,24 +24,32 @@ public class CommerceClients {
             @Value("${dependencies.user}") String userUrl,
             @Value("${dependencies.payment}") String paymentUrl,
             @Value("${dependencies.notification}") String notificationUrl) {
-        SimpleClientHttpRequestFactory timeouts = new SimpleClientHttpRequestFactory();
-        timeouts.setConnectTimeout(Duration.ofMillis(500));
-        timeouts.setReadTimeout(Duration.ofMillis(1200));
-        inventory = RestClient.builder().baseUrl(inventoryUrl).requestFactory(timeouts).build();
-        users = RestClient.builder().baseUrl(userUrl).requestFactory(timeouts).build();
-        payments = RestClient.builder().baseUrl(paymentUrl).requestFactory(timeouts).build();
-        notifications = RestClient.builder().baseUrl(notificationUrl).requestFactory(timeouts).build();
+        inventory = client(inventoryUrl, 800);
+        users = client(userUrl, 500);
+        payments = client(paymentUrl, 2000);
+        notifications = client(notificationUrl, 500);
+    }
+    private RestClient client(String url, int readMs) {
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(Duration.ofMillis(200));
+        factory.setReadTimeout(Duration.ofMillis(readMs));
+        return RestClient.builder().baseUrl(url).requestFactory(factory)
+            .requestInterceptor((request, body, execution) -> {
+                String requestId = org.slf4j.MDC.get("request_id");
+                if (requestId != null) request.getHeaders().set("x-request-id", requestId);
+                return execution.execute(request, body);
+            }).build();
     }
 
     /** 查询用户状态；被冻结用户不能创建订单。 */
     @SuppressWarnings("unchecked")
     public Map<String, Object> getUser(long userId) {
-        return users.get().uri("/users/{id}", userId).retrieve().body(Map.class);
+        return users.get().uri("/users/{id}/status", userId).retrieve().body(Map.class);
     }
 
     /** 通过 Kubernetes Service 预占库存，绝不直接访问 Pod IP。 */
     public void reserve(OrderItem item, String reservationId) {
-        inventory.post().uri("/inventory/reservations")
+        inventory.post().uri("/inventory/reserve")
                 .body(Map.of("sku", item.sku(), "quantity", item.quantity(), "reservation_id", reservationId))
                 .retrieve().toBodilessEntity();
     }
@@ -50,7 +58,8 @@ public class CommerceClients {
     @SuppressWarnings("unchecked")
     public Map<String, Object> pay(long orderId, String amount) {
         return payments.post().uri("/payments")
-                .body(Map.of("order_id", orderId, "amount", amount))
+                .header("X-Idempotency-Key", "order-" + orderId)
+                .body(Map.of("order_id", orderId, "amount", amount, "idempotency_key", "order-" + orderId))
                 .retrieve().body(Map.class);
     }
 
@@ -60,4 +69,8 @@ public class CommerceClients {
                 .body(Map.of("type", "ORDER_CREATED", "order_id", orderId, "user_id", userId))
                 .retrieve().toBodilessEntity();
     }
+
+    public void release(String id) { inventory.post().uri("/inventory/release").body(Map.of("reservation_id", id)).retrieve().toBodilessEntity(); }
+    public void commit(String id) { inventory.post().uri("/inventory/commit").body(Map.of("reservation_id", id)).retrieve().toBodilessEntity(); }
+    public void confirm(String id) { payments.post().uri("/payments/{id}/confirm", id).retrieve().toBodilessEntity(); }
 }

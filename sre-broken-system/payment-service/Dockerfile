@@ -1,8 +1,8 @@
 # Build stage installs TypeScript tooling, runs tests and emits JavaScript.
 FROM node:22-alpine AS build
 WORKDIR /app
-COPY package.json tsconfig.json ./
-RUN npm install
+COPY package.json package-lock.json tsconfig.json ./
+RUN npm ci
 COPY src ./src
 COPY tests ./tests
 RUN npm test && npm prune --omit=dev

@@ -1,6 +1,7 @@
 """Common Prometheus, JSON logging and lightweight OTLP tracing integration."""
 
 import json
+from contextvars import ContextVar
 import logging
 import time
 import os
@@ -10,6 +11,8 @@ from prometheus_client import Counter, Gauge, Histogram
 
 from app.core.config import settings
 
+
+request_id_context = ContextVar("request_id", default=None)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("user-service")
@@ -28,7 +31,7 @@ def log_event(level: str, message: str, trace_id: str = "", **fields: object) ->
         "@timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "service_name": "user-service", "environment": os.getenv("ENVIRONMENT", "development"),
         "trace_id": native_trace or trace_id or None, "span_id": span,
-        "request_id": fields.get("request_id"), "host": socket.gethostname(),
+        "request_id": fields.get("request_id") or request_id_context.get(), "host": socket.gethostname(),
         "pod_name": settings.pod_name, "namespace": os.getenv("KUBERNETES_NAMESPACE", "sre-lab"),
         "exception_type": fields.get("exception_type"), "stack_trace": fields.get("stack_trace"),
     }

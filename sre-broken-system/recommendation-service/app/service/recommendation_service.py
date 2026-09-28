@@ -1,6 +1,8 @@
 """Recommendation ranking, cache policy and genuine algorithmic failure modes."""
 
 from threading import Lock
+from app.core.faults import faults
+faults.allowed = {"normal", "cache_miss", "large_scan", "quadratic_ranking", "cpu_high", "slow_algorithm", "user_dependency_timeout"}
 from app.model.product import Recommendation
 from app.repository.catalog_repository import CatalogRepository
 
@@ -29,12 +31,11 @@ class RecommendationService:
 
     def _rank(self, key: str, category: str, limit: int) -> list[Recommendation]:
         bounded_limit = min(max(limit, 1), 50)
-        if self.mode() != "cache_miss" and key in self._cache:
+        if self.mode() == "normal" and key in self._cache:
             return self._cache[key][:bounded_limit]
-        # BAD: a personalization shortcut removed the category index and scans the whole catalog
-        # on every cache miss, creating version-specific CPU and latency regression.
-        candidates = self.repository.full_scan()
-        if self.mode() == "quadratic_ranking":
+        candidates = self.repository.full_scan() if self.mode() in {"large_scan", "quadratic_ranking", "cpu_high", "slow_algorithm"} else self.repository.category(category)
+        if self.mode() in {"quadratic_ranking", "cpu_high", "slow_algorithm"}:
+            candidates = candidates[:2000]
             # Pairwise comparison is intentionally O(n²), creating real CPU cost rather than sleep.
             scores = [(candidate, sum(1 for other in candidates if candidate.popularity >= other.popularity))
                       for candidate in candidates]
@@ -45,24 +46,18 @@ class RecommendationService:
             ranked = sorted(candidates, key=lambda item: item.popularity / max(item.price, 1), reverse=True)
             result = [Recommendation(product.id, product.popularity / max(product.price, 1), "popularity-price score")
                       for product in ranked[:bounded_limit]]
-        if self.mode() != "cache_miss":
+        if self.mode() == "normal":
             if len(self._cache) >= 2_000:
                 self._cache.pop(next(iter(self._cache)))
             self._cache[key] = result
         return result
 
     def set_mode(self, mode: str) -> bool:
-        if mode not in self._allowed_modes:
-            return False
-        with self._lock:
-            self._mode = mode
-            if mode == "normal":
-                self._cache.clear()
-        return True
+        self._cache.clear()
+        return faults.set(mode)
 
     def mode(self) -> str:
-        with self._lock:
-            return self._mode
+        return faults.get()
 
     def cache_size(self) -> int:
         return len(self._cache)

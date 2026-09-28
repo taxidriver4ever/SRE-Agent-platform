@@ -26,6 +26,14 @@ def validate():
         deployments = [d for d in docs if d['kind'] == 'Deployment']
         services = [d for d in docs if d['kind'] == 'Service']
         assert len(deployments) == len(services) == 6
+        assert all(s['spec']['type'] == 'ClusterIP' for s in services)
+        routes = [d for d in docs if d['kind'] == 'HTTPRoute']
+        assert len(routes) == 3
+        assert {r['spec']['rules'][0]['matches'][0]['path']['value'] for r in routes} == {'/api/orders','/api/users','/api/recommendations'}
+        assert all(r['spec']['rules'][0]['timeouts']['request'] == '5s' for r in routes)
+        inventory = next(d for d in deployments if d['metadata']['name'] == 'inventory-service')
+        assert inventory['spec']['replicas'] == 1 and inventory['spec']['strategy']['type'] == 'Recreate'
+        assert any(d['kind'] == 'PersistentVolumeClaim' for d in docs)
         assert not any(d['kind'] == 'Secret' for d in docs)
         for d in deployments:
             name = d['metadata']['name']
@@ -47,6 +55,8 @@ def validate():
             if name == 'order-service':
                 assert 'secretKeyRef' in env['DB_PASSWORD']['valueFrom']
                 assert env['INVENTORY_BASE_URL']['value'] == 'http://inventory-service:8081'
+            if name == 'payment-service':
+                assert 'secretKeyRef' in env['PAYMENT_DB_PASSWORD']['valueFrom']
             if name == 'user-service':
                 assert 'secretKeyRef' in env['DATABASE_URL']['valueFrom']
         for change in ['services.order-service.image.tag=latest', 'services.user-service.image.digest=bad',

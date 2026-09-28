@@ -10,3 +10,8 @@ const monitor=monitorEventLoopDelay({resolution:20});monitor.enable();setInterva
 /** Structured logs use the common cross-language fields. */
 export function log(level:string,message:string,traceId="",fields:Record<string,unknown>={}):void{console.log(JSON.stringify({timestamp:new Date().toISOString(),...labels,level,trace_id:traceId,message,...fields}));}
 export async function metricsText():Promise<string>{return client.register.metrics();}export const metricsContentType=client.register.contentType;
+
+export const dbActive=new client.Gauge({name:"db_pool_active",help:"Borrowed payment connections"});
+export const dbIdle=new client.Gauge({name:"db_pool_idle",help:"Idle payment connections"});
+export const dbPending=new client.Gauge({name:"db_pool_pending",help:"Waiting payment requests"});
+export const activeRequests=new client.Gauge({name:"sre_http_active_requests",help:"In-flight HTTP requests"});

@@ -18,6 +18,8 @@ spec:
   clusterResourceWhitelist:
   - group: ''
     kind: Namespace
+  - group: gateway.networking.k8s.io
+    kind: GatewayClass
   namespaceResourceWhitelist:
   - group: ''
     kind: Service
@@ -39,4 +41,15 @@ spec:
     kind: RoleBinding
   - group: batch
     kind: Job
-
+  - group: ''
+    kind: PersistentVolumeClaim
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+  - group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+  - group: gateway.envoyproxy.io
+    kind: BackendTrafficPolicy
+  - group: gateway.envoyproxy.io
+    kind: ClientTrafficPolicy

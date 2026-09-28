@@ -1,0 +1,112 @@
+{{- if .Values.gateway.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: {{ .Values.gateway.className }}
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: sre-lab-proxy
+  namespace: {{ .Release.Namespace }}
+spec:
+  telemetry:
+    requestID:
+      tracing: Disable
+    tracing:
+      samplingRate: 100
+      provider:
+        type: OpenTelemetry
+        backendRefs:
+          - name: {{ .Values.gateway.collectorService }}
+            port: 4317
+    accessLog:
+      settings:
+        - format:
+            type: JSON
+            json:
+              timestamp: "%START_TIME%"
+              service: "envoy-gateway"
+              environment: "lab"
+              request_id: "%REQ(X-REQUEST-ID)%"
+              trace_id: "%TRACE_ID%"
+              endpoint: "%REQ(:PATH)%"
+              latency_ms: "%DURATION%"
+              status: "%RESPONSE_CODE%"
+              response_flags: "%RESPONSE_FLAGS%"
+              upstream: "%UPSTREAM_CLUSTER%"
+          sinks:
+            - type: File
+              file: {path: /dev/stdout}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: sre-lab
+  namespace: {{ .Release.Namespace }}
+spec:
+  gatewayClassName: {{ .Values.gateway.className }}
+  infrastructure:
+    parametersRef:
+      group: gateway.envoyproxy.io
+      kind: EnvoyProxy
+      name: sre-lab-proxy
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces: {from: Same}
+{{- range $path, $name := dict "orders" "order-service" "users" "user-service" "recommendations" "recommendation-service" }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: lab-{{ $path }}
+  namespace: {{ $.Release.Namespace }}
+spec:
+  parentRefs: [{name: sre-lab}]
+  rules:
+    - matches:
+        - path: {type: PathPrefix, value: /api/{{ $path }}}
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path: {type: ReplacePrefixMatch, replacePrefixMatch: /{{ $path }}}
+      timeouts:
+        request: {{ $.Values.gateway.requestTimeout | quote }}
+      backendRefs:
+        - name: {{ $name }}
+          port: {{ (index $.Values.services $name).port }}
+{{- end }}
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: lab-path-policy
+  namespace: {{ .Release.Namespace }}
+spec:
+  targetRefs:
+    - {group: gateway.networking.k8s.io, kind: Gateway, name: sre-lab}
+  headers:
+    requestID: PreserveOrGenerate
+  path:
+    escapedSlashesAction: RejectRequest
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: lab-rate-limit
+  namespace: {{ .Release.Namespace }}
+spec:
+  targetRefs:
+    - {group: gateway.networking.k8s.io, kind: Gateway, name: sre-lab}
+  rateLimit:
+    local:
+      rules:
+        - limit:
+            requests: {{ .Values.gateway.requestsPerSecond }}
+            unit: Second
+{{- end }}

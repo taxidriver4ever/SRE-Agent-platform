@@ -14,4 +14,4 @@ RUN pytest -q
 RUN useradd --create-home --uid 10001 app
 USER app
 EXPOSE 8082
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8082", "--workers", "2"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8082", "--workers", "1"]

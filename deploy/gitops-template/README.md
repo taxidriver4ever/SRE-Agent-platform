@@ -8,7 +8,7 @@ all six scanned images and initialized their full source SHA/digests.
 
 Lab prerequisites in `sre-lab`: existing MySQL (`mysql:3306`, database `sre_lab`),
 the existing observability stack, and Secret `sre-lab-database` with
-`order-password` and `user-database-url`. The Lab chart never manages database
+`order-password`, `user-database-url` and `payment-password`. The Lab chart never manages database
 volumes or observability resources. Private GHCR requires `imagePullSecrets`.
 Follow `docs/lab-gitops.md` in the application repository for migration, runtime
 fault injection, canary experiments and Git revert. `scripts/promote.py` continues
@@ -112,3 +112,5 @@ full dependency checks. History/ES failure must not make core diagnosis unready.
 Chart defaults intentionally have empty tags and invalid owner placeholders. Helm
 rejects incomplete image settings and mutable tags. Frontend nginx routing follows
 the configured Agent Service port; its REST/SSE behavior is preserved.
+
+Commerce migration also requires Envoy Gateway v1.9.1 CRDs/controller and the additive payment schema. See [commerce deployment](../../docs/lab-commerce.md).

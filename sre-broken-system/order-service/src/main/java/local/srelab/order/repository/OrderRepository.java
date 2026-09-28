@@ -34,6 +34,8 @@ public class OrderRepository {
      * 真实数据库回归，不依赖应用层 sleep 伪造延迟。
      */
     public List<Map<String, Object>> searchByEmail(String email, int limit) {
+        if (!faults.mode().equals("slow_sql")) return jdbc.queryForList(
+            "SELECT id,user_id,customer_email,status,total_amount,created_at FROM orders WHERE customer_email=? ORDER BY id DESC LIMIT ?", email, limit);
         return jdbc.queryForList(
                 "SELECT id,user_id,customer_email,status,total_amount,created_at "
                         + "FROM orders WHERE customer_email LIKE ? "
@@ -74,7 +76,7 @@ public class OrderRepository {
             statement.setLong(1, command.userId());
             statement.setString(2, command.customerEmail());
             statement.setBigDecimal(3, total);
-            statement.setObject(4, Instant.now());
+            statement.setTimestamp(4, java.sql.Timestamp.from(Instant.now()));
             return statement;
         }, keys);
         long orderId = keys.getKey().longValue();
@@ -85,9 +87,11 @@ public class OrderRepository {
         return orderId;
     }
 
+    public void setStatus(long id, String status) { jdbc.update("UPDATE orders SET status=? WHERE id=?", status, id); }
+
     /** 取消仅允许从 CREATED/PAID 状态发生，并返回是否真正更新。 */
     public boolean cancel(long orderId) {
-        return jdbc.update("UPDATE orders SET status='CANCELLED' WHERE id=? AND status IN ('CREATED','PAID')", orderId) == 1;
+        return jdbc.update("UPDATE orders SET status='CANCELLED' WHERE id=? AND status IN ('CREATED')", orderId) == 1;
     }
 
     /** 连接池故障通过真实事务连接占用实现，不使用 Thread.sleep 冒充 SQL 性能问题。 */

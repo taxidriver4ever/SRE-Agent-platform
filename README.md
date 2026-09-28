@@ -1970,3 +1970,33 @@ Invoke-RestMethod `
 ## License
 
 本项目使用仓库根目录 [LICENSE](LICENSE) 中声明的许可证。
+
+
+## SRE Lab Architecture
+
+Lab 已按既有语言增量演进为小型电商调用链，统一由 Envoy 入口访问。
+
+```mermaid
+flowchart LR
+    Client --> Gateway[Envoy Gateway]
+    Gateway --> Order[Java Order]
+    Gateway --> User[Python User]
+    Gateway --> Recommendation[Python Recommendation]
+    Order --> User
+    Order --> Inventory[Go Inventory]
+    Order --> Payment[TypeScript Payment]
+    Order --> Notification[Go Notification]
+    Payment --> Notification
+    Recommendation --> User
+```
+
+默认 `docker compose up -d --build` 启动电商 Lab，入口 `http://127.0.0.1:18080/api/orders`。
+观测栈使用 `--profile observability`，Agent 平台使用 `--profile platform`。
+升级已有数据库卷前，先应用新增 `002-commerce.sql`；详细架构、契约、持久化限制和 Helm/GitOps 顺序见 [电商 Lab 文档](docs/lab-commerce.md)。
+
+## Fault Scenarios
+
+支持支付连接池耗尽、库存 CPU、通知部分失败、用户超时、有界重试放大、Gateway 超时配置错误六类跨服务场景。
+通过内部 `/internal/faults` 注入，TTL 到期自动恢复；入口不公开故障管理端点。
+[场景操作与预期指标/Trace/根因](docs/lab-commerce.md#fault-scenarios)。
+完整隔离验证：`python scripts/ci/lab_commerce_check.py --build`；普通 CI 仍按服务差异构建和扫描。

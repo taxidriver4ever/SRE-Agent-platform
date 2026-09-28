@@ -22,12 +22,16 @@ public class OrderController {
 
     @PostMapping
     public ResponseEntity<Order> create(@RequestBody CreateOrderRequest request) {
+        if (request.items() == null) throw new IllegalArgumentException("items required");
         List<OrderItem> items = request.items().stream()
                 .map(item -> new OrderItem(item.productId(), item.sku(), item.quantity(), item.unitPrice()))
                 .toList();
         return ResponseEntity.status(201).body(service.create(
                 new CreateOrderCommand(request.userId(), request.customerEmail(), items)));
     }
+
+    @PostMapping("/{id}/reconcile")
+    public Order reconcile(@PathVariable long id) { return service.completePayment(id); }
 
     @GetMapping("/{id}")
     public Order detail(@PathVariable long id) {

@@ -481,6 +481,7 @@ spec:
   ports:
   - name: grpc
     port: 4317
+    appProtocol: kubernetes.io/h2c
     targetPort: 4317
   - name: http
     port: 4318

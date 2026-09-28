@@ -4,7 +4,7 @@ WORKDIR /workspace
 COPY pom.xml ./
 RUN mvn -q -DskipTests dependency:go-offline
 COPY src ./src
-RUN mvn -q test package
+RUN mvn -B test package
 
 # 官方 OpenTelemetry Java 自动探针提供 HTTP、JDBC 和下游请求 Trace。
 FROM otel/autoinstrumentation-java:2.27.0 AS otel

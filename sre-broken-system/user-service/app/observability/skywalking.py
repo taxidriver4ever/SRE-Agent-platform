@@ -11,9 +11,9 @@ def start() -> None:
 
 
 def correlation() -> tuple[str | None, str | None]:
-    if os.getenv("SKYWALKING_AGENT_ENABLED", "false").lower() == "true":
-        from skywalking.trace.context import get_context
-        context = get_context()
-        if context.active_span is not None:
-            return str(context.segment.related_traces[0]), str(context.active_span.sid)
+    """Use the active OTel context; the Collector exports it to SkyWalking."""
+    from opentelemetry import trace
+    span = trace.get_current_span().get_span_context()
+    if span.is_valid:
+        return format(span.trace_id,"032x"), format(span.span_id,"016x")
     return None, None

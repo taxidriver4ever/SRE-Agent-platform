@@ -2,6 +2,7 @@
 name: sre-platform
 services:
   elasticsearch:
+    profiles: [observability]
     image: docker.elastic.co/elasticsearch/elasticsearch:8.17.3
     environment:
       discovery.type: single-node
@@ -16,6 +17,7 @@ services:
       timeout: 5s
       retries: 30
   kibana:
+    profiles: [observability]
     image: docker.elastic.co/kibana/kibana:8.17.3
     environment:
       ELASTICSEARCH_HOSTS: http://elasticsearch:9200
@@ -24,6 +26,7 @@ services:
     depends_on:
       elasticsearch: {condition: service_healthy}
   logstash:
+    profiles: [observability]
     image: docker.elastic.co/logstash/logstash:8.17.3
     command: ["-f", "/usr/share/logstash/pipeline/pipeline.conf"]
     environment:
@@ -46,6 +49,7 @@ services:
     depends_on:
       elasticsearch: {condition: service_healthy}
   filebeat:
+    profiles: [observability]
     image: docker.elastic.co/beats/filebeat:8.17.3
     user: root
     command: ["-e", "--strict.perms=false"]
@@ -56,6 +60,7 @@ services:
       - filebeat-data:/usr/share/filebeat/data
     depends_on: [logstash]
   skywalking-oap:
+    profiles: [observability]
     image: apache/skywalking-oap-server:10.2.0
     environment:
       SW_STORAGE: elasticsearch
@@ -75,6 +80,7 @@ services:
     depends_on:
       elasticsearch: {condition: service_healthy}
   skywalking-ui:
+    profiles: [observability]
     image: apache/skywalking-ui:10.2.0
     environment:
       SW_OAP_ADDRESS: http://skywalking-oap:12800
@@ -83,6 +89,7 @@ services:
     ports: ["127.0.0.1:18088:8080"]
     depends_on: [skywalking-oap]
   otel-collector:
+    profiles: [observability]
     image: otel/opentelemetry-collector-contrib:0.130.1
     command: ["--config=/etc/otel/config.yaml"]
     volumes:
@@ -90,6 +97,7 @@ services:
     mem_limit: 256m
     depends_on: [skywalking-oap]
   prometheus:
+    profiles: [observability]
     image: prom/prometheus:v3.5.0
     command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=24h"]
     volumes:
@@ -97,6 +105,7 @@ services:
     ports: ["127.0.0.1:19090:9090"]
     mem_limit: 512m
   mysql:
+    profiles: [platform]
     image: mysql:8.4
     environment:
       MYSQL_ROOT_PASSWORD: ${APPLICATION_MYSQL_ROOT_PASSWORD:-local_root_change_me}
@@ -125,10 +134,12 @@ services:
       timeout: 5s
       retries: 40
   redis:
+    profiles: [platform]
     image: redis:7.4-alpine
     mem_limit: 128m
     command: ["redis-server", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
   sre-gateway:
+    profiles: [platform]
     build: ./sre-agent-backend/sre-gateway
     environment:
       GATEWAY_MYSQL_HOST: mysql
@@ -144,6 +155,7 @@ services:
     depends_on:
       mysql: {condition: service_healthy}
   sre-agent:
+    profiles: [platform]
     build:
       context: .
       dockerfile: sre-agent-backend/sre-agent/Dockerfile
@@ -182,8 +194,9 @@ services:
     ports: ["127.0.0.1:8001:8001"]
     depends_on:
       mysql: {condition: service_healthy}
-      skywalking-oap: {condition: service_started}
+      skywalking-oap: {condition: service_started, required: false}
   frontend:
+    profiles: [platform]
     build: ./sre-agent-frontend
     ports: ["127.0.0.1:3000:8080"]
     depends_on: [sre-agent]
@@ -203,40 +216,65 @@ services:
       OTEL_METRICS_EXPORTER: none
       OTEL_LOGS_EXPORTER: none
     logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}
-    ports: ["127.0.0.1:18080:8080"]
     depends_on:
       lab-mysql: {condition: service_healthy}
   inventory-service:
+    volumes: ["inventory-data:/data"]
     build: ./sre-broken-system/inventory-service
     environment:
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
       RECOMMENDATION_BASE_URL: http://recommendation-service:8085
+      INVENTORY_DATA_FILE: /data/inventory.json
     logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}
   user-service:
     build: ./sre-broken-system/user-service
     environment:
       DATABASE_URL: mysql+pymysql://sre_app:sre_app_dev_only@lab-mysql:3306/sre_lab
-      SKYWALKING_AGENT_ENABLED: "true"
+      SKYWALKING_AGENT_ENABLED: "false"
       SKYWALKING_AGENT_COLLECTOR: skywalking-oap:11800
       SKYWALKING_SERVICE_NAME: user-service
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
     logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}
     depends_on:
       lab-mysql: {condition: service_healthy}
   payment-service:
+    environment:
+      PAYMENT_DB_HOST: lab-mysql
+      PAYMENT_DB_USER: payment_app
+      PAYMENT_DB_PASSWORD: payment_app_dev_only
+      PAYMENT_DB_NAME: payment_db
+      NOTIFICATION_BASE_URL: http://notification-service:8084
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+    depends_on:
+      lab-mysql: {condition: service_healthy}
     build: ./sre-broken-system/payment-service
     logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}
   notification-service:
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
     build: ./sre-broken-system/notification-service
     logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}
   recommendation-service:
     build: ./sre-broken-system/recommendation-service
     environment:
       NOTIFICATION_BASE_URL: http://notification-service:8084
-      SKYWALKING_AGENT_ENABLED: "true"
+      SKYWALKING_AGENT_ENABLED: "false"
       SKYWALKING_AGENT_COLLECTOR: skywalking-oap:11800
       SKYWALKING_SERVICE_NAME: recommendation-service
+      USER_BASE_URL: http://user-service:8082
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
     logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}
+  lab-gateway:
+    image: envoyproxy/envoy:v1.39.1
+    ports: ["127.0.0.1:18080:8080"]
+    volumes:
+      - ./sre-broken-system/sre-lab-infra/gateway/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    depends_on: [order-service, user-service, recommendation-service]
 volumes:
+  inventory-data:
   logstash-data:
   elasticsearch-data:
   filebeat-data:

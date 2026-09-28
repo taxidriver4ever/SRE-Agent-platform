@@ -35,39 +35,59 @@ public class OrderApplicationService {
 
     /** 创建订单前验证用户并预占每个 SKU，随后支付和发送通知。 */
     public Order create(CreateOrderCommand command) {
+        // Optional fixed business processing time for the gateway budget experiment.
+        int processingMs = Integer.parseInt(System.getenv().getOrDefault("ORDER_PROCESSING_DELAY_MS", "0"));
+        if (processingMs > 0) try { Thread.sleep(Math.min(processingMs, 2000)); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new IllegalStateException("order interrupted", e); }
         Map<String, Object> user = clients.getUser(command.userId());
-        if ("SUSPENDED".equals(user.get("status"))) {
-            throw new IllegalStateException("suspended user cannot create orders");
-        }
-        String reservationId = "order-pending-" + System.nanoTime();
-        command.items().forEach(item -> clients.reserve(item, reservationId));
-        BigDecimal total = command.items().stream()
-                .map(item -> item.unitPrice().multiply(BigDecimal.valueOf(item.quantity())))
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
-        long orderId = orders.create(command, total);
-        clients.pay(orderId, total.toPlainString());
+        if (user == null || !"ACTIVE".equalsIgnoreCase(String.valueOf(user.get("status")))) throw new IllegalStateException("user is not allowed to order");
+        long orderId = orders.create(command, totalOf(command.items()));
+        java.util.List<String> holds = new java.util.ArrayList<>();
         try {
-            clients.notifyCreated(orderId, command.userId());
-        } catch (RuntimeException notificationError) {
-            log.warn("notification failed order_id={} error={}", orderId, notificationError.toString());
+            for (OrderItem item : command.items()) {
+                String key = "order-" + orderId + "-" + item.sku();
+                holds.add(key); clients.reserve(item, key);
+            }
+        } catch (RuntimeException failure) {
+            boolean released = true;
+            for (String key : holds) {
+                try { clients.release(key); }
+                catch (RuntimeException e) { released = false; log.warn("inventory compensation requires review order_id={}", orderId); }
+            }
+            orders.setStatus(orderId, released ? "FAILED" : "REVIEW_REQUIRED");
+            throw failure;
         }
+        orders.setStatus(orderId, "PAYMENT_PENDING");
+        return completePayment(orderId);
+    }
+
+    /** Repeat a durable payment intent using the original idempotency key. */
+    public Order completePayment(long orderId) {
+        Order order = orders.find(orderId);
+        if ("PAID".equals(order.status())) return order;
+        if (!"PAYMENT_PENDING".equals(order.status())) throw new IllegalStateException("order requires inventory reconciliation");
+        int attempts = java.util.Set.of("retry_storm", "retry_amplification").contains(faults.mode()) ? 3 : 1;
+        Map<String, Object> payment = null;
+        for (int attempt = 0; attempt < attempts; attempt++) {
+            try { payment = clients.pay(orderId, order.totalAmount().toPlainString()); break; }
+            catch (org.springframework.web.client.RestClientException failure) {
+                if (failure instanceof org.springframework.web.client.RestClientResponseException r && r.getStatusCode().is4xxClientError()) throw failure;
+                if (attempt + 1 == attempts) throw failure;
+                retryCounter.increment();
+                try { Thread.sleep(50L * (attempt + 1)); } catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new IllegalStateException("retry interrupted", e); }
+            }
+        }
+        if (payment == null || payment.get("id") == null) throw new IllegalStateException("invalid payment response");
+        // Timeout leaves PAYMENT_PENDING; confirm and commit are safe to repeat.
+        clients.confirm(payment.get("id").toString());
+        for (OrderItem item : order.items()) clients.commit("order-" + orderId + "-" + item.sku());
+        orders.setStatus(orderId, "PAID");
+        try { clients.notifyCreated(orderId, order.userId()); }
+        catch (RuntimeException error) { log.warn("notification_partial_failure order_id={} error_type={}", orderId, error.getClass().getSimpleName()); }
         return orders.find(orderId);
     }
 
-    /** 查询订单并在 retry_storm 模式复现无退避请求放大。 */
-    public Order get(long orderId) {
-        int attempts = faults.mode().equals("retry_storm") ? 5 : 1;
-        RuntimeException last = null;
-        for (int attempt = 1; attempt <= attempts; attempt++) {
-            try {
-                return orders.find(orderId);
-            } catch (RuntimeException error) {
-                last = error;
-                retryCounter.increment();
-            }
-        }
-        throw last == null ? new IllegalStateException("order not found") : last;
-    }
+    public Order get(long orderId) { return orders.find(orderId); }
 
     public List<Map<String, Object>> search(String email, int limit) {
         if (faults.mode().equals("single_pod_slow")) {

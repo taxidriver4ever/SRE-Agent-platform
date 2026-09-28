@@ -1,5 +1,6 @@
 """Prometheus instruments ranking latency, cache size and request outcomes."""
 import json
+from contextvars import ContextVar
 import logging
 import time
 import os
@@ -7,6 +8,8 @@ import socket
 from app.observability.skywalking import correlation
 from prometheus_client import Counter, Gauge, Histogram
 from app.core.config import settings
+
+request_id_context = ContextVar("request_id", default=None)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("recommendation-service")
@@ -24,6 +27,6 @@ def log_event(message: str, trace_id: str, **fields: object) -> None:
                "pod": LABELS[2], "pod_name": LABELS[2], "level": "INFO", "message": message,
                "environment": os.getenv("ENVIRONMENT", "development"),
                "namespace": os.getenv("KUBERNETES_NAMESPACE", "sre-lab"), "host": socket.gethostname(),
-               "request_id": None, "exception_type": None, "stack_trace": None, **fields,
+               "request_id": request_id_context.get(), "exception_type": None, "stack_trace": None, **fields,
                "trace_id": native_trace or trace_id or None, "span_id": span}
     logger.info(json.dumps(payload))

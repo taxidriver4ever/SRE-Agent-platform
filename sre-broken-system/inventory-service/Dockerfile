@@ -11,7 +11,7 @@ FROM alpine:3.21
 ARG VCS_REF=unknown
 ARG VCS_SOURCE=local/inventory-service
 LABEL org.opencontainers.image.revision=$VCS_REF org.opencontainers.image.source=$VCS_SOURCE
-RUN addgroup -S app && adduser -S app -G app
+RUN addgroup -S -g 1000 app && adduser -S -u 1000 app -G app && mkdir /data && chown app:app /data
 USER app
 COPY --from=build /out/inventory-service /inventory-service
 EXPOSE 8081

@@ -28,13 +28,13 @@ def check(service, image, sha):
     try:
         env = {'SERVICE_VERSION': sha, 'POD_NAME': prefix, 'SKYWALKING_AGENT_ENABLED': 'false',
                'OTEL_SDK_DISABLED': 'true'}
-        if service in {'order-service', 'user-service'}:
+        if service in {'order-service', 'user-service', 'payment-service'}:
             db = prefix + '-mysql'
             names.append(db)
-            schema = Path(__file__).resolve().parents[2] / 'sre-broken-system/sre-lab-infra/mysql/init/001-schema.sql'
+            schema = Path(__file__).resolve().parents[2] / 'sre-broken-system/sre-lab-infra/mysql/init'
             docker('run', '-d', '--name', db, '--network', prefix, '--network-alias', 'mysql',
                    '-e', 'MYSQL_ROOT_PASSWORD=ci-disposable-only',
-                   '--mount', f'type=bind,src={schema},dst=/docker-entrypoint-initdb.d/schema.sql,readonly', 'mysql:8.4')
+                   '--mount', f'type=bind,src={schema},dst=/docker-entrypoint-initdb.d,readonly', 'mysql:8.4')
             for _ in range(120):
                 result = subprocess.run(['docker', 'exec', db, 'mysql', '-h127.0.0.1', '-usre_app',
                                          '-psre_app_dev_only', '-Dsre_lab', '-e', 'SELECT 1'], capture_output=True)
@@ -45,14 +45,15 @@ def check(service, image, sha):
                 raise RuntimeError('disposable MySQL initialization timed out')
             env.update(DB_URL='jdbc:mysql://mysql:3306/sre_lab?useSSL=false&allowPublicKeyRetrieval=true',
                        DB_USERNAME='sre_app', DB_PASSWORD='sre_app_dev_only',
-                       DATABASE_URL='mysql+pymysql://sre_app:sre_app_dev_only@mysql:3306/sre_lab')
+                       DATABASE_URL='mysql+pymysql://sre_app:sre_app_dev_only@mysql:3306/sre_lab',
+                       PAYMENT_DB_HOST='mysql', PAYMENT_DB_PASSWORD='payment_app_dev_only')
         names.append(prefix)
         args = ['run', '-d', '--name', prefix, '--network', prefix, '-p', f'127.0.0.1::{PORTS[service]}']
         for key, value in env.items():
             args.extend(['-e', f'{key}={value}'])
         docker(*args, image)
         address = docker('port', prefix, f'{PORTS[service]}/tcp').splitlines()[0]
-        health = '/actuator/health/readiness' if service == 'order-service' else '/health'
+        health = '/actuator/health/readiness' if service == 'order-service' else '/ready'
         for _ in range(120):
             try:
                 with urllib.request.urlopen('http://' + address + health, timeout=3) as response:
@@ -68,7 +69,29 @@ def check(service, image, sha):
                 body = response.read()
                 if response.status != 200 or not body:
                     raise RuntimeError(f'empty/failed runtime endpoint: {path}')
-        print(f'{service}: OCI revision, health, metrics and fault API passed')
+        from lab_commerce_check import request
+        base = 'http://' + address
+        if service == 'payment-service':
+            payload = {'order_id': 800001, 'amount': 12.25, 'idempotency_key': 'contract-800001'}
+            payment = request(base, '/payments', payload, expected=201)
+            assert payment['id'] and payment['status'] == 'AUTHORIZED'
+            assert request(base, '/payments', payload, expected=201)['id'] == payment['id']
+            request(base, '/payments', {**payload, 'amount': 13}, expected=409)
+            assert request(base, '/payments/' + payment['id'] + '/confirm', {}, expected=200)['status'] == 'CAPTURED'
+        elif service == 'inventory-service':
+            reservation = {'sku': 'SKU-1', 'quantity': 1, 'reservation_id': 'contract-SKU-1'}
+            request(base, '/inventory/reserve', reservation, expected=201)
+            request(base, '/inventory/reserve', reservation, expected=201)
+            assert request(base, '/inventory/commit', {'reservation_id': reservation['reservation_id']})['reserved'] == 0
+        elif service == 'user-service':
+            assert request(base, '/users/1/status')['status'] == 'ACTIVE'
+            assert request(base, '/users/1/preferences')['category']
+        elif service == 'notification-service':
+            assert request(base, '/notifications', {'type': 'ORDER_CREATED', 'order_id': 1}, expected=202)['id']
+        elif service == 'recommendation-service':
+            assert request(base, '/recommendations/products/1')
+        assert request(base, '/internal/faults')['fault_mode'] == 'normal'
+        print(f'{service}: OCI revision, health, metrics, fault API and provider contracts passed')
     except Exception:
         for name in names:
             subprocess.run(['docker', 'logs', '--tail', '80', name], check=False)

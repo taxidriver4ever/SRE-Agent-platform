@@ -7,7 +7,7 @@ from app.core.config import settings
 from app.model.user import User
 
 
-engine = create_engine(settings.database_url, pool_size=4, max_overflow=2, pool_pre_ping=True)
+engine = create_engine(settings.database_url, pool_size=4, max_overflow=2, pool_pre_ping=True, pool_timeout=0.5, connect_args={"connect_timeout":1,"read_timeout":1,"write_timeout":1})
 SessionFactory = sessionmaker(bind=engine, expire_on_commit=False)
 
 

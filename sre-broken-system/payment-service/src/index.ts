@@ -1,5 +1,9 @@
-import{randomBytes}from"node:crypto";import express from"express";import{config}from"./config/config.js";import{latency,log,metricsContentType,metricsText,requests}from"./observability/telemetry.js";import{paymentRouter,paymentService}from"./routes/payment-routes.js";
-
-/** Application entrypoint is limited to middleware and dependency wiring. */
-const app=express();app.use(express.json({limit:"64kb"}));app.use((request,response,next)=>{const started=process.hrtime.bigint();const traceparent=request.header("traceparent")??"";request.traceId=traceparent.split("-")[1]??randomBytes(16).toString("hex");response.on("finish",()=>{const seconds=Number(process.hrtime.bigint()-started)/1e9;const path=request.route?.path??request.path;requests.labels("payment-service",config.version,config.podName,path,String(response.statusCode)).inc();latency.labels("payment-service",config.version,config.podName,path).observe(seconds);});response.setHeader("X-Service-Version",config.version);response.setHeader("X-Pod-Name",config.podName);next();});
-app.get("/health",(_request,response)=>response.json({status:"ok",service:"payment-service",version:config.version,pod:config.podName,fault_mode:paymentService.getFault()}));app.get("/metrics",async(_request,response)=>{response.type(metricsContentType).send(await metricsText());});app.use(paymentRouter);app.use((error:Error,request:express.Request,response:express.Response,_next:express.NextFunction)=>{log("ERROR","payment request failed",request.traceId,{error:error.message});response.status(error.message.includes("not found")?404:400).json({error:error.message});});app.listen(config.port,"0.0.0.0",()=>log("INFO","payment-service started","",{port:config.port}));
+import {NodeSDK} from "@opentelemetry/sdk-node";
+import {HttpInstrumentation} from "@opentelemetry/instrumentation-http";
+import {ExpressInstrumentation} from "@opentelemetry/instrumentation-express";
+import {MySQL2Instrumentation} from "@opentelemetry/instrumentation-mysql2";
+import {UndiciInstrumentation} from "@opentelemetry/instrumentation-undici";
+const sdk=new NodeSDK({serviceName:"payment-service",instrumentations:[new HttpInstrumentation(),new ExpressInstrumentation(),new MySQL2Instrumentation(),new UndiciInstrumentation()]});
+sdk.start();
+await import("./server.js");
+process.once("SIGTERM",()=>{void sdk.shutdown().finally(()=>process.exit(0));});

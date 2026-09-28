@@ -23,12 +23,13 @@ if (-not $SkipBuild -and -not $InfrastructureOnly) { & (Join-Path $PSScriptRoot 
 kubectl apply -f (Join-Path $k8s "namespace\namespace.yaml")
 # ConfigMaps are generated from source files so SQL and observability configuration have one canonical copy.
 $mysqlSql = Join-Path $infraRoot "mysql\init\001-schema.sql"
+$commerceSql = Join-Path $infraRoot "mysql\init\002-commerce.sql"
 $prometheusConfig = Join-Path $infraRoot "observability\prometheus.yml"
 $filebeatConfig = Join-Path $infraRoot "observability\filebeat-kubernetes.yml"
 $templateConfig = Join-Path $infraRoot "observability\log-template.json"
 $logstashConfig = Join-Path $infraRoot "observability\logstash"
 $otelConfig = Join-Path $infraRoot "observability\otel-collector.yaml"
-kubectl -n sre-lab create configmap mysql-init "--from-file=001-schema.sql=$mysqlSql" --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n sre-lab create configmap mysql-init "--from-file=001-schema.sql=$mysqlSql" "--from-file=002-commerce.sql=$commerceSql" --dry-run=client -o yaml | kubectl apply -f -
 # MySQL 清单只引用 Secret，不在 Git 中保存密码。全新 Kind 集群没有该对象时，
 # 优先使用显式环境变量；本地未配置时生成随机值。已有 Secret 必须复用，否则
 # 重部署持久卷时会让容器密码与数据目录中的既有 root 密码不一致。
@@ -51,6 +52,10 @@ kubectl -n sre-lab rollout status deployment/mysql --timeout=240s
 Get-Content -LiteralPath $mysqlSql -Raw |
     kubectl -n sre-lab exec -i deployment/mysql -- sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD"'
 if ($LASTEXITCODE -ne 0) { throw "Failed to apply the idempotent MySQL schema and synthetic dataset" }
+Get-Content -LiteralPath $commerceSql -Raw |
+    kubectl -n sre-lab exec -i deployment/mysql -- sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD"'
+if ($LASTEXITCODE -ne 0) { throw "Failed to apply the additive commerce schema" }
+
 
 kubectl -n sre-lab create configmap prometheus-config "--from-file=prometheus.yml=$prometheusConfig" --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n sre-lab create configmap filebeat-config "--from-file=filebeat.yml=$filebeatConfig" --dry-run=client -o yaml | kubectl apply -f -

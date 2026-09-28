@@ -6,9 +6,10 @@ import java.util.List;
 public record CreateOrderCommand(long userId, String customerEmail, List<OrderItem> items) {
     /** 订单必须至少包含一件商品，邮箱用于后续订单查询演示。 */
     public CreateOrderCommand {
-        if (items == null || items.isEmpty()) {
+        if (userId <= 0 || items == null || items.isEmpty() || items.size() > 20) {
             throw new IllegalArgumentException("order items cannot be empty");
         }
+        if (items.stream().map(OrderItem::sku).distinct().count() != items.size()) throw new IllegalArgumentException("duplicate SKU; combine quantities");
         if (customerEmail == null || customerEmail.isBlank()) {
             throw new IllegalArgumentException("customerEmail is required");
         }

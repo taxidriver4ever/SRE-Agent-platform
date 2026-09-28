@@ -32,11 +32,16 @@ metadata:
   annotations:
     {{- toYaml $annotations | nindent 4 }}
 spec:
+  {{- if and (eq $service "inventory-service") (ne (int $svc.replicas) 1) }}{{ fail "persistent inventory requires one writer" }}{{ end }}
   replicas: {{ $svc.replicas }}
   revisionHistoryLimit: 5
   strategy:
+    {{- if eq $service "inventory-service" }}
+    type: Recreate
+    {{- else }}
     type: RollingUpdate
     rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+    {{- end }}
   selector:
     matchLabels:
       app: {{ $service }}
@@ -65,10 +70,20 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if eq $service "inventory-service" }}
+      securityContext: {fsGroup: 1000}
+      volumes:
+        - name: inventory-data
+          persistentVolumeClaim: {claimName: inventory-data}
+      {{- end }}
       containers:
         - name: {{ $service }}
           image: {{ printf "%s:%s@%s" $svc.image.repository $svc.image.tag $svc.image.digest | quote }}
           imagePullPolicy: IfNotPresent
+          {{- if eq $service "inventory-service" }}
+          volumeMounts:
+            - {name: inventory-data, mountPath: /data}
+          {{- end }}
           ports:
             - {name: http, containerPort: {{ $svc.port }}}
           env:
@@ -76,7 +91,7 @@ spec:
             - name: POD_NAME
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
             {{- range $key, $value := $svc.config }}
-            {{- if has $key (list "DB_PASSWORD" "DATABASE_URL" "SERVICE_VERSION" "POD_NAME") }}{{ fail "reserved or secret configuration must use chart-managed references" }}{{ end }}
+            {{- if has $key (list "DB_PASSWORD" "DATABASE_URL" "PAYMENT_DB_PASSWORD" "SERVICE_VERSION" "POD_NAME") }}{{ fail "reserved or secret configuration must use chart-managed references" }}{{ end }}
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}
@@ -91,6 +106,11 @@ spec:
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef: {name: {{ $root.Values.databaseSecret }}, key: user-database-url}
+            {{- end }}
+            {{- if eq $service "payment-service" }}
+            - name: PAYMENT_DB_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: {{ $root.Values.databaseSecret }}, key: payment-password}
             {{- end }}
           startupProbe:
             httpGet: {path: {{ $svc.livenessPath }}, port: http}

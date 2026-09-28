@@ -1,32 +1,15 @@
 package local.srelab.order.config;
-
+import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicReference;
 import org.springframework.stereotype.Component;
-
-/**
- * 进程级故障开关。每个 Pod 独立保存状态，因此场景脚本可以只命中一个 Pod，
- * 真实复现 SRE-008，而不会把异常错误地扩散到整个 Deployment。
- */
 @Component
 public class FaultState {
-    private static final Set<String> ALLOWED = Set.of(
-            "normal", "slow_sql", "pool_exhaustion", "dependency_timeout",
-            "retry_storm", "single_pod_slow", "bad_health");
-    private final AtomicReference<String> mode =
-            new AtomicReference<>(System.getenv().getOrDefault("FAULT_MODE", "normal"));
-
-    /** 返回无锁的原子快照，供请求路径决定是否注入故障。 */
-    public String mode() {
-        return mode.get();
-    }
-
-    /** 只接受预定义实验模式，禁止把任意字符串当作可执行行为。 */
-    public boolean changeTo(String requestedMode) {
-        if (!ALLOWED.contains(requestedMode)) {
-            return false;
-        }
-        mode.set(requestedMode);
-        return true;
-    }
+ private static final Set<String> ALLOWED=Set.of("normal","slow_sql","pool_exhaustion","dependency_timeout","retry_storm","single_pod_slow","bad_health","thread_pool_saturation","downstream_timeout","retry_amplification");
+ private String current="normal";private long expires=0;private int delay=3000;
+ public FaultState(){changeTo(System.getenv().getOrDefault("FAULT_MODE","normal"));}
+ public synchronized String mode(){if(System.currentTimeMillis()>=expires)current="normal";return current;}
+ public boolean changeTo(String mode){return enable(mode,120,3000);}
+ public synchronized boolean enable(String mode,int seconds,int delayMs){if(mode==null||!ALLOWED.contains(mode)||seconds<1||seconds>300||delayMs<0||delayMs>10000)return false;current=mode;expires=System.currentTimeMillis()+seconds*1000L;delay=delayMs;return true;}
+ public synchronized int delayMs(){return delay;}
+ public synchronized Map<String,Object> snapshot(){return Map.of("fault_mode",mode(),"expires_at",mode().equals("normal")?0:expires,"parameters",Map.of("delay_ms",delay));}
 }
