@@ -23,7 +23,7 @@ def export(destination: Path, repository: str, sha: str, registry: str) -> None:
     shutil.copytree(source, destination)
     url = f'https://github.com/{repository}.git'
     for path in (destination / 'argocd').glob('*.yaml'):
-        path.write_text(path.read_text().replace('https://github.com/REPLACE_OWNER/sre-agent-deploy.git', url))
+        path.write_text(path.read_text(encoding='utf-8').replace('https://github.com/REPLACE_OWNER/sre-agent-deploy.git', url), encoding='utf-8')
     for environment in ['dev', 'staging', 'prod']:
         update(destination, environment, sha, registry)
     subprocess.run(['git', 'init', '-b', 'main', str(destination)], check=True)
