@@ -87,6 +87,11 @@ def test_lab_pipeline_is_separate_and_scans_before_publishing():
     scan = next(i for i, s in enumerate(steps) if s.get('uses', '').startswith('aquasecurity/trivy'))
     push = next(i for i, s in enumerate(steps) if s.get('run') == 'docker push "$IMAGE_REF"')
     assert build < runtime < scan < push
+    # Runner dependencies are separate from dependencies inside the built image.
+    dependencies = next(i for i, s in enumerate(steps)
+                        if 'pip install PyYAML==' in s.get('run', ''))
+    assert dependencies < build
+    assert 'import lab_commerce_check' in steps[dependencies]['run']
     assert steps[build]['with']['load'] and not steps[build]['with']['push']
     assert steps[scan]['with']['exit-code'] == '1'
     assert steps[scan]['with']['ignore-unfixed'] is False
@@ -94,6 +99,21 @@ def test_lab_pipeline_is_separate_and_scans_before_publishing():
     download = next(s for s in jobs['update-lab-gitops']['steps'] if s.get('uses', '').startswith('actions/download-artifact'))
     assert download['with']['pattern'] == 'lab-digest-*'
     assert jobs['update-lab-gitops']['concurrency']['group'] != jobs['update-gitops']['concurrency']['group']
+
+
+@pytest.mark.parametrize('job_name', ['build-images', 'build-lab-images'])
+def test_scan_evidence_upload_does_not_mask_the_original_failure(job_name):
+    jobs = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8'))['jobs']
+    steps = jobs[job_name]['steps']
+    scan = next(s for s in steps if s.get('uses', '').startswith('aquasecurity/trivy'))
+    upload = next(s for s in steps if s.get('with', {}).get('path') == 'image-scan.json')
+    # Keep reports from failed vulnerability scans, but skip nonexistent reports
+    # when an earlier runtime/build failure prevented the scanner from running.
+    assert upload['if'] == "always() && hashFiles('image-scan.json') != ''"
+    assert scan['with']['exit-code'] == '1'
+    assert scan.get('continue-on-error', False) is False
+    push = next(s for s in steps if s.get('run') == 'docker push "$IMAGE_REF"')
+    assert 'always()' not in push.get('if', '')
 
 
 @pytest.mark.parametrize('problem', ['wrong-source', 'duplicate', 'wrong-group'])

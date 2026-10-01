@@ -97,6 +97,26 @@ GitOps Job 只修改 `environments/dev/values.yaml`，校验三份 digest 的来
 | 内置 `GITHUB_TOKEN` | 镜像 Job 的 packages:write；其他 Job 仅 contents:read |
 
 没有 KUBECONFIG、Kubernetes Token 或 Argo admin 密钥进入 Actions。
+
+### 首次启用发布前的 GitHub 配置
+
+在应用仓库 **Settings → Secrets and variables → Actions** 中设置：
+
+1. Variables：`GITOPS_REPOSITORY` 填已初始化的独立部署仓库 `owner/repo`，不要填完整 URL，也不要填应用仓库内的模板路径。
+2. Variables：`GITOPS_BRANCH` 填部署分支；省略时使用 `main`。
+3. Secrets：`GITOPS_TOKEN` 填可读写该部署仓库的凭据。使用 fine-grained PAT 时，仅选择目标部署仓库并授予 Contents read/write；不要把 Token 写进代码、文档或聊天。
+4. 部署仓库应先通过本项目导出流程初始化，包含 `environments/dev/values.yaml` 和 `environments/dev/lab-values.yaml`，再启用发布。
+
+这两个更新作业没有声明 GitHub Environment，配置应放在 Repository 层（或授权本仓库访问的 Organization 层），仅放进 Environment Secret 不会被当前作业读取。
+缺失配置时仍阻止发布，不把部署跳过伪装成发布成功。
+
+### CI #10 的失败与修复
+
+提交 `80e6155` 的六个 Lab 镜像构建成功，但 Runner 执行 `lab_runtime_check.py` 时，通过 `lab_commerce_check.py` 间接导入 `yaml`，因未安装 PyYAML 全部失败。
+Lab 构建作业现在显式安装 `PyYAML==6.0.2` 并在构建前检查导入；其他 Job 或容器内的依赖不视为 Runner 依赖。
+平台与 Lab 的镜像扫描报告仅在文件存在时上传；Trivy 的失败状态仍阻止镜像发布。这样运行检查失败时不会再产生误导性的 `image-scan.json` 缺失错误。
+`Commit dev desired state` 的配置缺失是独立问题，仍需按上面的步骤配置部署仓库和 Secret；提交 CI 代码修复不能代替 GitHub 仓库设置。
+
 在两个仓库启用 main 保护、Required checks；对 CI、回归套件、Chart 启用 Code Owner
 review，避免通过修改门禁自身来绕过门禁。本仓库 CODEOWNERS 只是声明，分支保护需
 在 GitHub 实际启用。部署仓库 prod/staging 变更建议通过 PR；机器人仅写 dev 文件，
