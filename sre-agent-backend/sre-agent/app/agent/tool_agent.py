@@ -10,9 +10,9 @@ from app.agent.prompt import build_system_prompt
 from app.agent.schemas import AgentDecision, AgentResult, AgentStep
 from app.llm import LLM, LLMMessage
 from app.llm.prompts import prompt_messages
-from app.llm.structured import StructuredOutputParser
 from app.llm.structured_output import (
     StructuredOutputError,
+    validate_structured_output,
     schema_retry_message,
     template_refill_message,
 )
@@ -182,4 +182,4 @@ def _parse_decision(content: str) -> AgentDecision:
     协议要求裸 JSON；公共结构化输出层会有限兼容代码围栏、前缀文字、尾随逗号
     和单引号，再以严格 Schema 作为是否允许执行工具的最终边界。
     """
-    return StructuredOutputParser(schema_type=AgentDecision).parse(content)
+    return validate_structured_output(content, AgentDecision)

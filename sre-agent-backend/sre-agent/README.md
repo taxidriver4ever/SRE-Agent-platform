@@ -10,15 +10,13 @@ MySQL is the source of truth for diagnosis tasks and historical records. Elastic
 
 ## 模块
 
-默认使用 LangChain Core 的 Prompt/ChatModel/Parser 调用链和官方
-`langchain-mcp-adapters` 工具适配。Gateway HTTP 协议、只读 Policy/Audit、
-Evidence Gate 和 MySQL Task/Lease/CAS/Checkpoint 继续由原模块负责。
-详见 [架构分析、分阶段实施与验收](../../docs/langchain-mcp-refactor.md)。
+运行时直接使用 Python async/await、LLM Protocol、GatewayLLM 与 FastMCP Client。
+Prompt 直接构造消息，Structured Output 使用项目现有修复规则和 Pydantic 校验。
+只保留一个实现；Evidence Gate、Policy/Audit 和 MySQL Task/Lease/CAS/Checkpoint 保持原有职责。
+详见 [架构收敛说明](../../docs/runtime-convergence.md)。
 
-更新环境后执行 `python -m pip install -r requirements-dev.txt`。
-在 Agent 的 `.env` 设置 `SRE_AGENT_BACKEND=legacy` 并重启，可回滚到原 Gateway/MCP
-调用后端；默认值为 `langchain`。此开关不卸载依赖、不回滚业务数据，也不撤销
-所有权检查修正；Prompt 文本、结构化修复规则和业务调度共用一份实现。
+更新环境后执行 `python -m pip install -r requirements-dev.txt` 和 `python -m pip check`。
+建议使用干净虚拟环境，避免旧依赖残留。
 
 - `app/llm/`：Provider 无关协议与 Gateway Client，Agent 不使用厂商 SDK。
 - `app/intent/`：LLM Structured Output 意图分类与工作流闸门；合法意图确认前禁止进入工具 Runtime。

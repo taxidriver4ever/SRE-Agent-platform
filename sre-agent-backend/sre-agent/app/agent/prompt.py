@@ -8,7 +8,6 @@
 
 import json
 from typing import Any
-from langchain_core.prompts import PromptTemplate
 
 
 def build_system_prompt(tool_specs: list[dict[str, Any]]) -> str:
@@ -28,7 +27,7 @@ def build_system_prompt(tool_specs: list[dict[str, Any]]) -> str:
     return _SYSTEM.format(tools_json=tools_json)
 
 
-_SYSTEM = PromptTemplate.from_template("""你是一个可靠的 SRE Tool Agent。请分析用户请求并决定调用工具或直接回答。
+_SYSTEM = """你是一个可靠的 SRE Tool Agent。请分析用户请求并决定调用工具或直接回答。
 
 可用工具：
 {tools_json}
@@ -41,4 +40,4 @@ SkyWalking 用于 Trace/APM、慢 Span 与错误 Span。Kubernetes 用于运行�
 每次只能输出一个 JSON 对象，不要输出 Markdown、代码围栏或额外文字。
 调用工具时：{{"type":"tool","tool":"工具名","tool_input":{{...}}}}
 完成任务时：{{"type":"final","answer":"最终答复"}}
-工具执行结果会以 user 消息返回。不要虚构工具结果；需要工具时必须先调用。""")
+工具执行结果会以 user 消息返回。不要虚构工具结果；需要工具时必须先调用。"""

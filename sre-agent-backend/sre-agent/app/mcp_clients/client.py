@@ -34,24 +34,18 @@ class FastMCPToolClient:
         policy: ToolPolicy | None = None,
         audit_repository: ToolAuditRepository | None = None,
         default_project_id: str = "sre-lab",
-        backend: str = "legacy",
     ) -> None:
         self.server = server
         self.kubernetes = kubernetes
         self.policy = policy
         self.audit_repository = audit_repository
         self.default_project_id = default_project_id
-        self.backend = backend
 
     async def specifications(self) -> list[dict[str, Any]]:
         """合并标准 tools/list Schema 与审核过的 Kubernetes 语义 Schema。"""
         async with Client(self.server) as client:
-            if self.backend == "langchain":
-                from app.mcp_clients.langchain import specifications as load_specifications
-                loaded = await load_specifications(client)
-            else:
-                loaded = [{"name": tool.name, "description": tool.description or "",
-                           "input_schema": tool.inputSchema} for tool in await client.list_tools()]
+            loaded = [{"name": tool.name, "description": tool.description or "",
+                       "input_schema": tool.inputSchema} for tool in await client.list_tools()]
         specifications = [item for item in loaded if (
             item["name"] != "search_conversation_memory"
             or current_conversation_memory_scope() is not None
@@ -71,6 +65,8 @@ class FastMCPToolClient:
 
     async def execute(self, name: str, arguments: dict[str, Any]) -> Any:
         """按语义路由工具，并只返回 MCP 的结构化结果。"""
+        from app.agent.observability import trace_call
+
         started = time.perf_counter()
         scope = current_task_scope() or TaskSecurityScope(
             "system", self.default_project_id, "unscoped"
@@ -82,10 +78,7 @@ class FastMCPToolClient:
                 value = await self.kubernetes.call(name, arguments)
             else:
                 async with Client(self.server) as client:
-                    if self.backend == "langchain":
-                        from app.mcp_clients.langchain import call_tool
-                        result = await call_tool(client, name, arguments)
-                    else:
+                    with trace_call("tool", name):
                         result = await client.call_tool(name, arguments)
                 value = result.data if result.data is not None else {
                     "content": [block.model_dump(mode="json") for block in result.content]

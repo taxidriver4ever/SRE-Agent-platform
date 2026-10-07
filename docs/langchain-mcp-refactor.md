@@ -1,3 +1,5 @@
+> **Historical / superseded** — 本文仅记录已被替代的迁移方案、旧依赖和历史测试结果，不描述当前运行时。当前架构及本次验收见 [runtime-convergence.md](runtime-convergence.md)。
+
 # LangChain + MCP 渐进式重构
 
 ## 分析基线

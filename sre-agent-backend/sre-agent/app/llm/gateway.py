@@ -72,57 +72,60 @@ class GatewayLLM:
         ``LLMResponse``。网络、HTTP 状态码和响应结构问题统一抛出
         ``GatewayRequestError``，避免上层依赖 httpx 异常类型。
         """
-        # 延迟校验让未配置密钥的实例仍可用于启动应用和响应健康检查。
-        if not self.api_key:
-            raise GatewayConfigurationError("GATEWAY_API_KEY is not configured")
+        from app.agent.observability import trace_call
 
-        try:
-            # Token 只放在 Authorization 请求头中，永不写入 payload 或错误文本。
-            response = await self._client.post(
-                f"{self.base_url}/v1/gateway/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json={
-                    "model": self.model,
-                    # 网关目前只支持普通文本角色，LLMMessage 在此处完成边界转换。
-                    "messages": [
-                        {"role": message.role, "content": message.content}
-                        for message in messages
-                    ],
-                    # 当前调用均依赖 JSON/短摘要；限制生成长度并降低随机性可减少
-                    # 本地模型超时和 Structured Output 重试。
-                    "temperature": 0,
-                    "max_tokens": self.max_tokens,
-                    # 当前网关明确拒绝流式请求，Agent 循环也按完整 JSON 响应解析。
-                    "stream": False,
-                },
-            )
-            # 将非 2xx 状态转换成 HTTPStatusError，交给下方分支保留状态码。
-            response.raise_for_status()
-            data: dict[str, Any] = response.json()
+        with trace_call("llm", "sre-gateway"):
+            # 延迟校验让未配置密钥的实例仍可用于启动应用和响应健康检查。
+            if not self.api_key:
+                raise GatewayConfigurationError("GATEWAY_API_KEY is not configured")
 
-            # choices[0] 是网关当前非流式响应的唯一选择。缺失字段会被统一捕获
-            # 并转成协议异常，不把 KeyError 等实现细节泄漏给 API 调用方。
-            choice = data["choices"][0]
-            usage = data.get("usage") or {}
-            return LLMResponse(
-                content=choice["message"]["content"],
-                model=data.get("model", self.model),
-                provider=data.get("provider"),
-                prompt_tokens=int(usage.get("prompt_tokens", 0)),
-                completion_tokens=int(usage.get("completion_tokens", 0)),
-            )
-        except httpx.HTTPStatusError as exc:
-            # 仅提取响应正文中的 detail；绝不拼接包含 Authorization 的 Request。
-            detail = _safe_error_detail(exc.response)
-            error_type = LLMRateLimitError if exc.response.status_code == 429 else GatewayRequestError
-            raise error_type(
-                f"Gateway returned HTTP {exc.response.status_code}: {detail}"
-            ) from exc
-        except httpx.TimeoutException as exc:
-            raise LLMTimeoutError("Gateway request or response is invalid") from exc
-        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
-            # 同时覆盖网络错误、非法 JSON 和网关响应字段类型不正确等情况。
-            raise GatewayRequestError("Gateway request or response is invalid") from exc
+            try:
+                # Token 只放在 Authorization 请求头中，永不写入 payload 或错误文本。
+                response = await self._client.post(
+                    f"{self.base_url}/v1/gateway/chat/completions",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json={
+                        "model": self.model,
+                        # 网关目前只支持普通文本角色，LLMMessage 在此处完成边界转换。
+                        "messages": [
+                            {"role": message.role, "content": message.content}
+                            for message in messages
+                        ],
+                        # 当前调用均依赖 JSON/短摘要；限制生成长度并降低随机性可减少
+                        # 本地模型超时和 Structured Output 重试。
+                        "temperature": 0,
+                        "max_tokens": self.max_tokens,
+                        # 当前网关明确拒绝流式请求，Agent 循环也按完整 JSON 响应解析。
+                        "stream": False,
+                    },
+                )
+                # 将非 2xx 状态转换成 HTTPStatusError，交给下方分支保留状态码。
+                response.raise_for_status()
+                data: dict[str, Any] = response.json()
+
+                # choices[0] 是网关当前非流式响应的唯一选择。缺失字段会被统一捕获
+                # 并转成协议异常，不把 KeyError 等实现细节泄漏给 API 调用方。
+                choice = data["choices"][0]
+                usage = data.get("usage") or {}
+                return LLMResponse(
+                    content=choice["message"]["content"],
+                    model=data.get("model", self.model),
+                    provider=data.get("provider"),
+                    prompt_tokens=int(usage.get("prompt_tokens", 0)),
+                    completion_tokens=int(usage.get("completion_tokens", 0)),
+                )
+            except httpx.HTTPStatusError as exc:
+                # 仅提取响应正文中的 detail；绝不拼接包含 Authorization 的 Request。
+                detail = _safe_error_detail(exc.response)
+                error_type = LLMRateLimitError if exc.response.status_code == 429 else GatewayRequestError
+                raise error_type(
+                    f"Gateway returned HTTP {exc.response.status_code}: {detail}"
+                ) from exc
+            except httpx.TimeoutException as exc:
+                raise LLMTimeoutError("Gateway request or response is invalid") from exc
+            except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
+                # 同时覆盖网络错误、非法 JSON 和网关响应字段类型不正确等情况。
+                raise GatewayRequestError("Gateway request or response is invalid") from exc
 
     async def close(self) -> None:
         """关闭本实例自行创建的连接池。

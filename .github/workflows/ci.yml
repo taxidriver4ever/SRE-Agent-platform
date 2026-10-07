@@ -307,7 +307,7 @@ jobs:
         set -euo pipefail
         case "$IMAGE" in
           sre-agent)
-            docker run --rm --read-only --tmpfs /tmp --entrypoint python "$IMAGE_REF" -c 'from app.core.config import get_settings; import fastmcp, langchain_core, langchain_mcp_adapters'
+            docker run --rm --read-only --tmpfs /tmp --entrypoint python "$IMAGE_REF" -c 'from app.core.config import get_settings; import fastmcp; from app.llm import GatewayLLM; from app.llm.structured import generate_structured; from app.mcp_clients import FastMCPToolClient'
             docker run --rm --read-only --entrypoint node "$IMAGE_REF" --version
             docker run --rm --read-only --entrypoint git "$IMAGE_REF" --version
             ;;

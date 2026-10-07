@@ -39,10 +39,9 @@ class KubernetesMCPAdapter:
         "get_container_image": "resources_get",
     }
 
-    def __init__(self, namespace: str, *, backend: str = "legacy") -> None:
+    def __init__(self, namespace: str) -> None:
         """构造惰性 MCP Client；应用健康检查不会触发 npx 下载或集群连接。"""
         self.namespace = namespace
-        self.backend = backend
         self._connect_lock = asyncio.Lock()
         version = os.getenv("KUBERNETES_MCP_VERSION", DEFAULT_KUBERNETES_MCP_VERSION)
         command = os.getenv("KUBERNETES_MCP_COMMAND", "npx.cmd" if os.name == "nt" else "npx")
@@ -95,6 +94,8 @@ class KubernetesMCPAdapter:
 
     async def call(self, semantic_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """调用第三方工具，并把 YAML/TextContent 归一化为稳定 JSON 结构。"""
+        from app.agent.observability import trace_call
+
         if semantic_name not in self._TOOL_MAP:
             raise ValueError(f"未审核的 Kubernetes MCP 语义: {semantic_name}")
         await self._ensure_connected()
@@ -107,10 +108,7 @@ class KubernetesMCPAdapter:
             else upstream_name
         )
         upstream_arguments = self._translate_arguments(semantic_name, arguments)
-        if self.backend == "langchain":
-            from app.mcp_clients.langchain import call_tool
-            result = await call_tool(self._client, callable_name, upstream_arguments)
-        else:
+        with trace_call("tool", callable_name):
             result = await self._client.call_tool(callable_name, upstream_arguments)
         payload = self._decode_result(result)
         return self._shape_result(semantic_name, payload)

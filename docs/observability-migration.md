@@ -48,7 +48,7 @@ Invoke-RestMethod http://127.0.0.1:19412/zipkin/api/v2/services
 
 ## 修改范围与清理
 
-* Adapter/Tool：`app/mcp_servers/observability/adapters.py`、`tools.py`，复用 HTTP/FastMCP/LangChain 通路。
+* Adapter/Tool：`app/mcp_servers/observability/adapters.py`、`tools.py`，使用 HTTP/FastMCP 通路；当前唯一运行时见 [架构收敛说明](runtime-convergence.md)。
 * 配置/权限/提示词：`app/core/config.py`、`app/security/policy.py`、`config/tool-policy.yaml`、`app/agent/prompt.py`。
 * Evidence：`app/evidence/`、`app/workflow/models.py`、`runtime_extractor.py`、`evidence_gate.py`、`planning/`；只做新格式映射、来源选择和 Span 证据规则。Task/CAS/Heartbeat 实现未改。
 * 采集：`app/core/telemetry.py`、`app/serve.py`；Python Demo 插桩与 JSON 日志；Java 使用 Spring Boot 内置 JSON encoder，正确转义异常、多行和引号。
